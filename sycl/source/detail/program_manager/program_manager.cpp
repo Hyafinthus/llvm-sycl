@@ -31,6 +31,7 @@
 #include <sycl/stl.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 #define PRINT_TRACE 1
+// #define SCHEDULE 1
 
 #include <algorithm>
 #include <cassert>
@@ -1000,6 +1001,7 @@ ProgramManager::ProgramManager() {
     globalDevices.end()
   );
 
+#ifdef SCHEDULE
   struct mq_attr mq_attr;
   mq_attr.mq_maxmsg = MAX_MSG_NUM;
   mq_attr.mq_msgsize = sizeof(DeviceData);
@@ -1018,8 +1020,10 @@ ProgramManager::ProgramManager() {
     std::cerr << "Error: mq_kernel open failed" << std::endl;
     exit(EXIT_FAILURE);
   }
+#endif
 }
 
+#ifdef SCHEDULE
 ProgramManager::~ProgramManager() {
   mq_close(mq_id_device);
   mq_close(mq_id_kernel);
@@ -1030,6 +1034,9 @@ ProgramManager::~ProgramManager() {
 
   std::cout << "Message queue closed" << std::endl;
 }
+#else
+ProgramManager::~ProgramManager() = default;
+#endif
 
 RTDeviceBinaryImage &
 ProgramManager::getDeviceImage(OSModuleHandle M, KernelSetId KSId,

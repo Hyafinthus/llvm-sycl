@@ -451,6 +451,8 @@ void Scheduler::enqueueLeavesOfReqUnlocked(const Requirement *const Req,
       #ifdef PRINT_TRACE
       std::cout << "===scheduler.cpp===10" << std::endl;
       #endif
+      bool Enqueued = GraphProcessor::enqueueCommand(Cmd, GraphReadLock, Res,
+                                                     ToCleanUp, Cmd);
       if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
         throw runtime_error("Enqueue process failed.",
                             PI_ERROR_INVALID_OPERATION);
