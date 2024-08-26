@@ -15,6 +15,8 @@
 #include <detail/sycl_mem_obj_t.hpp>
 #include <sycl/access/access.hpp>
 #include <sycl/exception.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#define PRINT_TRACE 1
 
 #include <cstdlib>
 #include <cstring>
@@ -136,16 +138,23 @@ static void handleVisitedNodes(std::vector<Command *> &Visited) {
   }
 }
 
+// 这个函数在addCG中实际上只传入了AllocaCmd 所有的DAG都是从AllocaCmd开始的
 static void printDotRecursive(std::fstream &Stream,
                               std::vector<Command *> &Visited, Command *Cmd) {
   if (!markNodeAsVisited(Cmd, Visited))
     return;
+  
+  // 先输出依赖于此Cmd的Cmd 即先输出的是后执行的
   for (Command *User : Cmd->MUsers) {
-    if (User)
+    if (User) {
+      std::cout << "--- Alloca Command: " << Cmd << " User Command: " << User << std::endl;
       printDotRecursive(Stream, Visited, User);
+    }
   }
+  std::cout << "--- before --- printDot: " << Cmd << " (" << typeid(Cmd).name() << ")" << std::endl;
   Cmd->printDot(Stream);
 }
+
 
 void Scheduler::GraphBuilder::printGraphAsDot(const char *ModeName) {
   static size_t Counter = 0;
@@ -160,9 +169,13 @@ void Scheduler::GraphBuilder::printGraphAsDot(const char *ModeName) {
 
   MVisitedCmds.clear();
 
+  // 用来存内存对象元数据
   for (SYCLMemObjI *MemObject : MMemObjs)
-    for (Command *AllocaCmd : MemObject->MRecord->MAllocaCommands)
+    // 只涉及了AllocaCmd 并没有传入ExecCmd 而是作为AllocaCmd->UserCmd使用
+    for (Command *AllocaCmd : MemObject->MRecord->MAllocaCommands) {
+      std::cout << "--- before --- printDotRecursive: " << AllocaCmd << std::endl;
       printDotRecursive(Stream, MVisitedCmds, AllocaCmd);
+    }
 
   Stream << "}" << std::endl;
 
@@ -458,11 +471,17 @@ Command *Scheduler::GraphBuilder::remapMemoryObject(
 Command *
 Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
                                      std::vector<Command *> &ToEnqueue) {
+  #ifdef PRINT_TRACE
+  std::cout << "======graph_build.cpp===addCopyBack" << std::endl;
+  #endif
+
   QueueImplPtr HostQueue = Scheduler::getInstance().getDefaultHostQueue();
   SYCLMemObjI *MemObj = Req->MSYCLMemObj;
   MemObjRecord *Record = getMemObjRecord(MemObj);
   if (Record && MPrintOptionsArray[BeforeAddCopyBack])
     printGraphAsDot("before_addCopyBack");
+
+  std::cout << "\n\n\n\n\n";
 
   // Do nothing if there were no or only read operations with the memory object.
   if (nullptr == Record || !Record->MMemModified)
@@ -486,14 +505,20 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
   for (Command *Dep : Deps) {
     Command *ConnCmd = MemCpyCmd->addDep(
         DepDesc{Dep, MemCpyCmd->getRequirement(), SrcAllocaCmd}, ToCleanUp);
-    if (ConnCmd)
+    std::cout << "======graph_build.cpp======MemCpyCmd: " << MemCpyCmd << " Dep: " << Dep << std::endl;
+    if (ConnCmd) {
+      std::cout << " ConnCmd: " << ConnCmd << std::endl;
       ToEnqueue.push_back(ConnCmd);
+    }
   }
 
   updateLeaves(Deps, Record, Req->MAccessMode, ToCleanUp);
   addNodeToLeaves(Record, MemCpyCmd, Req->MAccessMode, ToEnqueue);
   for (Command *Cmd : ToCleanUp)
     cleanupCommand(Cmd);
+
+  std::cout << "\n\n\n\n\n";
+
   if (MPrintOptionsArray[AfterAddCopyBack])
     printGraphAsDot("after_addCopyBack");
   return MemCpyCmd;
@@ -504,12 +529,18 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
 Command *
 Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
                                          std::vector<Command *> &ToEnqueue) {
+  #ifdef PRINT_TRACE
+  std::cout << "======graph_build.cpp===addHostAccessor" << std::endl;
+  #endif
 
   const QueueImplPtr &HostQueue = getInstance().getDefaultHostQueue();
 
   MemObjRecord *Record = getOrInsertMemObjRecord(HostQueue, Req, ToEnqueue);
   if (MPrintOptionsArray[BeforeAddHostAcc])
     printGraphAsDot("before_addHostAccessor");
+
+  std::cout << "\n\n\n\n\n";
+
   markModifiedIfWrite(Record, Req);
 
   AllocaCommandBase *HostAllocaCmd =
@@ -531,6 +562,8 @@ Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
                                Command::BlockReason::HostAccessor, ToEnqueue);
 
   Req->MBlockedCmd = EmptyCmd;
+
+  std::cout << "\n\n\n\n\n";
 
   if (MPrintOptionsArray[AfterAddHostAcc])
     printGraphAsDot("after_addHostAccessor");
@@ -921,23 +954,46 @@ Command *
 Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
                                const QueueImplPtr &Queue,
                                std::vector<Command *> &ToEnqueue) {
+  // Req是AccessorImplHost类 代表对Host数据的需求
+  // using Requirement = AccessorImplHost;
   std::vector<Requirement *> &Reqs = CommandGroup->MRequirements;
+
+  #ifdef PRINT_TRACE
+  std::cout << "======graph_build.cpp===addCG" << std::endl;
+  std::cout << "======graph_build.cpp === MEvents: " << CommandGroup->MEvents.size() << std::endl;
+  #endif
+
+  // Event通常用于异步表示Command完成状态
+  // 这里代表这个CG需要等待的所有前置Event 在现有bench的kernel上看都是空的
   const std::vector<detail::EventImplPtr> &Events = CommandGroup->MEvents;
 
+  // 返回NewCmd代表整个CG的执行
   auto NewCmd = std::make_unique<ExecCGCommand>(std::move(CommandGroup), Queue);
   if (!NewCmd)
     throw runtime_error("Out of host memory", PI_ERROR_OUT_OF_HOST_MEMORY);
 
   if (MPrintOptionsArray[BeforeAddCG])
     printGraphAsDot("before_addCG");
+  // ===============================
 
+  // 对同一内存需求可能有多个Req 合并这些Req
   // If there are multiple requirements for the same memory object, its
   // AllocaCommand creation will be dependent on the access mode of the first
   // requirement. Combine these access modes to take all of them into account.
   combineAccessModesOfReqs(Reqs);
+
+  // DAG只是执行顺序和依赖的结构 不直接参与每个Cmd的执行
+  // ToEnqueue和ToCleanUp是执行时数据结构
+  // 由于依赖和内存需求 Cmd的前置会加入ToEnqueue
+
+  // 表示图更新中不在需要的Cmd (操作完成 不再被依赖 被替代)
   std::vector<Command *> ToCleanUp;
+
+  // 对每个Req处理 1.判断是否同一上下文需要移动内存 2.在图里增加依赖关系 3.更新叶子节点
   for (Requirement *Req : Reqs) {
+    // MemObj是内存对象元数据 (引用计数 位置状态 操作 分配 依赖)
     MemObjRecord *Record = nullptr;
+    // Req相关的AllocCmd
     AllocaCommandBase *AllocaCmd = nullptr;
 
     bool isSameCtx = false;
@@ -958,15 +1014,22 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
           sameCtx(QueueForAlloca->getContextImplPtr(), Record->MCurContext);
     }
 
+    std::cout << "--- before --- after_addCG0" << std::endl;
+    if (MPrintOptionsArray[AfterAddCG])
+      printGraphAsDot("after_addCG0");
+
+    // 如果queue中上下文和内存对象不在同一个上下文 需要创建Mem移动的Command
     // If there is alloca command we need to check if the latest memory is in
     // required context.
     if (isSameCtx) {
+      std::cout << "===graph_builder.cpp===isSameCtx" << std::endl;
       // If the memory is already in the required host context, check if the
       // required access mode is valid, remap if not.
       if (Record->MCurContext->is_host() &&
           !isAccessModeAllowed(Req->MAccessMode, Record->MHostAccess))
         remapMemoryObject(Record, Req, AllocaCmd, ToEnqueue);
     } else {
+      std::cout << "===graph_builder.cpp===notSameCtx" << std::endl;
       // Cannot directly copy memory from OpenCL device to OpenCL device -
       // create two copies: device->host and host->device.
       bool NeedMemMoveToHost = false;
@@ -989,35 +1052,68 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
                          ToEnqueue);
       insertMemoryMove(Record, Req, MemMoveTargetQueue, ToEnqueue);
     }
+
+    std::cout << "--- before --- after_addCG1" << std::endl;
+    if (MPrintOptionsArray[AfterAddCG])
+      printGraphAsDot("after_addCG1");
+
+    // 下面是更新图的边 节点就是一个个Cmd 以Deps和Users作为遍历的边
+    // 一个Cmd Users是依赖于此Cmd的 Deps是此Cmd依赖的 见commands.hpp
     std::set<Command *> Deps =
         findDepsForReq(Record, Req, Queue->getContextImplPtr());
 
+    std::cout << "Deps Size: " << Deps.size() << std::endl;
+
+    // 为图增加边 即A->B CmdA.Dep=CmdB CmdB.User=CmdA
+    // Dep在这里都是以AllocaCmd为基准
     for (Command *Dep : Deps) {
       Command *ConnCmd =
           NewCmd->addDep(DepDesc{Dep, Req, AllocaCmd}, ToCleanUp);
       if (ConnCmd)
         ToEnqueue.push_back(ConnCmd);
     }
+
+    std::cout << "--- before --- after_addCG2" << std::endl;
+    if (MPrintOptionsArray[AfterAddCG])
+      printGraphAsDot("after_addCG2");
   }
 
+  std::cout << "\n\n\n\n\n";
+  std::cout << "ExecCmd: " << &NewCmd << std::endl;
+  // " AllCmd1: " << &(NewCmd->MDeps.at(0).MDepCommand)
+  // << " AllCmd2: " << &(NewCmd->MDeps.at(1).MDepCommand) << std::endl;
+  
+  // 在DAG中 root是后执行的(Exec) leaf是先执行的(Alloca) 叶子是能立即执行的命令 因为没有任何依赖
+  // 这个NewCmd代表整CG执行 是最后执行的 它的Deps就是其所有依赖的Cmd 即是往下的子节点
   // Set new command as user for dependencies and update leaves.
   // Node dependencies can be modified further when adding the node to leaves,
   // iterate over their copy.
   // FIXME employ a reference here to eliminate copying of a vector
   std::vector<DepDesc> Deps = NewCmd->MDeps;
+
+  std::cout << "Deps: " << &Deps << " count: " << Deps.size() << std::endl;
+
+  // 更新Leaves
   for (DepDesc &Dep : Deps) {
     const Requirement *Req = Dep.MDepRequirement;
     MemObjRecord *Record = getMemObjRecord(Req->MSYCLMemObj);
+    std::cout << "DepCmd: " << Dep.MDepCommand << " Req: " << Req << " Record: " << Record << std::endl;
     updateLeaves({Dep.MDepCommand}, Record, Req->MAccessMode, ToCleanUp);
     addNodeToLeaves(Record, NewCmd.get(), Req->MAccessMode, ToEnqueue);
   }
+  std::cout << "\n\n\n\n\n";
 
+  // 不是用户显式制定的依赖 是这个CG的所有前置Event
   // Register all the events as dependencies
   for (detail::EventImplPtr e : Events) {
     if (Command *ConnCmd = NewCmd->addDep(e, ToCleanUp))
       ToEnqueue.push_back(ConnCmd);
   }
 
+  // 放弃添加CommunicationCommand
+  // auto CommCmd = std::make_unique<CommunicationCommand>(Queue);
+
+  // ===============================
   if (MPrintOptionsArray[AfterAddCG])
     printGraphAsDot("after_addCG");
 

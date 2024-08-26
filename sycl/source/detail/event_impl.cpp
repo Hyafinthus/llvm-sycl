@@ -13,6 +13,9 @@
 #include <detail/scheduler/scheduler.hpp>
 #include <sycl/context.hpp>
 #include <sycl/device_selector.hpp>
+#include <sycl/detail/iostream_proxy.hpp> 
+#define PRINT_TRACE 1
+// #define MODIFY 1
 
 #include "detail/config.hpp"
 
@@ -225,13 +228,40 @@ void event_impl::wait(std::shared_ptr<sycl::detail::event_impl> Self) {
   TelemetryEvent = instrumentationProlog(Name, StreamID, IId);
 #endif
 
-  if (MEvent)
+  if (MEvent) {
     // presence of MEvent means the command has been enqueued, so no need to
     // go via the slow path event waiting in the scheduler
+    #ifdef MODIFY
+    pi_event_status Status = PI_EVENT_QUEUED;
+    getPlugin().call<PiApiKind::piEventGetInfo>(MEvent, PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
+    std::cout << "\n===event_impl.cpp===MEvent's Command1: " << MCommand << ", MState: " << MState << ", MEventStatus: " << Status << std::endl;
+
+    Command* DepCmd = static_cast<Command *>(MCommand)->MDeps.at(0).MDepCommand;
+    if (DepCmd->getType() == Command::CommandType::RUN_CG) {
+      RT::PiEvent DepEvent = DepCmd->getEvent()->MEvent;
+      getPlugin().call<PiApiKind::piEventGetInfo>(DepEvent, PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
+      std::cout << "DepCmd: " << DepCmd << ", MEventStatus: " << Status << std::endl;
+    }
+    #endif
+
     waitInternal();
-  else if (MCommand)
+    std::cout << "===event_impl.cpp=== after waitinternal" << std::endl;
+
+    #ifdef MODIFY
+    getPlugin().call<PiApiKind::piEventGetInfo>(MEvent, PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
+    std::cout << "===event_impl.cpp===MEvent's Command2: " << MCommand << ", MState: " << MState << ", MEventStatus: " << Status << "\n"<< std::endl;
+    // static_cast<Command *>(MCommand)->getEvent()->MState
+    #endif
+  }
+  else if (MCommand) {
+    #ifdef PRINT_TRACE
+    std::cout << "===event_impl.cpp===MCommand" << std::endl;
+    #endif
     detail::Scheduler::getInstance().waitForEvent(Self);
+  }
+
   cleanupCommand(std::move(Self));
+  std::cout << "===event_impl.cpp=== after cleanup" << std::endl;
 
 #ifdef XPTI_ENABLE_INSTRUMENTATION
   instrumentationEpilog(TelemetryEvent, Name, StreamID, IId);

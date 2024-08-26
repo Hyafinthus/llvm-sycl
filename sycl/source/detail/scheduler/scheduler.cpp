@@ -13,6 +13,9 @@
 #include <detail/scheduler/scheduler_helpers.hpp>
 #include <detail/stream_impl.hpp>
 #include <sycl/device_selector.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#include <mpi.h>
+#define PRINT_TRACE 1
 
 #include <chrono>
 #include <cstdio>
@@ -47,6 +50,9 @@ void Scheduler::waitForRecordToFinish(MemObjRecord *Record,
   std::vector<Command *> ToCleanUp;
   for (Command *Cmd : Record->MReadLeaves) {
     EnqueueResultT Res;
+    #ifdef PRINT_TRACE
+    std::cout << "===scheduler.cpp===1" << std::endl;
+    #endif
     bool Enqueued = GraphProcessor::enqueueCommand(Cmd, Res, ToCleanUp, Cmd);
     if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
       throw runtime_error("Enqueue process failed.",
@@ -59,6 +65,9 @@ void Scheduler::waitForRecordToFinish(MemObjRecord *Record,
   }
   for (Command *Cmd : Record->MWriteLeaves) {
     EnqueueResultT Res;
+    #ifdef PRINT_TRACE
+    std::cout << "===scheduler.cpp===2" << std::endl;
+    #endif
     bool Enqueued = GraphProcessor::enqueueCommand(Cmd, Res, ToCleanUp, Cmd);
     if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
       throw runtime_error("Enqueue process failed.",
@@ -71,6 +80,9 @@ void Scheduler::waitForRecordToFinish(MemObjRecord *Record,
   for (AllocaCommandBase *AllocaCmd : Record->MAllocaCommands) {
     Command *ReleaseCmd = AllocaCmd->getReleaseCmd();
     EnqueueResultT Res;
+    #ifdef PRINT_TRACE
+    std::cout << "===scheduler.cpp===3" << std::endl;
+    #endif
     bool Enqueued =
         GraphProcessor::enqueueCommand(ReleaseCmd, Res, ToCleanUp, ReleaseCmd);
     if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
@@ -92,6 +104,9 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
   const CG::CGTYPE Type = CommandGroup->getType();
   std::vector<Command *> AuxiliaryCmds;
   std::vector<StreamImplPtr> Streams;
+  #ifdef PRINT_TRACE
+  std::cout << "======scheduler.cpp===addCG: " << Type << std::endl;
+  #endif
 
   if (Type == CG::Kernel) {
     Streams = ((CGExecKernel *)CommandGroup.get())->getStreams();
@@ -123,6 +138,12 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
                                    AuxiliaryCmds);
     }
     NewEvent = NewCmd->getEvent();
+
+    // 从1开始
+    if (Type == CG::Kernel) {
+      GlobalHandler::instance().kernel_cmd_count++;
+      NewCmd->kernel_index = GlobalHandler::instance().kernel_cmd_count;
+    }
   }
 
   std::vector<Command *> ToCleanUp;
@@ -142,6 +163,9 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
     };
 
     for (Command *Cmd : AuxiliaryCmds) {
+      #ifdef PRINT_TRACE
+      std::cout << "===scheduler.cpp===4" << std::endl;
+      #endif
       Enqueued = GraphProcessor::enqueueCommand(Cmd, Res, ToCleanUp, Cmd);
       try {
         if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
@@ -159,6 +183,9 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
       // TODO: Check if lazy mode.
       EnqueueResultT Res;
       try {
+        #ifdef PRINT_TRACE
+        std::cout << "===scheduler.cpp===5" << std::endl;
+        #endif
         bool Enqueued =
             GraphProcessor::enqueueCommand(NewCmd, Res, ToCleanUp, NewCmd);
         if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
@@ -177,6 +204,58 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
   for (auto StreamImplPtr : Streams) {
     StreamImplPtr->flush(NewEvent);
   }
+
+  // 为什么DAG中增加Command不可行
+  // 1. DAG是隐式构建的 它会用两个成员变量连接不同的Command表示之间的关系 但执行不会用这两个 而是其他的逻辑
+  // 2. 执行涉及到MemObj Leaves Event Record Req无法解耦 想在图里插入Command就得处理所有相关数据结构的正确初始化
+  // 但不同类对应的生命周期完全不同 一个Command会涉及其他很多新相关的类 且有的类只是为特定类别的Command服务 逻辑也是写死的
+  // 做不到解耦
+  // 现在在尝试两种思路 1.直接在上层secheduler那里获取实际数据指针 2.仍添加Command 好处是能为后续涉及DAG 标准 通用
+  // kernel间拆分还是应该从DAG 整个sycl运行时
+  // 执行一部分有一部分的DAG 应该对整个程序预处理分析依赖
+  // 在此处代表Kernel的ExecCG已经执行完毕 可以同步 不一定非要在DAG中同步
+  // 但DAG应该仍需要考虑 后续Kernel分解还是涉及DAG
+  // 需要能够获取KernelCG的 DAG-AllocaCmd 或 Args-Ptr
+
+  std::cout << "\n\n\n\n\nscheduler::addCG==================================" << std::endl;
+  Command * KCmd = static_cast<Command *>(NewEvent->getCommand());
+  std::cout << "Cmd: " << KCmd << std::endl;
+  for (const DepDesc Dep : KCmd->MDeps) {
+    std::cout << "DepCmd: " << Dep.MDepCommand << std::endl;
+    std::cout << "AllocCmd: " << Dep.MAllocaCmd << std::endl;
+    // Requirement = AccessorImplHost
+    std::cout << "Req: " << Dep.MDepRequirement << std::endl;
+    // MemObjRecord 用来存内存元数据
+    std::cout << "Record for Req: " << getMemObjRecord(Dep.MDepRequirement) << std::endl;
+    // void * AllocCmd成员变量 是不是数据指针？ 应该是的
+    std::cout << "MemAllocation: " << Dep.MAllocaCmd->MMemAllocation << std::endl;
+  }
+  for (const Command * User : KCmd->MUsers) {
+    std::cout << "User: " << User << std::endl;
+  }
+
+  // 在等待计算完毕通信
+  // int mpi_size = GlobalHandler::instance().mpi_size;
+  // int mpi_rank = GlobalHandler::instance().mpi_rank;
+  // 要判断那些Cmd需要等待哪些可以先submit
+  // if (KCmd->kernel_index > 0) {
+  //   if (KCmd->kernel_index == 2) {
+  //     if (mpi_rank == 0) {
+  //       // 要recv到Cmd2的Deps里
+  //       for (const DepDesc Dep : KCmd->MDeps) {
+  //         MPI_Recv(Dep.MAllocaCmd->MMemAllocation, 1024*1024, MPI_FLOAT, 1, 0, MPI_COMM_WORLD, nullptr);
+  //       }
+  //     } else {        
+  //       std::cout << "\nMPIRANK: " << mpi_rank << " NewCmd: " << KCmd << ", MEventStatus: " << NewEvent->piCheckStatus() << std::endl;
+  //       NewEvent->wait(NewEvent);
+  //       std::cout << "\nMPIRANK: " << mpi_rank << " NewCmd: " << KCmd << ", MEventStatus: " << NewEvent->piCheckStatus() << std::endl;
+  //       for (const DepDesc Dep : KCmd->MDeps) {
+  //         MPI_Send(Dep.MAllocaCmd->MMemAllocation, 1024*1024, MPI_FLOAT, 0, 0, MPI_COMM_WORLD);
+  //       }
+  //       exit(0);
+  //     }
+  //   }
+  // }
 
   return NewEvent;
 }
@@ -200,12 +279,18 @@ EventImplPtr Scheduler::addCopyBack(Requirement *Req) {
     bool Enqueued;
 
     for (Command *Cmd : AuxiliaryCmds) {
+      #ifdef PRINT_TRACE
+      std::cout << "===scheduler.cpp===6" << std::endl;
+      #endif
       Enqueued = GraphProcessor::enqueueCommand(Cmd, Res, ToCleanUp, Cmd);
       if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
         throw runtime_error("Enqueue process failed.",
                             PI_ERROR_INVALID_OPERATION);
     }
 
+    #ifdef PRINT_TRACE
+    std::cout << "===scheduler.cpp===7" << std::endl;
+    #endif
     Enqueued = GraphProcessor::enqueueCommand(NewCmd, Res, ToCleanUp, NewCmd);
     if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
       throw runtime_error("Enqueue process failed.",
@@ -333,6 +418,9 @@ EventImplPtr Scheduler::addHostAccessor(Requirement *Req) {
     bool Enqueued;
 
     for (Command *Cmd : AuxiliaryCmds) {
+      #ifdef PRINT_TRACE
+      std::cout << "===scheduler.cpp===8" << std::endl;
+      #endif
       Enqueued = GraphProcessor::enqueueCommand(Cmd, Res, ToCleanUp, Cmd);
       if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
         throw runtime_error("Enqueue process failed.",
@@ -340,6 +428,9 @@ EventImplPtr Scheduler::addHostAccessor(Requirement *Req) {
     }
 
     if (Command *NewCmd = static_cast<Command *>(NewCmdEvent->getCommand())) {
+      #ifdef PRINT_TRACE
+      std::cout << "===scheduler.cpp===9" << std::endl;
+      #endif
       Enqueued = GraphProcessor::enqueueCommand(NewCmd, Res, ToCleanUp, NewCmd);
       if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
         throw runtime_error("Enqueue process failed.",
@@ -373,6 +464,9 @@ void Scheduler::enqueueLeavesOfReqUnlocked(const Requirement *const Req,
   auto EnqueueLeaves = [&ToCleanUp](LeavesCollection &Leaves) {
     for (Command *Cmd : Leaves) {
       EnqueueResultT Res;
+      #ifdef PRINT_TRACE
+      std::cout << "===scheduler.cpp===10" << std::endl;
+      #endif
       bool Enqueued = GraphProcessor::enqueueCommand(Cmd, Res, ToCleanUp, Cmd);
       if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
         throw runtime_error("Enqueue process failed.",
@@ -392,6 +486,9 @@ void Scheduler::enqueueUnblockedCommands(
     if (!Cmd)
       continue;
     EnqueueResultT Res;
+    #ifdef PRINT_TRACE
+    std::cout << "===scheduler.cpp===11" << std::endl;
+    #endif
     bool Enqueued = GraphProcessor::enqueueCommand(Cmd, Res, ToCleanUp, Cmd);
     if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
       throw runtime_error("Enqueue process failed.",

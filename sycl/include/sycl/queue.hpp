@@ -116,6 +116,7 @@ public:
                  const property_list &PropList = {})
       : queue(detail::select_device(deviceSelector), AsyncHandler, PropList) {}
 
+  // 一个selector作为初始化列表参数的构造函数，直接调用select_device，而cpu_selector_v是个函数对象，在select_device中对每个设备调用cpu_selector_v，返回最大的那个设备
   /// Constructs a SYCL queue instance using the device identified by the
   /// device selector provided.
   /// \param DeviceSelector is SYCL 2020 Device Selector, a simple callable that

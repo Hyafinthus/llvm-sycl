@@ -19,76 +19,76 @@
 // list.
 //
 // Platform
-_PI_API(piPlatformsGet)
+_PI_API(piPlatformsGet) //
 _PI_API(piPlatformGetInfo)
-_PI_API(piextPlatformGetNativeHandle)
-_PI_API(piextPlatformCreateWithNativeHandle)
+_PI_API(piextPlatformGetNativeHandle) //no
+_PI_API(piextPlatformCreateWithNativeHandle) //c
 // Device
-_PI_API(piDevicesGet)
-_PI_API(piDeviceGetInfo)
+_PI_API(piDevicesGet) //
+_PI_API(piDeviceGetInfo) //
 _PI_API(piDevicePartition)
 _PI_API(piDeviceRetain)
 _PI_API(piDeviceRelease)
-_PI_API(piextDeviceSelectBinary)
-_PI_API(piextGetDeviceFunctionPointer)
-_PI_API(piextDeviceGetNativeHandle)
-_PI_API(piextDeviceCreateWithNativeHandle)
+_PI_API(piextDeviceSelectBinary) //
+_PI_API(piextGetDeviceFunctionPointer) //
+_PI_API(piextDeviceGetNativeHandle) //no
+_PI_API(piextDeviceCreateWithNativeHandle) //c
 // Context
-_PI_API(piContextCreate)
-_PI_API(piContextGetInfo)
+_PI_API(piContextCreate) //c
+_PI_API(piContextGetInfo) //
 _PI_API(piContextRetain)
 _PI_API(piContextRelease)
 _PI_API(piextContextSetExtendedDeleter)
-_PI_API(piextContextGetNativeHandle)
-_PI_API(piextContextCreateWithNativeHandle)
+_PI_API(piextContextGetNativeHandle) //no
+_PI_API(piextContextCreateWithNativeHandle) //c
 // Queue
-_PI_API(piQueueCreate)
-_PI_API(piextQueueCreate)
-_PI_API(piQueueGetInfo)
+_PI_API(piQueueCreate) //c
+_PI_API(piextQueueCreate) //no
+_PI_API(piQueueGetInfo) //
 _PI_API(piQueueFinish)
 _PI_API(piQueueFlush)
 _PI_API(piQueueRetain)
 _PI_API(piQueueRelease)
-_PI_API(piextQueueGetNativeHandle)
-_PI_API(piextQueueCreateWithNativeHandle)
+_PI_API(piextQueueGetNativeHandle) //no
+_PI_API(piextQueueCreateWithNativeHandle) //c
 // Memory
-_PI_API(piMemBufferCreate)
-_PI_API(piMemImageCreate)
+_PI_API(piMemBufferCreate) //c
+_PI_API(piMemImageCreate) //c
 _PI_API(piMemGetInfo)
 _PI_API(piMemImageGetInfo)
 _PI_API(piMemRetain)
 _PI_API(piMemRelease)
-_PI_API(piMemBufferPartition)
-_PI_API(piextMemGetNativeHandle)
-_PI_API(piextMemCreateWithNativeHandle)
+_PI_API(piMemBufferPartition) //
+_PI_API(piextMemGetNativeHandle) //no
+_PI_API(piextMemCreateWithNativeHandle) //c
 // Program
-_PI_API(piProgramCreate)
-_PI_API(piclProgramCreateWithSource)
-_PI_API(piProgramCreateWithBinary)
+_PI_API(piProgramCreate) //c
+_PI_API(piclProgramCreateWithSource) //c
+_PI_API(piProgramCreateWithBinary) //c
 _PI_API(piProgramGetInfo)
 _PI_API(piProgramCompile)
 _PI_API(piProgramBuild)
-_PI_API(piProgramLink)
+_PI_API(piProgramLink) //
 _PI_API(piProgramGetBuildInfo)
 _PI_API(piProgramRetain)
 _PI_API(piProgramRelease)
-_PI_API(piextProgramSetSpecializationConstant)
-_PI_API(piextProgramGetNativeHandle)
-_PI_API(piextProgramCreateWithNativeHandle)
+_PI_API(piextProgramSetSpecializationConstant) //
+_PI_API(piextProgramGetNativeHandle) //no
+_PI_API(piextProgramCreateWithNativeHandle) //c
 // Kernel
-_PI_API(piKernelCreate)
+_PI_API(piKernelCreate) //c
 _PI_API(piKernelSetArg)
 _PI_API(piKernelGetInfo)
-_PI_API(piKernelGetGroupInfo)
-_PI_API(piKernelGetSubGroupInfo)
+_PI_API(piKernelGetGroupInfo) //
+_PI_API(piKernelGetSubGroupInfo) //
 _PI_API(piKernelRetain)
 _PI_API(piKernelRelease)
-_PI_API(piextKernelSetArgPointer)
-_PI_API(piKernelSetExecInfo)
-_PI_API(piextKernelCreateWithNativeHandle)
-_PI_API(piextKernelGetNativeHandle)
+_PI_API(piextKernelSetArgPointer) //
+_PI_API(piKernelSetExecInfo) //
+_PI_API(piextKernelCreateWithNativeHandle) //c
+_PI_API(piextKernelGetNativeHandle) //no
 // Event
-_PI_API(piEventCreate)
+_PI_API(piEventCreate) //c
 _PI_API(piEventGetInfo)
 _PI_API(piEventGetProfilingInfo)
 _PI_API(piEventsWait)
@@ -96,10 +96,10 @@ _PI_API(piEventSetCallback)
 _PI_API(piEventSetStatus)
 _PI_API(piEventRetain)
 _PI_API(piEventRelease)
-_PI_API(piextEventGetNativeHandle)
-_PI_API(piextEventCreateWithNativeHandle)
+_PI_API(piextEventGetNativeHandle) //no
+_PI_API(piextEventCreateWithNativeHandle) //c
 // Sampler
-_PI_API(piSamplerCreate)
+_PI_API(piSamplerCreate) //c
 _PI_API(piSamplerGetInfo)
 _PI_API(piSamplerRetain)
 _PI_API(piSamplerRelease)
@@ -119,21 +119,21 @@ _PI_API(piEnqueueMemImageRead)
 _PI_API(piEnqueueMemImageWrite)
 _PI_API(piEnqueueMemImageCopy)
 _PI_API(piEnqueueMemImageFill)
-_PI_API(piEnqueueMemBufferMap)
+_PI_API(piEnqueueMemBufferMap) //
 _PI_API(piEnqueueMemUnmap)
 // USM
-_PI_API(piextUSMHostAlloc)
-_PI_API(piextUSMDeviceAlloc)
-_PI_API(piextUSMSharedAlloc)
-_PI_API(piextUSMFree)
-_PI_API(piextUSMEnqueueMemset)
-_PI_API(piextUSMEnqueueMemcpy)
-_PI_API(piextUSMEnqueuePrefetch)
-_PI_API(piextUSMEnqueueMemAdvise)
-_PI_API(piextUSMGetMemAllocInfo)
+_PI_API(piextUSMHostAlloc) //
+_PI_API(piextUSMDeviceAlloc) //
+_PI_API(piextUSMSharedAlloc) //
+_PI_API(piextUSMFree) //
+_PI_API(piextUSMEnqueueMemset) //
+_PI_API(piextUSMEnqueueMemcpy) //
+_PI_API(piextUSMEnqueuePrefetch) //
+_PI_API(piextUSMEnqueueMemAdvise) //
+_PI_API(piextUSMGetMemAllocInfo) //
 
-_PI_API(piextKernelSetArgMemObj)
-_PI_API(piextKernelSetArgSampler)
+_PI_API(piextKernelSetArgMemObj) //
+_PI_API(piextKernelSetArgSampler) //
 
 _PI_API(piextPluginGetOpaqueData)
 
@@ -141,8 +141,8 @@ _PI_API(piPluginGetLastError)
 
 _PI_API(piTearDown)
 
-_PI_API(piextUSMEnqueueFill2D)
-_PI_API(piextUSMEnqueueMemset2D)
-_PI_API(piextUSMEnqueueMemcpy2D)
+_PI_API(piextUSMEnqueueFill2D) //invald 
+_PI_API(piextUSMEnqueueMemset2D) //invald 
+_PI_API(piextUSMEnqueueMemcpy2D) //invald 
 
 #undef _PI_API

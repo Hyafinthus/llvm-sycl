@@ -691,7 +691,7 @@ protected:
       AfterAddHostAcc,
       Size
     };
-    std::array<bool, PrintOptions::Size> MPrintOptionsArray{false};
+    std::array<bool, PrintOptions::Size> MPrintOptionsArray{true,true,true,true,true,true};//{false};
   };
 
   /// Graph Processor provides interfaces for enqueueing commands and their

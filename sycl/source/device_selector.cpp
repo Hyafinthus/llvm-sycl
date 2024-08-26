@@ -131,11 +131,20 @@ device select_device(DSelectorInvocableType DeviceSelectorInvocable,
   throw sycl::runtime_error(Message, PI_ERROR_DEVICE_NOT_FOUND);
 }
 
+// 需要重写这个函数 暂时不需要确定设备
 // select_device(selector)
+// __SYCL_EXPORT device
+// select_device(const DSelectorInvocableType &DeviceSelectorInvocable) {
+//   std::vector<device> Devices = device::get_devices();
+//   return select_device(DeviceSelectorInvocable, Devices);
+// }
 __SYCL_EXPORT device
 select_device(const DSelectorInvocableType &DeviceSelectorInvocable) {
-  std::vector<device> Devices = device::get_devices();
+  return device();
+}
 
+device select_device(DSelectorInvocableType DeviceSelectorInvocable, bool rebind) {
+  std::vector<device> Devices = device::get_devices();
   return select_device(DeviceSelectorInvocable, Devices);
 }
 

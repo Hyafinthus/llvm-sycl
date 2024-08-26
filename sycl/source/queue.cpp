@@ -9,6 +9,7 @@
 #include <detail/backend_impl.hpp>
 #include <detail/event_impl.hpp>
 #include <detail/queue_impl.hpp>
+#include <detail/device_impl.hpp>
 #include <sycl/event.hpp>
 #include <sycl/exception_list.hpp>
 #include <sycl/ext/codeplay/experimental/fusion_properties.hpp>
@@ -44,10 +45,16 @@ queue::queue(const context &SyclContext, const device &SyclDevice,
       AsyncHandler, PropList);
 }
 
+// 已经在device_selector中选择完设备，创建一个具体的queue_impl对象，将device作为属性给这个queue
+// queue::queue(const device &SyclDevice, const async_handler &AsyncHandler,
+//              const property_list &PropList) {
+//   impl = std::make_shared<detail::queue_impl>(
+//       detail::getSyclObjImpl(SyclDevice), AsyncHandler, PropList);
+// }
 queue::queue(const device &SyclDevice, const async_handler &AsyncHandler,
              const property_list &PropList) {
-  impl = std::make_shared<detail::queue_impl>(
-      detail::getSyclObjImpl(SyclDevice), AsyncHandler, PropList);
+  impl = std::make_shared<detail::queue_impl>(detail::DeviceImplPtr(nullptr), AsyncHandler, PropList);
+  impl->setShell();
 }
 
 queue::queue(cl_command_queue clQueue, const context &SyclContext,
@@ -137,7 +144,15 @@ event queue::discard_or_return(const event &Event) {
 
 event queue::submit_impl(std::function<void(handler &)> CGH,
                          const detail::code_location &CodeLoc) {
-  return impl->submit(CGH, impl, CodeLoc);
+  // return impl->submit(CGH, impl, CodeLoc);
+  // 需要在这里处理替换impl的引用问题
+  event ret = impl->submit(CGH, impl, CodeLoc);
+  std::shared_ptr<detail::queue_impl> newImpl = detail::getSyclObjImpl(ret)->getQueueImpl();
+  if (newImpl) {
+    std::cout << "=== queue rebind impl" << std::endl;
+    impl = newImpl;
+  }
+  return ret;
 }
 
 event queue::submit_impl(std::function<void(handler &)> CGH, queue SecondQueue,

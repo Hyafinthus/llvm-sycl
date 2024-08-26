@@ -4,6 +4,8 @@
 #cmake_policy(SET CMP0057 NEW)
 #include(AddLLVM)
 
+find_package(MPI REQUIRED)
+
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/version.rc.in
   ${CMAKE_CURRENT_BINARY_DIR}/version.rc
@@ -22,6 +24,7 @@ function(add_sycl_rt_library LIB_NAME LIB_OBJ_NAME)
   cmake_parse_arguments(ARG "" "XPTI_LIB" "COMPILE_OPTIONS;SOURCES" ${ARGN})
 
   add_library(${LIB_OBJ_NAME} OBJECT ${ARG_SOURCES})
+  target_include_directories(${LIB_OBJ_NAME} PRIVATE ${MPI_CXX_INCLUDE_PATH}) 
   add_library(${LIB_NAME} SHARED
               $<TARGET_OBJECTS:${LIB_OBJ_NAME}>
               ${CMAKE_CURRENT_BINARY_DIR}/version.rc)
@@ -93,6 +96,7 @@ function(add_sycl_rt_library LIB_NAME LIB_OBJ_NAME)
     PRIVATE
       ${CMAKE_DL_LIBS}
       ${CMAKE_THREAD_LIBS_INIT}
+      ${MPI_CXX_LIBRARIES}
   )
 
   add_common_options(${LIB_NAME} ${LIB_OBJ_NAME})
