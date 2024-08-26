@@ -138,6 +138,7 @@ using EnableIfSYCL2020DeviceSelectorInvocable = std::enable_if_t<
     !std::is_base_of_v<ext::oneapi::filter_selector, DeviceSelector> &&
     !std::is_base_of_v<device_selector, DeviceSelector>>;
 
+// 调用source中实现，返回一个nullptr
 __SYCL_EXPORT device
 select_device(const DSelectorInvocableType &DeviceSelectorInvocable);
 

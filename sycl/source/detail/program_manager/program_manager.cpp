@@ -28,6 +28,8 @@
 #include <sycl/exception.hpp>
 #include <sycl/ext/oneapi/experimental/spec_constant.hpp>
 #include <sycl/stl.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#define PRINT_TRACE 1
 
 #include <algorithm>
 #include <cassert>
@@ -47,7 +49,7 @@ namespace detail {
 
 using ContextImplPtr = std::shared_ptr<sycl::detail::context_impl>;
 
-static constexpr int DbgProgMgr = 0;
+static constexpr int DbgProgMgr = 1;
 
 static constexpr char UseSpvEnv[]("SYCL_USE_KERNEL_SPV");
 
@@ -98,6 +100,10 @@ createBinaryProgram(const ContextImplPtr Context, const device &Device,
 static RT::PiProgram createSpirvProgram(const ContextImplPtr Context,
                                         const unsigned char *Data,
                                         size_t DataLen) {
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===createSpirvProgram" << std::endl;
+  #endif
+
   RT::PiProgram Program = nullptr;
   const detail::plugin &Plugin = Context->getPlugin();
   Plugin.call<PiApiKind::piProgramCreate>(Context->getHandleRef(), Data,
@@ -319,6 +325,11 @@ RT::PiProgram ProgramManager::createPIProgram(const RTDeviceBinaryImage &Img,
 
   // Load the image
   const ContextImplPtr Ctx = getSyclObjImpl(Context);
+
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===before_createSpirvProgram" << std::endl;
+  #endif
+
   RT::PiProgram Res = Format == PI_DEVICE_BINARY_TYPE_SPIRV
                           ? createSpirvProgram(Ctx, RawImg.BinaryStart, ImgSize)
                           : createBinaryProgram(Ctx, Device, RawImg.BinaryStart,
@@ -507,6 +518,10 @@ RT::PiProgram ProgramManager::getBuiltPIProgram(
   if (Prg)
     Prg->stableSerializeSpecConstRegistry(SpecConsts);
 
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===Check_Root_Device" << std::endl;
+  #endif
+
   // Check if we can optimize program builds for sub-devices by using a program
   // built for the root device
   DeviceImplPtr RootDevImpl = DeviceImpl;
@@ -518,6 +533,10 @@ RT::PiProgram ProgramManager::getBuiltPIProgram(
       break;
     RootDevImpl = ParentDev;
   }
+
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===5 piDeviceGetInfo" << std::endl;
+  #endif
 
   pi_bool MustBuildOnSubdevice = PI_TRUE;
   ContextImpl->getPlugin().call<PiApiKind::piDeviceGetInfo>(
@@ -575,13 +594,23 @@ RT::PiProgram ProgramManager::getBuiltPIProgram(
     }
   }
 
+  // lambda
   auto BuildF = [this, &Img, &Context, &ContextImpl, &Device, Prg, &CompileOpts,
                  &LinkOpts, SpecConsts] {
+
     const detail::plugin &Plugin = ContextImpl->getPlugin();
     applyOptionsFromImage(CompileOpts, LinkOpts, Img, {Device}, Plugin);
 
+    #ifdef PRINT_TRACE
+    std::cout << "===pgm_mng.cpp===lambda_BuildF_before_getOrCreatePIProgram" << std::endl;
+    #endif
+
     auto [NativePrg, DeviceCodeWasInCache] = getOrCreatePIProgram(
         Img, Context, Device, CompileOpts + LinkOpts, SpecConsts);
+
+    #ifdef PRINT_TRACE
+    std::cout << "===pgm_mng.cpp===lambda_BuildF_after_getOrCreatePIProgram" << std::endl;
+    #endif
 
     if (!DeviceCodeWasInCache) {
       if (Prg)
@@ -589,6 +618,10 @@ RT::PiProgram ProgramManager::getBuiltPIProgram(
       if (Img.supportsSpecConstants())
         enableITTAnnotationsIfNeeded(NativePrg, Plugin);
     }
+
+    #ifdef PRINT_TRACE
+    std::cout << "===pgm_mng.cpp===lambda_BuildF_1" << std::endl;
+    #endif
 
     ProgramPtr ProgramManaged(
         NativePrg, Plugin.getPiPlugin().PiFunctionTable.piProgramRelease);
@@ -605,9 +638,17 @@ RT::PiProgram ProgramManager::getBuiltPIProgram(
         !SYCLConfig<SYCL_DEVICELIB_NO_FALLBACK>::get())
       DeviceLibReqMask = getDeviceLibReqMask(Img);
 
+    #ifdef PRINT_TRACE
+    std::cout << "===pgm_mng.cpp===lambda_BuildF_2" << std::endl;
+    #endif
+
     ProgramPtr BuiltProgram =
         build(std::move(ProgramManaged), ContextImpl, CompileOpts, LinkOpts,
               getRawSyclObjImpl(Device)->getHandleRef(), DeviceLibReqMask);
+
+    #ifdef PRINT_TRACE
+    std::cout << "===pgm_mng.cpp===lambda_BuildF_3" << std::endl;
+    #endif
 
     emitBuiltProgramInfo(BuiltProgram.get(), ContextImpl);
 
@@ -626,6 +667,11 @@ RT::PiProgram ProgramManager::getBuiltPIProgram(
   };
 
   uint32_t ImgId = Img.getImageID();
+
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===lambda_BuildF_before_getOrBuild" << std::endl;
+  #endif
+
   const RT::PiDevice PiDevice = Dev->getHandleRef();
   auto CacheKey =
       std::make_pair(std::make_pair(std::move(SpecConsts), ImgId),
@@ -656,11 +702,17 @@ ProgramManager::getOrCreateKernel(OSModuleHandle M,
 
   using PiKernelT = KernelProgramCache::PiKernelT;
 
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===getKernelProgramCache" << std::endl;
+  #endif
   KernelProgramCache &Cache = ContextImpl->getKernelProgramCache();
 
   std::string CompileOpts, LinkOpts;
   SerializedObj SpecConsts;
   if (Prg) {
+    #ifdef PRINT_TRACE
+    std::cout << "===pgm_mng.cpp===Prg" << std::endl;
+    #endif
     CompileOpts = Prg->get_build_options();
     Prg->stableSerializeSpecConstRegistry(SpecConsts);
   }
@@ -673,6 +725,9 @@ ProgramManager::getOrCreateKernel(OSModuleHandle M,
   if (std::get<0>(ret_tuple))
     return ret_tuple;
 
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===getBuiltPIProgram" << std::endl;
+  #endif
   RT::PiProgram Program =
       getBuiltPIProgram(M, ContextImpl, DeviceImpl, KernelName, Prg);
 
@@ -691,6 +746,10 @@ ProgramManager::getOrCreateKernel(OSModuleHandle M,
     return Result;
   };
 
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===getOrCreateKernel_before_getOrBuild" << std::endl;
+  #endif
+  
   auto GetCachedBuildF = [&Cache, &KernelName, Program]() {
     return Cache.getOrInsertKernel(Program, KernelName);
   };
@@ -1114,6 +1173,10 @@ ProgramManager::build(ProgramPtr Program, const ContextImplPtr Context,
     return Program;
   }
 
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===build_before_compile_link" << std::endl;
+  #endif
+
   // Include the main program and compile/link everything together
   Plugin.call<PiApiKind::piProgramCompile>(Program.get(), /*num devices =*/1,
                                            &Device, CompileOptions.c_str(), 0,
@@ -1124,6 +1187,10 @@ ProgramManager::build(ProgramPtr Program, const ContextImplPtr Context,
   RT::PiResult Error = Plugin.call_nocheck<PiApiKind::piProgramLink>(
       Context->getHandleRef(), /*num devices =*/1, &Device, LinkOptions.c_str(),
       LinkPrograms.size(), LinkPrograms.data(), nullptr, nullptr, &LinkedProg);
+
+  #ifdef PRINT_TRACE
+  std::cout << "===pgm_mng.cpp===build_after_compile_link" << std::endl;
+  #endif
 
   // Link program call returns a new program object if all parameters are valid,
   // or NULL otherwise. Release the original (user) program.

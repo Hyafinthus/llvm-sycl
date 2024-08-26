@@ -16,6 +16,8 @@
 #include <sycl/detail/pi.hpp>
 #include <sycl/detail/type_traits.hpp>
 #include <sycl/stl.hpp>
+#include <map>
+#include <string>
 
 #ifdef XPTI_ENABLE_INSTRUMENTATION
 // Include the headers necessary for emitting traces using the trace framework
@@ -199,6 +201,16 @@ public:
       std::cout << std::endl;
     } else {
       R = PiCallInfo.getFuncPtr(*MPlugin)(Args...);
+      
+      int key = static_cast<int>(PiApiOffset);
+      std::string value;
+      auto it = PiApiKindString.find(key);
+      if (it != PiApiKindString.end()) {
+          value = it->second;
+      }
+      std::cout << "Call PiApi: " << key << " " << value << "\n";
+      // (std::cout << ... << typeid(ArgsT).name()) << " ";
+      // (std::cout << ... << Args) << '\n';
     }
 #ifdef XPTI_ENABLE_INSTRUMENTATION
     // Close the function begin with a call to function end
@@ -294,6 +306,118 @@ private:
   // represents the unique ids of the last device of each platform
   // index of this vector corresponds to the index in PiPlatforms vector.
   std::vector<int> LastDeviceIds;
+  std::map<int, std::string> PiApiKindString = {
+    {0, "piPlatformsGet"},
+    {1, "piPlatformGetInfo"},
+    {2, "piextPlatformGetNativeHandle"},
+    {3, "piextPlatformCreateWithNativeHandle"},
+    {4, "piDevicesGet"},
+    {5, "piDeviceGetInfo"},
+    {6, "piDevicePartition"},
+    {7, "piDeviceRetain"},
+    {8, "piDeviceRelease"},
+    {9, "piextDeviceSelectBinary"},
+    {10, "piextGetDeviceFunctionPointer"},
+    {11, "piextDeviceGetNativeHandle"},
+    {12, "piextDeviceCreateWithNativeHandle"},
+    {13, "piContextCreate"},
+    {14, "piContextGetInfo"},
+    {15, "piContextRetain"},
+    {16, "piContextRelease"},
+    {17, "piextContextSetExtendedDeleter"},
+    {18, "piextContextGetNativeHandle"},
+    {19, "piextContextCreateWithNativeHandle"},
+    {20, "piQueueCreate"},
+    {21, "piextQueueCreate"},
+    {22, "piQueueGetInfo"},
+    {23, "piQueueFinish"},
+    {24, "piQueueFlush"},
+    {25, "piQueueRetain"},
+    {26, "piQueueRelease"},
+    {27, "piextQueueGetNativeHandle"},
+    {28, "piextQueueCreateWithNativeHandle"},
+    {29, "piMemBufferCreate"},
+    {30, "piMemImageCreate"},
+    {31, "piMemGetInfo"},
+    {32, "piMemImageGetInfo"},
+    {33, "piMemRetain"},
+    {34, "piMemRelease"},
+    {35, "piMemBufferPartition"},
+    {36, "piextMemGetNativeHandle"},
+    {37, "piextMemCreateWithNativeHandle"},
+    {38, "piProgramCreate"},
+    {39, "piclProgramCreateWithSource"},
+    {40, "piProgramCreateWithBinary"},
+    {41, "piProgramGetInfo"},
+    {42, "piProgramCompile"},
+    {43, "piProgramBuild"},
+    {44, "piProgramLink"},
+    {45, "piProgramGetBuildInfo"},
+    {46, "piProgramRetain"},
+    {47, "piProgramRelease"},
+    {48, "piextProgramSetSpecializationConstant"},
+    {49, "piextProgramGetNativeHandle"},
+    {50, "piextProgramCreateWithNativeHandle"},
+    {51, "piKernelCreate"},
+    {52, "piKernelSetArg"},
+    {53, "piKernelGetInfo"},
+    {54, "piKernelGetGroupInfo"},
+    {55, "piKernelGetSubGroupInfo"},
+    {56, "piKernelRetain"},
+    {57, "piKernelRelease"},
+    {58, "piextKernelSetArgPointer"},
+    {59, "piKernelSetExecInfo"},
+    {60, "piextKernelCreateWithNativeHandle"},
+    {61, "piextKernelGetNativeHandle"},
+    {62, "piEventCreate"},
+    {63, "piEventGetInfo"},
+    {64, "piEventGetProfilingInfo"},
+    {65, "piEventsWait"},
+    {66, "piEventSetCallback"},
+    {67, "piEventSetStatus"},
+    {68, "piEventRetain"},
+    {69, "piEventRelease"},
+    {70, "piextEventGetNativeHandle"},
+    {71, "piextEventCreateWithNativeHandle"},
+    {72, "piSamplerCreate"},
+    {73, "piSamplerGetInfo"},
+    {74, "piSamplerRetain"},
+    {75, "piSamplerRelease"},
+    {76, "piEnqueueKernelLaunch"},
+    {77, "piEnqueueNativeKernel"},
+    {78, "piEnqueueEventsWait"},
+    {79, "piEnqueueEventsWaitWithBarrier"},
+    {80, "piEnqueueMemBufferRead"},
+    {81, "piEnqueueMemBufferReadRect"},
+    {82, "piEnqueueMemBufferWrite"},
+    {83, "piEnqueueMemBufferWriteRect"},
+    {84, "piEnqueueMemBufferCopy"},
+    {85, "piEnqueueMemBufferCopyRect"},
+    {86, "piEnqueueMemBufferFill"},
+    {87, "piEnqueueMemImageRead"},
+    {88, "piEnqueueMemImageWrite"},
+    {89, "piEnqueueMemImageCopy"},
+    {90, "piEnqueueMemImageFill"},
+    {91, "piEnqueueMemBufferMap"},
+    {92, "piEnqueueMemUnmap"},
+    {93, "piextUSMHostAlloc"},
+    {94, "piextUSMDeviceAlloc"},
+    {95, "piextUSMSharedAlloc"},
+    {96, "piextUSMFree"},
+    {97, "piextUSMEnqueueMemset"},
+    {98, "piextUSMEnqueueMemcpy"},
+    {99, "piextUSMEnqueuePrefetch"},
+    {100, "piextUSMEnqueueMemAdvise"},
+    {101, "piextUSMGetMemAllocInfo"},
+    {102, "piextKernelSetArgMemObj"},
+    {103, "piextKernelSetArgSampler"},
+    {104, "piextPluginGetOpaqueData"},
+    {105, "piPluginGetLastError"},
+    {106, "piTearDown"},
+    {107, "piextUSMEnqueueFill2D"},
+    {108, "piextUSMEnqueueMemset2D"},
+    {109, "piextUSMEnqueueMemcpy2D"}
+  };
 }; // class plugin
 } // namespace detail
 } // __SYCL_INLINE_VER_NAMESPACE(_V1)

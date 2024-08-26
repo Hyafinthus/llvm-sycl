@@ -29,6 +29,8 @@
 #include <sycl/properties/queue_properties.hpp>
 #include <sycl/property_list.hpp>
 #include <sycl/stl.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#define PRINT_TRACE 1
 
 #include <utility>
 
@@ -61,17 +63,31 @@ public:
   // \return a default context for the platform if it includes the device
   // passed and default contexts are enabled, a new context otherwise.
   static ContextImplPtr getDefaultOrNew(const DeviceImplPtr &Device) {
-    if (!SYCLConfig<SYCL_ENABLE_DEFAULT_CONTEXTS>::get())
+    if (!SYCLConfig<SYCL_ENABLE_DEFAULT_CONTEXTS>::get()) {
+      #ifdef PRINT_TRACE
+        std::cout << "===queue_impl.cpp===getDefaultOrNew===SYCL_ENABLE_DEFAULT_CONTEXTS" << std::endl;
+      #endif
       return detail::getSyclObjImpl(
           context{createSyclObjFromImpl<device>(Device), {}, {}});
+    }
 
     ContextImplPtr DefaultContext = detail::getSyclObjImpl(
         Device->get_platform().ext_oneapi_get_default_context());
-    if (DefaultContext->isDeviceValid(Device))
+    if (DefaultContext->isDeviceValid(Device)) {
+      #ifdef PRINT_TRACE
+        std::cout << "===queue_impl.cpp===getDefaultOrNew===default context: " << DefaultContext << std::endl;
+      #endif
       return DefaultContext;
+    }
+
+    #ifdef PRINT_TRACE
+      std::cout << "===queue_impl.cpp===getDefaultOrNew===new context" << std::endl;
+    #endif
     return detail::getSyclObjImpl(
         context{createSyclObjFromImpl<device>(Device), {}, {}});
   }
+  
+  // 创建一个impl类，getDefaultOrNew是获取这个device对应的context
   /// Constructs a SYCL queue from a device using an async_handler and
   /// property_list provided.
   ///
@@ -79,10 +95,22 @@ public:
   /// to the queue.
   /// \param AsyncHandler is a SYCL asynchronous exception handler.
   /// \param PropList is a list of properties to use for queue construction.
+  // queue_impl(const DeviceImplPtr &Device, const async_handler &AsyncHandler,
+  //            const property_list &PropList)
+  //     : queue_impl(Device, getDefaultOrNew(Device), AsyncHandler, PropList){};
   queue_impl(const DeviceImplPtr &Device, const async_handler &AsyncHandler,
              const property_list &PropList)
-      : queue_impl(Device, getDefaultOrNew(Device), AsyncHandler, PropList){};
+      : MContext(nullptr), MAsyncHandler(AsyncHandler), MPropList(PropList),
+        MHostQueue(false), MAssertHappenedBuffer(range<1>{1}),
+        MIsInorder(false), MDiscardEvents(false),
+        MIsProfilingEnabled(false), MHasDiscardEventsSupport(false) {}
 
+  // void rebindDevice(const DeviceImplPtr &Device) {
+  //   MDevice = Device;
+  //   MContext = getDefaultOrNew(Device);
+  // }
+
+  // 由选择器创建的queue最终委托到此构造函数
   /// Constructs a SYCL queue with an async_handler and property_list provided
   /// form a device and a context.
   ///
@@ -143,6 +171,9 @@ public:
                               "does not have the queue_profiling aspect");
     }
     if (has_property<ext::intel::property::queue::compute_index>()) {
+      #ifdef PRINT_TRACE
+        std::cout << "===queue_impl.cpp===impl 1" << std::endl;
+      #endif
       int Idx = get_property<ext::intel::property::queue::compute_index>()
                     .get_index();
       int NumIndices =
@@ -169,11 +200,15 @@ public:
           PI_ERROR_INVALID_DEVICE);
     }
     if (!MHostQueue) {
+      #ifdef PRINT_TRACE
+        std::cout << "===queue_impl.cpp===impl 2" << std::endl;
+      #endif
       const QueueOrder QOrder =
           MIsInorder ? QueueOrder::Ordered : QueueOrder::OOO;
       MQueues.push_back(createQueue(QOrder));
       // This section is the second part of the instrumentation that uses the
       // tracepoint information and notifies
+      std::cout << "This queue_impl: " << this << " MQueues Created: " << &MQueues << " size: " << MQueues.size() << std::endl;
     }
   }
 
@@ -259,10 +294,22 @@ public:
           static_cast<const void *>("queue_destroy"));
     }
 #endif
+
+    if (shell) {
+      std::cout << "===queue_impl.hpp=== shell queue destruct" << std::endl;
+    } else {
     throw_asynchronous();
-    if (!MHostQueue) {
-      getPlugin().call<PiApiKind::piQueueRelease>(MQueues[0]);
+      std::cout << "===queue_impl.hpp=== before cleanup" << std::endl;
+      if (!MHostQueue) {
+        std::cout << "This queue_impl: " << this << " MQueues: " << &MQueues << " size: " << MQueues.size() << std::endl;
+        getPlugin().call<PiApiKind::piQueueRelease>(MQueues[0]);
+      }
+      std::cout << "===queue_impl.hpp=== after cleanup" << std::endl;
     }
+  }
+
+  void setShell() {
+    shell = true;
   }
 
   /// \return an OpenCL interoperability queue handle.
@@ -460,6 +507,7 @@ public:
       Plugin.checkPiResult(Error);
     }
 
+    std::cout << "PiQueue: " << &Queue << std::endl;
     return Queue;
   }
 
@@ -653,8 +701,13 @@ protected:
                     const std::shared_ptr<queue_impl> &SecondaryQueue,
                     const detail::code_location &Loc,
                     const SubmitPostProcessF *PostProcess) {
+    // The handler is created with the queue's context, not the queue's device.
     handler Handler(Self, PrimaryQueue, SecondaryQueue, MHostQueue);
+    // Save the code location for the handler.
     Handler.saveCodeLoc(Loc);
+    // handler作为CGF的单数，即sycl::handler cgh
+    // CGF中的函数通过handler来实际执行kernel中所有操作，即get_access和parallel_for等lambda函数
+    // 因为kernel所有操作都是通过handler来执行的，所以所有的操作都能通过handler的finalize函数做来处理
     CGF(Handler);
 
     // Scheduler will later omit events, that are not required to execute tasks.
@@ -680,7 +733,9 @@ protected:
     } else
       finalizeHandler(Handler, Type, Event);
 
+    std::cout << "===queue_impl.cpp===finalized handler" << std::endl;
     addEvent(Event);
+    std::cout << "===queue_impl.cpp===added event" << std::endl;
     return Event;
   }
 
@@ -708,6 +763,8 @@ protected:
   /// Protects all the fields that can be changed by class' methods.
   mutable std::mutex MMutex;
 
+  bool shell = false;
+
   DeviceImplPtr MDevice;
   const ContextImplPtr MContext;
 
@@ -719,8 +776,6 @@ protected:
   /// queue is the only owner on the runtime side.
   std::vector<event> MEventsShared;
   exception_list MExceptions;
-  const async_handler MAsyncHandler;
-  const property_list MPropList;
 
   /// List of queues created for FPGA device from a single SYCL queue.
   std::vector<RT::PiQueue> MQueues;
@@ -759,6 +814,9 @@ protected:
   uint64_t MInstanceID = 0;
 
 public:
+  const async_handler MAsyncHandler;
+  const property_list MPropList;
+
   // Queue constructed with the discard_events property
   const bool MDiscardEvents;
   const bool MIsProfilingEnabled;

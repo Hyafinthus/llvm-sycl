@@ -250,6 +250,16 @@ public:
   }
 
   bool isContextInitialized() const noexcept { return MIsContextInitialized; }
+  
+  pi_event_status piCheckStatus() {
+    pi_event_status Status = PI_EVENT_QUEUED;
+    getPlugin().call<PiApiKind::piEventGetInfo>(MEvent, PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
+    return Status;
+  }
+
+  std::shared_ptr<queue_impl> getQueueImpl() const {
+    return MQueue.lock();
+  }
 
 protected:
   // When instrumentation is enabled emits trace event for event wait begin and

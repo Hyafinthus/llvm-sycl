@@ -22,10 +22,14 @@
 #include <sycl/detail/kernel_desc.hpp>
 #include <sycl/detail/pi.h>
 #include <sycl/detail/pi.hpp>
+#include <sycl/device.hpp>
+#include <sycl/device_selector.hpp>
 #include <sycl/event.hpp>
 #include <sycl/handler.hpp>
 #include <sycl/info/info_desc.hpp>
 #include <sycl/stream.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#define PRINT_TRACE 1
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
@@ -88,6 +92,10 @@ void handler::setHandlerKernelBundle(kernel Kernel) {
   setHandlerKernelBundle(KernelBundleImpl);
 }
 
+namespace detail {
+  extern device select_device(DSelectorInvocableType DeviceSelectorInvocable, bool rebind);
+}
+
 event handler::finalize() {
   // This block of code is needed only for reduction implementation.
   // It is harmless (does nothing) for everything else.
@@ -115,12 +123,35 @@ event handler::finalize() {
                             "handler::require() before it can be used.");
   }
 
+  // =======================================================
+
+  // 给anaylzer传输需要的信息(kernel requirement等)
+  // analyzer结合recorder判断是否有同用户进程前序kernel 以及是否需要跨设备数据移动
+  // 等待接收anaylzer的调度决策
+
+  device d = detail::select_device(gpu_selector_v, true);
+  // 应被替换为运行时调度设备选择
+  // std::vector<device> Devices = device::get_devices();
+
+  detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
+  std::cout << "=== handler === rebind device " << d.is_gpu() << std::endl;
+  // MQueue->rebindDevice(dp);
+  MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->MAsyncHandler, MQueue->MPropList));
+  
+  // =======================================================
+  
+  // 单独对特殊情况的kernel处理 目前没有 按道理可以忽略 但必须在之前rebind 因为有调用
   const auto &type = getType();
   if (type == detail::CG::Kernel) {
     // If there were uses of set_specialization_constant build the kernel_bundle
     std::shared_ptr<detail::kernel_bundle_impl> KernelBundleImpPtr =
         getOrInsertHandlerKernelBundle(/*Insert=*/false);
+    // 目前没有遇到kernel_bundle的情况
+    // kernel_bundle主要用于用户控制kernel的编译和链接
     if (KernelBundleImpPtr) {
+      #ifdef PRINT_TRACE
+      std::cout << "======handler.cpp KernelBundleImpPtr" << std::endl;
+      #endif
       // Make sure implicit non-interop kernel bundles have the kernel
       if (!KernelBundleImpPtr->isInterop() &&
           !MImpl->isStateExplicitKernelBundle()) {
@@ -168,12 +199,18 @@ event handler::finalize() {
       }
     }
 
+    // 目前也没有这种快速kernel的情况
+    // 无需求 无依赖 无流 快速路径提交kernel执行
     if (!MQueue->is_in_fusion_mode() &&
         MRequirements.size() + MEvents.size() + MStreamStorage.size() == 0) {
       // if user does not add a new dependency to the dependency graph, i.e.
       // the graph is not changed, and the queue is not in fusion mode, then
       // this faster path is used to submit kernel bypassing scheduler and
       // avoiding CommandGroup, Command objects creation.
+
+      #ifdef PRINT_TRACE
+      std::cout << "======handler.cpp size=0" << std::endl;
+      #endif
 
       std::vector<RT::PiEvent> RawEvents;
       detail::EventImplPtr NewEvent;
@@ -198,6 +235,7 @@ event handler::finalize() {
                 nullptr);
             Result = PI_SUCCESS;
           } else {
+            std::cout << "handler.cpp -> enqueueImpKernel" << std::endl;
             Result = enqueueImpKernel(MQueue, MNDRDesc, MArgs,
                                       KernelBundleImpPtr, MKernel, MKernelName,
                                       MOSModuleHandle, RawEvents, OutEvent,
@@ -373,10 +411,19 @@ event handler::finalize() {
         "Internal Error. Command group cannot be constructed.",
         PI_ERROR_INVALID_OPERATION);
 
+  #ifdef PRINT_TRACE
+  std::cout << "======handler.cpp before === queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
+  #endif
+
   detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
       std::move(CommandGroup), std::move(MQueue));
 
   MLastEvent = detail::createSyclObjFromImpl<event>(Event);
+
+  #ifdef PRINT_TRACE
+  std::cout << "======handler.cpp after === queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
+  #endif
+
   return MLastEvent;
 }
 

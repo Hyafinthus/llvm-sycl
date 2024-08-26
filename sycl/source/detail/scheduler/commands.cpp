@@ -27,6 +27,9 @@
 #include <sycl/detail/cg_types.hpp>
 #include <sycl/detail/kernel_desc.hpp>
 #include <sycl/sampler.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#define PRINT_TRACE 1
+// #define MODIFY 1
 
 #include <cassert>
 #include <optional>
@@ -725,16 +728,47 @@ Command *Command::addDep(DepDesc NewDep, std::vector<Command *> &ToCleanUp) {
   Command *ConnectionCmd = nullptr;
 
   if (NewDep.MDepCommand) {
+    std::cout << "---Command---MDepCmd: " << NewDep.MDepCommand << std::endl;
     ConnectionCmd =
         processDepEvent(NewDep.MDepCommand->getEvent(), NewDep, ToCleanUp);
   }
   // ConnectionCmd insertion builds the following dependency structure:
   // this -> emptyCmd (for ConnectionCmd) -> ConnectionCmd -> NewDep
   // that means that this and NewDep are already dependent
+
+  #ifdef MODIFY
+  int mpi_size = GlobalHandler::instance().mpi_size;
+  int mpi_rank = GlobalHandler::instance().mpi_rank;
+  
+  std::cout << "---Command---addDep---Cmd: " << this << std::endl;
+
+  // addDep很常用 但是有的没有DepCommand
+  // 要检查这是个ExecCmd 即this为依赖于kernel2的kernel3
+  if (NewDep.MDepCommand)
+  if (NewDep.MDepCommand->getType() == CommandType::RUN_CG && this->getType() == CommandType::RUN_CG) {
+    if (NewDep.MDepCommand->kernel_index > 0) {
+      if (mpi_rank == 0) {
+        if (NewDep.MDepCommand->kernel_index == 2) {
+          MDeps.push_back(DepDesc{nullptr, NewDep.MDepRequirement, NewDep.MAllocaCmd});
+          std::cout << "---Command---createDep---size:" << MDeps.size() << std::endl;
+          return ConnectionCmd;
+        }
+      } else {
+        if (NewDep.MDepCommand->kernel_index == 1) {
+          return ConnectionCmd;
+        }
+      }
+    }
+  }
+  #endif
+
   if (!ConnectionCmd) {
     MDeps.push_back(NewDep);
-    if (NewDep.MDepCommand)
+    std::cout << "---Command---addDep---size:" << MDeps.size() << std::endl;
+    if (NewDep.MDepCommand) {
+      std::cout << "---Command---addDep---addUser" << std::endl;
       NewDep.MDepCommand->addUser(this);
+    }
   }
 
 #ifdef XPTI_ENABLE_INSTRUMENTATION
@@ -946,6 +980,23 @@ void Command::copySubmissionCodeLocation() {
 #endif
 }
 
+// 不能增加单独的通信Command 具体原因见Scheduler 最后要返回Cmd代表整个CG执行
+// CommunicateCommand::CommunicateCommand(QueueImplPtr Queue)
+//     : Command(CommandType::EMPTY_TASK, std::move(Queue)) {
+// }
+// pi_int32 CommunicateCommand::enqueueImp() {
+//   std::cout << "===CommunicateCommand===enqueueImp" << std::endl;
+//   return PI_SUCCESS;
+// }
+// void CommunicateCommand::printDot(std::ostream &Stream) const {
+//   Stream << "\"" << this << "\"" << " [CommunicateCommand]" << std::endl;
+//   for(const auto &Dep : MDeps) {
+//     if (Dep.MDepCommand == nullptr)
+//       continue;
+//     Stream << "  \"" << this << "\" -> \"" << Dep.MDepCommand << "\"" << std::endl;
+//   }
+// }
+
 AllocaCommandBase::AllocaCommandBase(CommandType Type, QueueImplPtr Queue,
                                      Requirement Req,
                                      AllocaCommandBase *LinkedAllocaCmd,
@@ -1031,6 +1082,11 @@ pi_int32 AllocaCommand::enqueueImp() {
     }
     HostPtr = MLinkedAllocaCmd->getMemAllocation();
   }
+
+  #ifdef PRINT_TRACE
+  std::cout << "===commands.cpp===MemoryManager_allocate" << std::endl;
+  #endif
+
   // TODO: Check if it is correct to use std::move on stack variable and
   // delete it RawEvents below.
   MMemAllocation = MemoryManager::allocate(
@@ -2088,6 +2144,7 @@ static void ReverseRangeDimensionsForKernel(NDRDescT &NDR) {
   }
 }
 
+// SetKernelParamsAndLaunch
 static pi_result SetKernelParamsAndLaunch(
     const QueueImplPtr &Queue, std::vector<ArgDesc> &Args,
     const std::shared_ptr<device_image_impl> &DeviceImageImpl,
@@ -2110,6 +2167,11 @@ static pi_result SetKernelParamsAndLaunch(
              "We should have caught this earlier.");
 
       RT::PiMem MemArg = (RT::PiMem)getMemAllocationFunc(Req);
+      std::cout << "===kind_accessor" << std::endl;
+      std::cout << "Kernel: " << Kernel << std::endl;
+      std::cout << "NextTrueIndex: " << NextTrueIndex << std::endl;
+      std::cout << "Size: " << sizeof(RT::PiMem) << std::endl;
+      std::cout << "MemArg: " << MemArg << std::endl;
       if (Plugin.getBackend() == backend::opencl) {
         Plugin.call<PiApiKind::piKernelSetArg>(Kernel, NextTrueIndex,
                                                sizeof(RT::PiMem), &MemArg);
@@ -2120,6 +2182,11 @@ static pi_result SetKernelParamsAndLaunch(
       break;
     }
     case kernel_param_kind_t::kind_std_layout: {
+      std::cout << "===kind_std_layout" << std::endl;
+      std::cout << "Kernel: " << Kernel << std::endl;
+      std::cout << "NextTrueIndex: " << NextTrueIndex << std::endl;
+      std::cout << "MSize: " << Arg.MSize << std::endl;
+      std::cout << "MPtr: " << Arg.MPtr << std::endl;
       Plugin.call<PiApiKind::piKernelSetArg>(Kernel, NextTrueIndex, Arg.MSize,
                                              Arg.MPtr);
       break;
@@ -2185,6 +2252,22 @@ static pi_result SetKernelParamsAndLaunch(
     if (EnforcedLocalSize)
       LocalSize = RequiredWGSize;
   }
+  
+  std::cout << "SetKernelParamsAndLaunch" << std::endl;
+  std::cout << "Queue->getHandleRef(): " << Queue->getHandleRef() << std::endl;
+  std::cout << "Kernel: " << Kernel << std::endl;
+  std::cout << "NDRDesc.Dims: " << NDRDesc.Dims << std::endl;
+  std::cout << "NDRDesc.GlobalOffset[0]: " << NDRDesc.GlobalOffset[0] << std::endl;
+  std::cout << "NDRDesc.GlobalSize[0]: " << NDRDesc.GlobalSize[0] << std::endl;
+  if (LocalSize != nullptr) {
+    std::cout << "LocalSize: " << *LocalSize << std::endl;
+  } else {
+    std::cout << "LocalSize: nullptr" << std::endl;
+  }
+  std::cout << "RawEvents.size(): " << RawEvents.size() << std::endl;
+  std::cout << "RawEvents.empty() ? nullptr : &RawEvents[0]: "
+            << (RawEvents.empty() ? nullptr : &RawEvents[0]) << std::endl;
+  std::cout << "OutEvent: " << OutEvent << std::endl;
 
   pi_result Error = Plugin.call_nocheck<PiApiKind::piEnqueueKernelLaunch>(
       Queue->getHandleRef(), Kernel, NDRDesc.Dims, &NDRDesc.GlobalOffset[0],
@@ -2220,6 +2303,7 @@ void DispatchNativeKernel(void *Blob) {
   delete NDRDesc;
 }
 
+// enqueueImpKernel
 pi_int32 enqueueImpKernel(
     const QueueImplPtr &Queue, NDRDescT &NDRDesc, std::vector<ArgDesc> &Args,
     const std::shared_ptr<detail::kernel_bundle_impl> &KernelBundleImplPtr,
@@ -2245,15 +2329,30 @@ pi_int32 enqueueImpKernel(
   // and can therefore not be looked up, but since they are self-contained
   // they can simply be launched directly.
   if (KernelBundleImplPtr && !KernelBundleImplPtr->isInterop()) {
+    #ifdef PRINT_TRACE
+    std::cout << "===commands.cpp===isInterop" << std::endl;
+    #endif
     kernel_id KernelID =
         detail::ProgramManager::getInstance().getSYCLKernelID(KernelName);
     kernel SyclKernel =
         KernelBundleImplPtr->get_kernel(KernelID, KernelBundleImplPtr);
 
+    #ifdef PRINT_TRACE
+    std::cout << "===commands.cpp===get_kernel" << std::endl;
+    #endif
+
     SyclKernelImpl = detail::getSyclObjImpl(SyclKernel);
+
+    #ifdef PRINT_TRACE
+    std::cout << "===commands.cpp===getSyclObjImpl" << std::endl;
+    #endif
 
     Kernel = SyclKernelImpl->getHandleRef();
     DeviceImageImpl = SyclKernelImpl->getDeviceImage();
+
+    #ifdef PRINT_TRACE 
+    std::cout << "===commands.cpp===getDeviceImage" << std::endl;
+    #endif
 
     Program = DeviceImageImpl->get_program_ref();
 
@@ -2262,6 +2361,9 @@ pi_int32 enqueueImpKernel(
             KernelBundleImplPtr->get_context(), KernelName,
             /*PropList=*/{}, Program);
   } else if (nullptr != MSyclKernel) {
+    #ifdef PRINT_TRACE
+    std::cout << "===commands.cpp===MSyclKernel" << std::endl;
+    #endif
     assert(MSyclKernel->get_info<info::kernel::context>() ==
            Queue->get_context());
     Kernel = MSyclKernel->getHandleRef();
@@ -2284,6 +2386,9 @@ pi_int32 enqueueImpKernel(
       KernelMutex = &MSyclKernel->getNoncacheableEnqueueMutex();
     }
   } else {
+    #ifdef PRINT_TRACE
+    std::cout << "===commands.cpp===Direct_Create_Kernel" << std::endl;
+    #endif
     std::tie(Kernel, KernelMutex, Program) =
         detail::ProgramManager::getInstance().getOrCreateKernel(
             OSModuleHandle, ContextImpl, DeviceImpl, KernelName, nullptr);
@@ -2310,12 +2415,16 @@ pi_int32 enqueueImpKernel(
   pi_result Error = PI_SUCCESS;
   ProgramManager::KernelArgMask EliminatedArgMask;
   if (nullptr == MSyclKernel || !MSyclKernel->isCreatedFromSource()) {
+    #ifdef PRINT_TRACE
+    std::cout << "===commands.cpp===getEliminatedKernelArgMask" << std::endl;
+    #endif
     EliminatedArgMask =
         detail::ProgramManager::getInstance().getEliminatedKernelArgMask(
             OSModuleHandle, Program, KernelName);
   }
   {
     assert(KernelMutex);
+    std::cout << "===commands.cpp -> SetKernelParamsAndLaunch" << std::endl;
     std::lock_guard<std::mutex> Lock(*KernelMutex);
 
     // Set SLM/Cache configuration for the kernel if non-default value is
@@ -2327,7 +2436,8 @@ pi_int32 enqueueImpKernel(
           Kernel, PI_EXT_KERNEL_EXEC_INFO_CACHE_CONFIG,
           sizeof(RT::PiKernelCacheConfig), &KernelCacheConfig);
     }
-
+    
+    std::cout << "===commands.cpp -> SetKernelParamsAndLaunch(no lock)" << std::endl;
     Error = SetKernelParamsAndLaunch(Queue, Args, DeviceImageImpl, Kernel,
                                      NDRDesc, EventsWaitList, OutEvent,
                                      EliminatedArgMask, getMemAllocationFunc);
@@ -2343,6 +2453,7 @@ pi_int32 enqueueImpKernel(
   return PI_SUCCESS;
 }
 
+// ExecCGCommand::enqueueImp
 pi_int32 ExecCGCommand::enqueueImp() {
   if (getCG().getType() != CG::CGTYPE::CodeplayHostTask)
     waitForPreparedHostEvents();
@@ -2354,6 +2465,7 @@ pi_int32 ExecCGCommand::enqueueImp() {
                         MCommandGroup->MRequirements.size() == 0)
                            ? nullptr
                            : &MEvent->getHandleRef();
+  std::cout << "======CGTYPE" << static_cast<unsigned int>(MCommandGroup->getType()) << std::endl;
   switch (MCommandGroup->getType()) {
 
   case CG::CGTYPE::UpdateHost: {
@@ -2513,6 +2625,9 @@ pi_int32 ExecCGCommand::enqueueImp() {
 
     if (MQueue->is_host() || (MQueue->getPlugin().getBackend() ==
                               backend::ext_intel_esimd_emulator)) {
+      #ifdef PRINT_TRACE
+      std::cout << "======commands.cpp host_queue or intel_esimd" << std::endl;
+      #endif
       for (ArgDesc &Arg : Args)
         if (kernel_param_kind_t::kind_accessor == Arg.MType) {
           Requirement *Req = (Requirement *)(Arg.MPtr);
@@ -2558,14 +2673,20 @@ pi_int32 ExecCGCommand::enqueueImp() {
                               ProgramManager::getInstance().kernelUsesAssert(
                                   OSModuleHandle, KernelName);
       if (KernelUsesAssert) {
+        // 这里是PiEvent 给后端的
         Event = &MEvent->getHandleRef();
       }
     }
-
-    return enqueueImpKernel(
+    std::cout << "commands.cpp -> enqueueImpKernel" << std::endl;
+    pi_int32 ret = enqueueImpKernel(
         MQueue, NDRDesc, Args, ExecKernel->getKernelBundle(), SyclKernel,
         KernelName, OSModuleHandle, RawEvents, Event, getMemAllocationFunc,
         ExecKernel->MKernelCacheConfig);
+
+    // TODO Intra-Kernel 这里整个kernel已经提交完毕
+    // 获取kernel中计算部分进行同步
+
+    return ret;
   }
   case CG::CGTYPE::CopyUSM: {
     CGCopyUSM *Copy = (CGCopyUSM *)MCommandGroup.get();

@@ -9,6 +9,10 @@
 #include <detail/event_impl.hpp>
 #include <detail/queue_impl.hpp>
 #include <detail/scheduler/scheduler.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#define PRINT_TRACE 1
+// #define MODIFY 1
+#include <detail/global_handler.hpp>
 
 #include <memory>
 #include <vector>
@@ -32,6 +36,10 @@ void Scheduler::GraphProcessor::waitForEvent(const EventImplPtr &Event,
     return;
 
   EnqueueResultT Res;
+  #ifdef PRINT_TRACE
+  std::cout << "===graph_procs.cpp===Direct_enqueueCommand" << std::endl;
+  #endif
+
   bool Enqueued =
       enqueueCommand(Cmd, GraphReadLock, Res, ToCleanUp, Cmd, BLOCKING);
   if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
@@ -83,10 +91,25 @@ bool Scheduler::GraphProcessor::enqueueCommand(
     Command *Cmd, ReadLockT &GraphReadLock, EnqueueResultT &EnqueueResult,
     std::vector<Command *> &ToCleanUp, Command *RootCommand,
     BlockingT Blocking) {
+  #ifdef PRINT_TRACE
+  std::cout << "===graph_procs.cpp===enqueueCommand" << std::endl;
+  #endif
   if (!Cmd)
     return true;
-  if (Cmd->isSuccessfullyEnqueued())
+  if (Cmd->isSuccessfullyEnqueued()) {
+    #ifdef MODIFY
+    pi_event_status Status = PI_EVENT_QUEUED;
+    using EventImplPtr = std::shared_ptr<sycl::detail::event_impl>;
+    EventImplPtr e = Cmd->getEvent();
+    if(e && e->getHandleRef()) {
+        e->getPlugin().call<PiApiKind::piEventGetInfo>(e->getHandleRef(), PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
+        std::cout << "===graph_procs.cpp=== already enqueued: " << Cmd << ", Status: " << Status << std::endl;
+    } else {
+      std::cout << "===graph_procs.cpp=== already enqueued: " << Cmd << std::endl;
+    }
+    #endif
     return handleBlockingCmd(Cmd, EnqueueResult, RootCommand, Blocking);
+  }
 
   if (KernelFusionCommand *FusionCmd = isPartOfActiveFusion(Cmd)) {
     // The fusion is still in-flight, but some other event/command depending
@@ -119,10 +142,14 @@ bool Scheduler::GraphProcessor::enqueueCommand(
   // Recursively enqueue all the implicit + explicit backend level dependencies
   // first and exit immediately if any of the commands cannot be enqueued.
   for (const EventImplPtr &Event : Cmd->getPreparedDepsEvents()) {
-    if (Command *DepCmd = static_cast<Command *>(Event->getCommand()))
+    if (Command *DepCmd = static_cast<Command *>(Event->getCommand())) {
+      #ifdef PRINT_TRACE
+      std::cout << "===graph_procs.cpp===recursive_1_enqueueCommand: " << DepCmd << std::endl;
+      #endif
       if (!enqueueCommand(DepCmd, GraphReadLock, EnqueueResult, ToCleanUp,
                           RootCommand, Blocking))
         return false;
+    }
   }
 
   // Recursively enqueue all the implicit + explicit host dependencies and
@@ -132,10 +159,14 @@ bool Scheduler::GraphProcessor::enqueueCommand(
   // MHostDepsEvents. TO FIX: implement enqueue of blocked commands on host task
   // completion stage and eliminate this event waiting in enqueue.
   for (const EventImplPtr &Event : Cmd->getPreparedHostDepsEvents()) {
-    if (Command *DepCmd = static_cast<Command *>(Event->getCommand()))
+    if (Command *DepCmd = static_cast<Command *>(Event->getCommand())) {
+      #ifdef PRINT_TRACE
+      std::cout << "===graph_procs.cpp===recursive_2_enqueueCommand: " << DepCmd << std::endl;
+      #endif
       if (!enqueueCommand(DepCmd, GraphReadLock, EnqueueResult, ToCleanUp,
                           RootCommand, Blocking))
         return false;
+    }
   }
 
   // Only graph read lock is to be held here.
@@ -151,6 +182,32 @@ bool Scheduler::GraphProcessor::enqueueCommand(
   // on completion of C and starts cleanup process. This thread is still in the
   // middle of enqueue of B. The other thread modifies dependency list of A by
   // removing C out of it. Iterators become invalid.
+  
+
+  #ifdef MODIFY
+  int mpi_size = GlobalHandler::instance().mpi_size;
+  int mpi_rank = GlobalHandler::instance().mpi_rank; 
+  
+  // 只有在scheduler里是CG::Kernel才会赋值 所以必为ExecCmd
+  if (Cmd->kernel_index > 0) {
+    // 暂时用不到 先用kernel_index来做
+    int &kernel_exec_count = GlobalHandler::instance().kernel_exec_count;
+    kernel_exec_count++;
+
+    if (mpi_rank == 0) {
+      if (Cmd->kernel_index == 2) {
+        return true;
+      }
+    } else {
+      if (Cmd->kernel_index == 1) {
+        return true;
+      }
+    }
+  }
+
+  std::cout << "===graph_procs.cpp===Cmd->enqueue: " << Cmd << ", MPIRANK=" << mpi_rank << std::endl;
+  #endif
+
   bool Result = Cmd->enqueue(EnqueueResult, Blocking, ToCleanUp);
   if (Result)
     Result = handleBlockingCmd(Cmd, EnqueueResult, RootCommand, Blocking);

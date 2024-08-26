@@ -47,6 +47,7 @@ class AllocaCommandBase;
 class ReleaseCommand;
 class ExecCGCommand;
 class EmptyCommand;
+class CommunicateCommand;
 
 enum BlockingT { NON_BLOCKING = 0, BLOCKING };
 
@@ -321,6 +322,8 @@ public:
   // to ensure we have the same object layout when the macro in the library and
   // SYCL app are not the same.
 
+  int kernel_index = 0;
+
   /// The event for node_create and task_begin.
   void *MTraceEvent = nullptr;
   /// The stream under which the traces are emitted.
@@ -371,6 +374,17 @@ public:
   /// intersect with command enqueue.
   std::vector<EventImplPtr> MBlockedUsers;
   std::mutex MBlockedUsersMutex;
+};
+
+/// 用于在kernel执行完毕后插入
+class CommunicateCommand : public Command {
+public:
+  CommunicateCommand(QueueImplPtr Queue);
+
+  void printDot(std::ostream &Stream) const final;
+
+private:
+  pi_int32 enqueueImp() final;
 };
 
 /// The empty command does nothing during enqueue. The task can be used to

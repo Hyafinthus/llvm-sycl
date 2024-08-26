@@ -74,6 +74,9 @@ CONSTFIX char clEnqueueReadGlobalVariableName[] =
 
 #undef CONSTFIX
 
+# define PRINT_CREATE true
+# define PRINT_ELSE true
+
 // Global variables for PI_ERROR_PLUGIN_SPECIFIC_ERROR
 constexpr size_t MaxMessageSize = 256;
 thread_local pi_result ErrorMessageCode = PI_SUCCESS;
@@ -265,6 +268,16 @@ extern "C" {
 pi_result piDeviceGetInfo(pi_device device, pi_device_info paramName,
                           size_t paramValueSize, void *paramValue,
                           size_t *paramValueSizeRet) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(paramName).name() << " " << paramName << ", ";
+  std::cout << typeid(paramValueSize).name() << " " << paramValueSize << ", ";
+  std::cout << typeid(paramValue).name() << " " << paramValue << ", ";
+  std::cout << typeid(paramValueSizeRet).name() << " " << paramValueSizeRet << ")";
+  std::cout << std::endl;
+}
+
   switch (paramName) {
     // TODO: Check regularly to see if support in enabled in OpenCL.
     // Intel GPU EU device-specific information extensions.
@@ -626,6 +639,14 @@ pi_result piDeviceGetInfo(pi_device device, pi_device_info paramName,
 
 pi_result piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
                          pi_uint32 *num_platforms) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(num_entries).name() << " " << num_entries << ", ";
+  std::cout << typeid(platforms).name() << " " << platforms << ", ";
+  std::cout << typeid(num_platforms).name() << " " << num_platforms << ")";
+  std::cout << std::endl;
+}
+
   cl_int result = clGetPlatformIDs(cast<cl_uint>(num_entries),
                                    cast<cl_platform_id *>(platforms),
                                    cast<cl_uint *>(num_platforms));
@@ -641,6 +662,11 @@ pi_result piPlatformsGet(pi_uint32 num_entries, pi_platform *platforms,
 
 pi_result piextPlatformCreateWithNativeHandle(pi_native_handle nativeHandle,
                                               pi_platform *platform) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(platform).name() << " " << platform << ")";
+  std::cout << std::endl;
+
   assert(platform);
   assert(nativeHandle);
   *platform = reinterpret_cast<pi_platform>(nativeHandle);
@@ -650,6 +676,16 @@ pi_result piextPlatformCreateWithNativeHandle(pi_native_handle nativeHandle,
 pi_result piDevicesGet(pi_platform platform, pi_device_type device_type,
                        pi_uint32 num_entries, pi_device *devices,
                        pi_uint32 *num_devices) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(platform).name() << " " << platform << ", ";
+  std::cout << typeid(device_type).name() << " " << device_type << ", ";
+  std::cout << typeid(num_entries).name() << " " << num_entries << ", ";
+  std::cout << typeid(devices).name() << " " << devices << ", ";
+  std::cout << typeid(num_devices).name() << " " << num_devices << ")";
+  std::cout << std::endl;
+}
+
   cl_int result = clGetDeviceIDs(
       cast<cl_platform_id>(platform), cast<cl_device_type>(device_type),
       cast<cl_uint>(num_entries), cast<cl_device_id *>(devices),
@@ -667,6 +703,14 @@ pi_result piDevicesGet(pi_platform platform, pi_device_type device_type,
 pi_result piextDeviceSelectBinary(pi_device device, pi_device_binary *images,
                                   pi_uint32 num_images,
                                   pi_uint32 *selected_image_ind) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(images).name() << " " << images << ", ";
+  std::cout << typeid(num_images).name() << " " << num_images << ", ";
+  std::cout << typeid(selected_image_ind).name() << " " << selected_image_ind << ")";
+  std::cout << std::endl;
+}
 
   // TODO: this is a bare-bones implementation for choosing a device image
   // that would be compatible with the targeted device. An AOT-compiled
@@ -737,6 +781,12 @@ pi_result piextDeviceSelectBinary(pi_device device, pi_device_binary *images,
 
 pi_result piextDeviceCreateWithNativeHandle(pi_native_handle nativeHandle,
                                             pi_platform, pi_device *piDevice) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(pi_platform).name() << ", ";
+  std::cout << typeid(piDevice).name() << " " << piDevice << ")";
+  std::cout << std::endl;
+  
   assert(piDevice != nullptr);
   *piDevice = reinterpret_cast<pi_device>(nativeHandle);
   return PI_SUCCESS;
@@ -758,6 +808,13 @@ pi_result piextQueueCreate(pi_context Context, pi_device Device,
 }
 pi_result piQueueCreate(pi_context context, pi_device device,
                         pi_queue_properties properties, pi_queue *queue) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(properties).name() << " " << properties << ", ";
+  std::cout << typeid(queue).name() << " " << queue << ")";
+  std::cout << std::endl;
+
   assert(queue && "piQueueCreate failed, queue argument is null");
 
   cl_platform_id curPlatform;
@@ -804,6 +861,16 @@ pi_result piQueueCreate(pi_context context, pi_device device,
 pi_result piQueueGetInfo(pi_queue queue, pi_queue_info param_name,
                          size_t param_value_size, void *param_value,
                          size_t *param_value_size_ret) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(queue).name() << " " << queue << ", ";
+  std::cout << typeid(param_name).name() << " " << param_name << ", ";
+  std::cout << typeid(param_value_size).name() << " " << param_value_size << ", ";
+  std::cout << typeid(param_value).name() << " " << param_value << ", ";
+  std::cout << typeid(param_value_size_ret).name() << " " << param_value_size_ret << ")";
+  std::cout << std::endl;
+}
+
   if (queue == nullptr) {
     return PI_ERROR_INVALID_QUEUE;
   }
@@ -827,6 +894,14 @@ pi_result piextQueueCreateWithNativeHandle(pi_native_handle nativeHandle,
                                            pi_context, pi_device,
                                            bool ownNativeHandle,
                                            pi_queue *piQueue) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(pi_context).name() << ", ";
+  std::cout << typeid(pi_device).name() << ", ";
+  std::cout << typeid(ownNativeHandle).name() << " " << ownNativeHandle << ", ";
+  std::cout << typeid(piQueue).name() << " " << piQueue << ")";
+  std::cout << std::endl;
+
   (void)ownNativeHandle;
   assert(piQueue != nullptr);
   *piQueue = reinterpret_cast<pi_queue>(nativeHandle);
@@ -836,6 +911,13 @@ pi_result piextQueueCreateWithNativeHandle(pi_native_handle nativeHandle,
 
 pi_result piProgramCreate(pi_context context, const void *il, size_t length,
                           pi_program *res_program) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(il).name() << " " << il << ", ";
+  std::cout << typeid(length).name() << " " << length << ", ";
+  std::cout << typeid(res_program).name() << " " << res_program << ")";
+  std::cout << std::endl;
+  
   cl_uint deviceCount;
   cl_int ret_err =
       clGetContextInfo(cast<cl_context>(context), CL_CONTEXT_NUM_DEVICES,
@@ -927,6 +1009,13 @@ pi_result piProgramCreate(pi_context context, const void *il, size_t length,
 pi_result piextProgramCreateWithNativeHandle(pi_native_handle nativeHandle,
                                              pi_context, bool,
                                              pi_program *piProgram) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(pi_context).name() << ", ";
+  std::cout << typeid(bool).name() << ", ";
+  std::cout << typeid(piProgram).name() << " " << piProgram << ")";
+  std::cout << std::endl;
+
   assert(piProgram != nullptr);
   *piProgram = reinterpret_cast<pi_program>(nativeHandle);
   return PI_SUCCESS;
@@ -935,6 +1024,12 @@ pi_result piextProgramCreateWithNativeHandle(pi_native_handle nativeHandle,
 pi_result piSamplerCreate(pi_context context,
                           const pi_sampler_properties *sampler_properties,
                           pi_sampler *result_sampler) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(sampler_properties).name() << " " << sampler_properties << ", ";
+  std::cout << typeid(result_sampler).name() << " " << result_sampler << ")";
+  std::cout << std::endl;
+
   // Initialize properties according to OpenCL 2.1 spec.
   pi_result error_code;
   pi_bool normalizedCoords = PI_TRUE;
@@ -965,6 +1060,14 @@ pi_result piSamplerCreate(pi_context context,
 
 pi_result piextKernelSetArgMemObj(pi_kernel kernel, pi_uint32 arg_index,
                                   const pi_mem *arg_value) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(kernel).name() << " " << kernel << ", ";
+  std::cout << typeid(arg_index).name() << " " << arg_index << ", ";
+  std::cout << typeid(arg_value).name() << " " << arg_value << ")";
+  std::cout << std::endl;
+}
+
   return cast<pi_result>(
       clSetKernelArg(cast<cl_kernel>(kernel), cast<cl_uint>(arg_index),
                      sizeof(arg_value), cast<const cl_mem *>(arg_value)));
@@ -972,6 +1075,14 @@ pi_result piextKernelSetArgMemObj(pi_kernel kernel, pi_uint32 arg_index,
 
 pi_result piextKernelSetArgSampler(pi_kernel kernel, pi_uint32 arg_index,
                                    const pi_sampler *arg_value) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(kernel).name() << " " << kernel << ", ";
+  std::cout << typeid(arg_index).name() << " " << arg_index << ", ";
+  std::cout << typeid(arg_value).name() << " " << arg_value << ")";
+  std::cout << std::endl;
+}
+
   return cast<pi_result>(
       clSetKernelArg(cast<cl_kernel>(kernel), cast<cl_uint>(arg_index),
                      sizeof(cl_sampler), cast<const cl_sampler *>(arg_value)));
@@ -980,6 +1091,14 @@ pi_result piextKernelSetArgSampler(pi_kernel kernel, pi_uint32 arg_index,
 pi_result piextKernelCreateWithNativeHandle(pi_native_handle nativeHandle,
                                             pi_context, pi_program, bool,
                                             pi_kernel *piKernel) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(pi_context).name() << ", ";
+  std::cout << typeid(pi_program).name() << ", ";
+  std::cout << typeid(bool).name() << ", ";
+  std::cout << typeid(piKernel).name() << " " << piKernel << ")";
+  std::cout << std::endl;
+
   assert(piKernel != nullptr);
   *piKernel = reinterpret_cast<pi_kernel>(nativeHandle);
   return PI_SUCCESS;
@@ -1017,6 +1136,14 @@ typedef CL_API_ENTRY cl_int(CL_API_CALL *clGetDeviceFunctionPointer_fn)(
 pi_result piextGetDeviceFunctionPointer(pi_device device, pi_program program,
                                         const char *func_name,
                                         pi_uint64 *function_pointer_ret) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(program).name() << " " << program << ", ";
+  std::cout << typeid(func_name).name() << " " << func_name << ", ";
+  std::cout << typeid(function_pointer_ret).name() << " " << function_pointer_ret << ")";
+  std::cout << std::endl;
+}
 
   cl_context CLContext = nullptr;
   cl_int ret_err =
@@ -1089,6 +1216,14 @@ pi_result piContextCreate(const pi_context_properties *properties,
       clCreateContext(properties, cast<cl_uint>(num_devices),
                       cast<const cl_device_id *>(devices), pfn_notify,
                       user_data, cast<cl_int *>(&ret)));
+  std::cout << "properties: " << properties << std::endl;
+  std::cout << "num_devices: " << num_devices << std::endl;
+  for (pi_uint32 i = 0; i < num_devices; ++i) {
+      std::cout << "device[" << i << "]: " << devices[i] << std::endl;
+  }
+  std::cout << "pfn_notify: " << pfn_notify << std::endl;
+  std::cout << "user_data: " << user_data << std::endl;
+  std::cout << "retcontext: " << retcontext << std::endl;
 
   return ret;
 }
@@ -1098,6 +1233,14 @@ pi_result piextContextCreateWithNativeHandle(pi_native_handle nativeHandle,
                                              const pi_device *devices,
                                              bool ownNativeHandle,
                                              pi_context *piContext) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(num_devices).name() << " " << num_devices << ", ";
+  std::cout << typeid(devices).name() << " " << devices << ", ";
+  std::cout << typeid(ownNativeHandle).name() << " " << ownNativeHandle << ", ";
+  std::cout << typeid(piContext).name() << " " << piContext << ")";
+  std::cout << std::endl;
+
   (void)num_devices;
   (void)devices;
   (void)ownNativeHandle;
@@ -1110,6 +1253,16 @@ pi_result piextContextCreateWithNativeHandle(pi_native_handle nativeHandle,
 pi_result piContextGetInfo(pi_context context, pi_context_info paramName,
                            size_t paramValueSize, void *paramValue,
                            size_t *paramValueSizeRet) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(paramName).name() << " " << paramName << ", ";
+  std::cout << typeid(paramValueSize).name() << " " << paramValueSize << ", ";
+  std::cout << typeid(paramValue).name() << " " << paramValue << ", ";
+  std::cout << typeid(paramValueSizeRet).name() << " " << paramValueSizeRet << ")";
+  std::cout << std::endl;
+}
+
   switch (paramName) {
   case PI_EXT_ONEAPI_CONTEXT_INFO_USM_MEMCPY2D_SUPPORT:
   case PI_EXT_ONEAPI_CONTEXT_INFO_USM_FILL2D_SUPPORT:
@@ -1140,6 +1293,15 @@ pi_result piContextGetInfo(pi_context context, pi_context_info paramName,
 pi_result piMemBufferCreate(pi_context context, pi_mem_flags flags, size_t size,
                             void *host_ptr, pi_mem *ret_mem,
                             const pi_mem_properties *properties) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(flags).name() << " " << flags << ", ";
+  std::cout << typeid(size).name() << " " << size << ", ";
+  std::cout << typeid(host_ptr).name() << " " << host_ptr << ", ";
+  std::cout << typeid(ret_mem).name() << " " << ret_mem << ", ";
+  std::cout << typeid(properties).name() << " " << properties << ")";
+  std::cout << std::endl;
+
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   if (properties) {
     // TODO: need to check if all properties are supported by OpenCL RT and
@@ -1167,6 +1329,15 @@ pi_result piMemImageCreate(pi_context context, pi_mem_flags flags,
                            const pi_image_format *image_format,
                            const pi_image_desc *image_desc, void *host_ptr,
                            pi_mem *ret_mem) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(flags).name() << " " << flags << ", ";
+  std::cout << typeid(image_format).name() << " " << image_format << ", ";
+  std::cout << typeid(image_desc).name() << " " << image_desc << ", ";
+  std::cout << typeid(host_ptr).name() << " " << host_ptr << ", ";
+  std::cout << typeid(ret_mem).name() << " " << ret_mem << ")";
+  std::cout << std::endl;
+
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   *ret_mem = cast<pi_mem>(
       clCreateImage(cast<cl_context>(context), cast<cl_mem_flags>(flags),
@@ -1180,6 +1351,15 @@ pi_result piMemImageCreate(pi_context context, pi_mem_flags flags,
 pi_result piMemBufferPartition(pi_mem buffer, pi_mem_flags flags,
                                pi_buffer_create_type buffer_create_type,
                                void *buffer_create_info, pi_mem *ret_mem) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(buffer).name() << " " << buffer << ", ";
+  std::cout << typeid(flags).name() << " " << flags << ", ";
+  std::cout << typeid(buffer_create_type).name() << " " << buffer_create_type << ", ";
+  std::cout << typeid(buffer_create_info).name() << " " << buffer_create_info << ", ";
+  std::cout << typeid(ret_mem).name() << " " << ret_mem << ")";
+  std::cout << std::endl;
+}
 
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   *ret_mem = cast<pi_mem>(
@@ -1192,6 +1372,13 @@ pi_result piMemBufferPartition(pi_mem buffer, pi_mem_flags flags,
 pi_result piextMemCreateWithNativeHandle(pi_native_handle nativeHandle,
                                          pi_context context,
                                          bool ownNativeHandle, pi_mem *piMem) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(ownNativeHandle).name() << " " << ownNativeHandle << ", ";
+  std::cout << typeid(piMem).name() << " " << piMem << ")";
+  std::cout << std::endl;
+
   (void)context;
   (void)ownNativeHandle;
   assert(piMem != nullptr);
@@ -1203,6 +1390,13 @@ pi_result piclProgramCreateWithSource(pi_context context, pi_uint32 count,
                                       const char **strings,
                                       const size_t *lengths,
                                       pi_program *ret_program) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(count).name() << " " << count << ", ";
+  std::cout << typeid(strings).name() << " " << strings << ", ";
+  std::cout << typeid(lengths).name() << " " << lengths << ", ";
+  std::cout << typeid(ret_program).name() << " " << ret_program << ")";
+  std::cout << std::endl;
 
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   *ret_program = cast<pi_program>(
@@ -1216,6 +1410,18 @@ pi_result piProgramCreateWithBinary(
     const size_t *lengths, const unsigned char **binaries,
     size_t num_metadata_entries, const pi_device_binary_property *metadata,
     pi_int32 *binary_status, pi_program *ret_program) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(num_devices).name() << " " << num_devices << ", ";
+  std::cout << typeid(device_list).name() << " " << device_list << ", ";
+  std::cout << typeid(lengths).name() << " " << lengths << ", ";
+  std::cout << typeid(binaries).name() << " " << binaries << ", ";
+  std::cout << typeid(num_metadata_entries).name() << " " << num_metadata_entries << ", ";
+  std::cout << typeid(metadata).name() << " " << metadata << ", ";
+  std::cout << typeid(binary_status).name() << " " << binary_status << ", ";
+  std::cout << typeid(ret_program).name() << " " << ret_program << ")";
+  std::cout << std::endl;
+
   (void)metadata;
   (void)num_metadata_entries;
 
@@ -1233,6 +1439,19 @@ pi_result piProgramLink(pi_context context, pi_uint32 num_devices,
                         const pi_program *input_programs,
                         void (*pfn_notify)(pi_program program, void *user_data),
                         void *user_data, pi_program *ret_program) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(num_devices).name() << " " << num_devices << ", ";
+  std::cout << typeid(device_list).name() << " " << device_list << ", ";
+  std::cout << typeid(options).name() << " " << options << ", ";
+  std::cout << typeid(num_input_programs).name() << " " << num_input_programs << ", ";
+  std::cout << typeid(input_programs).name() << " " << input_programs << ", ";
+  std::cout << typeid(pfn_notify).name() << " " << pfn_notify << ", ";
+  std::cout << typeid(user_data).name() << " " << user_data << ", ";
+  std::cout << typeid(ret_program).name() << " " << ret_program << ")";
+  std::cout << std::endl;
+}
 
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   *ret_program = cast<pi_program>(
@@ -1247,6 +1466,11 @@ pi_result piProgramLink(pi_context context, pi_uint32 num_devices,
 
 pi_result piKernelCreate(pi_program program, const char *kernel_name,
                          pi_kernel *ret_kernel) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(program).name() << " " << program << ", ";
+  std::cout << typeid(kernel_name).name() << " " << kernel_name << ", ";
+  std::cout << typeid(ret_kernel).name() << " " << ret_kernel << ")";
+  std::cout << std::endl;
 
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   *ret_kernel = cast<pi_kernel>(clCreateKernel(
@@ -1258,6 +1482,17 @@ pi_result piKernelGetGroupInfo(pi_kernel kernel, pi_device device,
                                pi_kernel_group_info param_name,
                                size_t param_value_size, void *param_value,
                                size_t *param_value_size_ret) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(kernel).name() << " " << kernel << ", ";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(param_name).name() << " " << param_name << ", ";
+  std::cout << typeid(param_value_size).name() << " " << param_value_size << ", ";
+  std::cout << typeid(param_value).name() << " " << param_value << ", ";
+  std::cout << typeid(param_value_size_ret).name() << " " << param_value_size_ret << ")";
+  std::cout << std::endl;
+}
+
   if (kernel == nullptr) {
     return PI_ERROR_INVALID_KERNEL;
   }
@@ -1280,6 +1515,19 @@ pi_result piKernelGetSubGroupInfo(pi_kernel kernel, pi_device device,
                                   const void *input_value,
                                   size_t param_value_size, void *param_value,
                                   size_t *param_value_size_ret) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(kernel).name() << " " << kernel << ", ";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(param_name).name() << " " << param_name << ", ";
+  std::cout << typeid(input_value_size).name() << " " << input_value_size << ", ";
+  std::cout << typeid(input_value).name() << " " << input_value << ", ";
+  std::cout << typeid(param_value_size).name() << " " << param_value_size << ", ";
+  std::cout << typeid(param_value).name() << " " << param_value << ", ";
+  std::cout << typeid(param_value_size_ret).name() << " " << param_value_size_ret << ")";
+  std::cout << std::endl;
+}
+
   (void)param_value_size;
   size_t ret_val;
   cl_int ret_err;
@@ -1323,6 +1571,10 @@ pi_result piKernelGetSubGroupInfo(pi_kernel kernel, pi_device device,
 }
 
 pi_result piEventCreate(pi_context context, pi_event *ret_event) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(ret_event).name() << " " << ret_event << ")";
+  std::cout << std::endl;
 
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   auto *cl_err = cast<cl_int *>(&ret_err);
@@ -1339,6 +1591,13 @@ pi_result piextEventCreateWithNativeHandle(pi_native_handle nativeHandle,
                                            pi_context context,
                                            bool ownNativeHandle,
                                            pi_event *piEvent) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ", ";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(ownNativeHandle).name() << " " << ownNativeHandle << ", ";
+  std::cout << typeid(piEvent).name() << " " << piEvent << ")";
+  std::cout << std::endl;
+
   (void)context;
   // TODO: ignore this, but eventually want to return error as unsupported
   (void)ownNativeHandle;
@@ -1357,6 +1616,20 @@ pi_result piEnqueueMemBufferMap(pi_queue command_queue, pi_mem buffer,
                                 pi_uint32 num_events_in_wait_list,
                                 const pi_event *event_wait_list,
                                 pi_event *event, void **ret_map) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(command_queue).name() << " " << command_queue << ", ";
+  std::cout << typeid(buffer).name() << " " << buffer << ", ";
+  std::cout << typeid(blocking_map).name() << " " << blocking_map << ", ";
+  std::cout << typeid(map_flags).name() << " " << map_flags << ", ";
+  std::cout << typeid(offset).name() << " " << offset << ", ";
+  std::cout << typeid(size).name() << " " << size << ", ";
+  std::cout << typeid(num_events_in_wait_list).name() << " " << num_events_in_wait_list << ", ";
+  std::cout << typeid(event_wait_list).name() << " " << event_wait_list << ", ";
+  std::cout << typeid(event).name() << " " << event << ", ";
+  std::cout << typeid(ret_map).name() << " " << ret_map << ")";
+  std::cout << std::endl;
+}
 
   pi_result ret_err = PI_ERROR_INVALID_OPERATION;
   *ret_map = cast<void *>(clEnqueueMapBuffer(
@@ -1382,6 +1655,15 @@ pi_result piEnqueueMemBufferMap(pi_queue command_queue, pi_mem buffer,
 pi_result piextUSMHostAlloc(void **result_ptr, pi_context context,
                             pi_usm_mem_properties *properties, size_t size,
                             pi_uint32 alignment) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(result_ptr).name() << " " << result_ptr << ", ";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(properties).name() << " " << properties << ", ";
+  std::cout << typeid(size).name() << " " << size << ", ";
+  std::cout << typeid(alignment).name() << " " << alignment << ")";
+  std::cout << std::endl;
+}
 
   void *Ptr = nullptr;
   pi_result RetVal = PI_ERROR_INVALID_OPERATION;
@@ -1419,6 +1701,16 @@ pi_result piextUSMDeviceAlloc(void **result_ptr, pi_context context,
                               pi_device device,
                               pi_usm_mem_properties *properties, size_t size,
                               pi_uint32 alignment) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(result_ptr).name() << " " << result_ptr << ", ";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(properties).name() << " " << properties << ", ";
+  std::cout << typeid(size).name() << " " << size << ", ";
+  std::cout << typeid(alignment).name() << " " << alignment << ")";
+  std::cout << std::endl;
+}
 
   void *Ptr = nullptr;
   pi_result RetVal = PI_ERROR_INVALID_OPERATION;
@@ -1457,6 +1749,16 @@ pi_result piextUSMSharedAlloc(void **result_ptr, pi_context context,
                               pi_device device,
                               pi_usm_mem_properties *properties, size_t size,
                               pi_uint32 alignment) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(result_ptr).name() << " " << result_ptr << ", ";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(device).name() << " " << device << ", ";
+  std::cout << typeid(properties).name() << " " << properties << ", ";
+  std::cout << typeid(size).name() << " " << size << ", ";
+  std::cout << typeid(alignment).name() << " " << alignment << ")";
+  std::cout << std::endl;
+}
 
   void *Ptr = nullptr;
   pi_result RetVal = PI_ERROR_INVALID_OPERATION;
@@ -1486,6 +1788,13 @@ pi_result piextUSMSharedAlloc(void **result_ptr, pi_context context,
 /// \param context is the pi_context of the allocation
 /// \param ptr is the memory to be freed
 pi_result piextUSMFree(pi_context context, void *ptr) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(ptr).name() << " " << ptr << ")";
+  std::cout << std::endl;
+}
+
   // Use a blocking free to avoid issues with indirect access from kernels that
   // might be still running.
   clMemBlockingFreeINTEL_fn FuncPtr = nullptr;
@@ -1511,6 +1820,15 @@ pi_result piextUSMFree(pi_context context, void *ptr) {
 /// \param arg_value is the pointer argument
 pi_result piextKernelSetArgPointer(pi_kernel kernel, pi_uint32 arg_index,
                                    size_t arg_size, const void *arg_value) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(kernel).name() << " " << kernel << ", ";
+  std::cout << typeid(arg_index).name() << " " << arg_index << ", ";
+  std::cout << typeid(arg_size).name() << " " << arg_size << ", ";
+  std::cout << typeid(arg_value).name() << " " << arg_value << ")";
+  std::cout << std::endl;
+}
+
   (void)arg_size;
 
   // Size is unused in CL as pointer args are passed by value.
@@ -1554,6 +1872,17 @@ pi_result piextUSMEnqueueMemset(pi_queue queue, void *ptr, pi_int32 value,
                                 size_t count, pi_uint32 num_events_in_waitlist,
                                 const pi_event *events_waitlist,
                                 pi_event *event) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(queue).name() << " " << queue << ", ";
+  std::cout << typeid(ptr).name() << " " << ptr << ", ";
+  std::cout << typeid(value).name() << " " << value << ", ";
+  std::cout << typeid(count).name() << " " << count << ", ";
+  std::cout << typeid(num_events_in_waitlist).name() << " " << num_events_in_waitlist << ", ";
+  std::cout << typeid(events_waitlist).name() << " " << events_waitlist << ", ";
+  std::cout << typeid(event).name() << " " << event << ")";
+  std::cout << std::endl;
+}
 
   // Have to look up the context from the kernel
   cl_context CLContext;
@@ -1594,6 +1923,18 @@ pi_result piextUSMEnqueueMemcpy(pi_queue queue, pi_bool blocking, void *dst_ptr,
                                 pi_uint32 num_events_in_waitlist,
                                 const pi_event *events_waitlist,
                                 pi_event *event) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(queue).name() << " " << queue << ", ";
+  std::cout << typeid(blocking).name() << " " << blocking << ", ";
+  std::cout << typeid(dst_ptr).name() << " " << dst_ptr << ", ";
+  std::cout << typeid(src_ptr).name() << " " << src_ptr << ", ";
+  std::cout << typeid(size).name() << " " << size << ", ";
+  std::cout << typeid(num_events_in_waitlist).name() << " " << num_events_in_waitlist << ", ";
+  std::cout << typeid(events_waitlist).name() << " " << events_waitlist << ", ";
+  std::cout << typeid(event).name() << " " << event << ")";
+  std::cout << std::endl;
+}
 
   // Have to look up the context from the kernel
   cl_context CLContext;
@@ -1633,6 +1974,18 @@ pi_result piextUSMEnqueuePrefetch(pi_queue queue, const void *ptr, size_t size,
                                   pi_uint32 num_events_in_waitlist,
                                   const pi_event *events_waitlist,
                                   pi_event *event) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(queue).name() << " " << queue << ", ";
+  std::cout << typeid(ptr).name() << " " << ptr << ", ";
+  std::cout << typeid(size).name() << " " << size << ", ";
+  std::cout << typeid(flags).name() << " " << flags << ", ";
+  std::cout << typeid(num_events_in_waitlist).name() << " " << num_events_in_waitlist << ", ";
+  std::cout << typeid(events_waitlist).name() << " " << events_waitlist << ", ";
+  std::cout << typeid(event).name() << " " << event << ")";
+  std::cout << std::endl;
+}
+
   (void)ptr;
   (void)size;
 
@@ -1681,6 +2034,16 @@ pi_result piextUSMEnqueuePrefetch(pi_queue queue, const void *ptr, size_t size,
 pi_result piextUSMEnqueueMemAdvise(pi_queue queue, const void *ptr,
                                    size_t length, pi_mem_advice advice,
                                    pi_event *event) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(queue).name() << " " << queue << ", ";
+  std::cout << typeid(ptr).name() << " " << ptr << ", ";
+  std::cout << typeid(length).name() << " " << length << ", ";
+  std::cout << typeid(advice).name() << " " << advice << ", ";
+  std::cout << typeid(event).name() << " " << event << ")";
+  std::cout << std::endl;
+}
+
   (void)ptr;
   (void)length;
   (void)advice;
@@ -1829,6 +2192,16 @@ pi_result piextUSMGetMemAllocInfo(pi_context context, const void *ptr,
                                   pi_mem_alloc_info param_name,
                                   size_t param_value_size, void *param_value,
                                   size_t *param_value_size_ret) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(context).name() << " " << context << ", ";
+  std::cout << typeid(ptr).name() << " " << ptr << ", ";
+  std::cout << typeid(param_name).name() << " " << param_name << ", ";
+  std::cout << typeid(param_value_size).name() << " " << param_value_size << ", ";
+  std::cout << typeid(param_value).name() << " " << param_value << ", ";
+  std::cout << typeid(param_value_size_ret).name() << " " << param_value_size_ret << ")";
+  std::cout << std::endl;
+}
 
   clGetMemAllocInfoINTEL_fn FuncPtr = nullptr;
   pi_result RetVal =
@@ -1941,10 +2314,21 @@ pi_result piextEnqueueDeviceGlobalVariableRead(
 pi_result piKernelSetExecInfo(pi_kernel kernel, pi_kernel_exec_info param_name,
                               size_t param_value_size,
                               const void *param_value) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(kernel).name() << " " << kernel << ", ";
+  std::cout << typeid(param_name).name() << " " << param_name << ", ";
+  std::cout << typeid(param_value_size).name() << " " << param_value_size << ", ";
+  std::cout << typeid(param_value).name() << " " << param_value << ")";
+  std::cout << std::endl;
+}
+
   if (param_name == PI_USM_INDIRECT_ACCESS &&
       *(static_cast<const pi_bool *>(param_value)) == PI_TRUE) {
+    std::cout << "===USMSetIndirectAccess\n";
     return USMSetIndirectAccess(kernel);
   } else {
+    std::cout << "===clSetKernelExecInfo\n";
     return cast<pi_result>(clSetKernelExecInfo(
         cast<cl_kernel>(kernel), param_name, param_value_size, param_value));
   }
@@ -1958,6 +2342,15 @@ pi_result piextProgramSetSpecializationConstant(pi_program prog,
                                                 pi_uint32 spec_id,
                                                 size_t spec_size,
                                                 const void *spec_value) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(prog).name() << " " << prog << ", ";
+  std::cout << typeid(spec_id).name() << " " << spec_id << ", ";
+  std::cout << typeid(spec_size).name() << " " << spec_size << ", ";
+  std::cout << typeid(spec_value).name() << " " << spec_value << ")";
+  std::cout << std::endl;
+}
+
   cl_program ClProg = cast<cl_program>(prog);
   cl_context Ctx = nullptr;
   size_t RetSize = 0;
@@ -1985,6 +2378,13 @@ pi_result piextProgramSetSpecializationConstant(pi_program prog,
 /// PI_SUCCESS
 static pi_result piextGetNativeHandle(void *piObj,
                                       pi_native_handle *nativeHandle) {
+if (PRINT_ELSE) {
+  std::cout << __FUNCTION__ << "(";
+  std::cout << typeid(piObj).name() << " " << piObj << ", ";
+  std::cout << typeid(nativeHandle).name() << " " << nativeHandle << ")";
+  std::cout << std::endl;
+}
+
   assert(nativeHandle != nullptr);
   *nativeHandle = reinterpret_cast<pi_native_handle>(piObj);
   return PI_SUCCESS;
