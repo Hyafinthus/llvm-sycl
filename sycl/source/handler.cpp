@@ -22,6 +22,7 @@
 #include <sycl/detail/kernel_desc.hpp>
 #include <sycl/detail/pi.h>
 #include <sycl/detail/pi.hpp>
+#include <sycl/access/access.hpp>
 #include <sycl/device.hpp>
 #include <sycl/device_selector.hpp>
 #include <sycl/event.hpp>
@@ -30,7 +31,8 @@
 #include <sycl/stream.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 #define PRINT_TRACE 1
-
+// #define REBIND 1
+// #define SCHEDULE 1
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 
@@ -92,9 +94,11 @@ void handler::setHandlerKernelBundle(kernel Kernel) {
   setHandlerKernelBundle(KernelBundleImpl);
 }
 
+#ifdef REBIND
 namespace detail {
   extern device select_device(DSelectorInvocableType DeviceSelectorInvocable, bool rebind);
 }
+#endif
 
 event handler::finalize() {
   // This block of code is needed only for reduction implementation.
@@ -123,22 +127,90 @@ event handler::finalize() {
                             "handler::require() before it can be used.");
   }
 
-  // =======================================================
-
+// =======================================================
+#ifdef SCHEDULE
+  using namespace sycl::detail;
   // 给anaylzer传输需要的信息(kernel requirement等)
   // analyzer结合recorder判断是否有同用户进程前序kernel 以及是否需要跨设备数据移动
   // 等待接收anaylzer的调度决策
+  
+  // 如果是kernel 以graph_builder的形式获取依赖
+  const auto &cmdType = getType();
+  if (cmdType == detail::CG::Kernel) {
+    std::unique_ptr<detail::CG> cmdGroup;
+    // 需要cmdGroup和MQueue
+    // graph_builder里用Mrequirements和MEvents构建依赖图
+    detail::combineAccessModesOfReqs(MRequirements);
+    std::vector<Command *> ToEnqueue; // scheduler中的AuxiliaryCmds
+    std::cout << "=== handler === REBIND === BEFORE REQS"<< std::endl;
 
-  device d = detail::select_device(gpu_selector_v, true);
+    // 在gloabal_handler初始化时获取所有device，并循环判断如果使用每个device的queue会造成几次数据移动
+    for (device tempD : detail::ProgramManager::getInstance().globalDevices) {
+      detail::DeviceImplPtr tempDP = detail::getSyclObjImpl(tempD);
+      MQueue.reset(new detail::queue_impl(tempDP, detail::queue_impl::getDefaultOrNew(tempDP), MQueue->MAsyncHandler, MQueue->MPropList));
+      int notSameCtxCount = 0;
+
+      std::cout << "=== handler === REBIND === TRY: " << tempD.get_info<info::device::name>() << std::endl;
+      for (Requirement *Req : MRequirements) {
+        // Req->MAccessMode
+        MemObjRecord *record = nullptr;
+        AllocaCommandBase *allocaCmd = nullptr;
+        bool isSameCtx = false;
+
+        std::cout << "=== handler === req 1"<< std::endl;
+        record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
+        // detail::Scheduler::getInstance().MGraphBuilder.markModifiedIfWrite(record, Req);
+        // allocaCmd = detail::Scheduler::getInstance().MGraphBuilder.getOrCreateAllocaForReq(record, Req, MQueue, ToEnqueue);
+        std::cout << "=== handler === req 2"<< std::endl;
+        isSameCtx = detail::sameCtx(MQueue->getContextImplPtr(), record->MCurContext);
+        if (!isSameCtx) {
+          notSameCtxCount++;
+        }
+      }
+      std::cout << "=== handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
+    }
+    
+    // TODO 将每个req对应的内存对象的大小和数目发给scheduler
+  }
+#endif
+
+#ifdef REBIND
+  for (device d : detail::ProgramManager::getInstance().globalDevices) {
+    std::cout << "=== handler === global device cpu: " << d.is_cpu() << " gpu: " << d.is_gpu() << " acc: " << d.is_accelerator() << std::endl;
+  }
+  detail::ProgramManager::getInstance().kernel_count++;
+
   // 应被替换为运行时调度设备选择
-  // std::vector<device> Devices = device::get_devices();
+  // device d = detail::select_device(gpu_selector_v, true);
+
+  // device d;
+  // if (detail::ProgramManager::getInstance().kernel_count == 1) {
+  //   d = detail::ProgramManager::getInstance().globalDevices.at(1);
+  // } else if (detail::ProgramManager::getInstance().kernel_count == 2) {
+  //   d = detail::ProgramManager::getInstance().globalDevices.at(2);
+  // } else {
+  //   d = detail::ProgramManager::getInstance().globalDevices.at(2);
+  // }
+
+  device dd = detail::ProgramManager::getInstance().globalDevices.at(0);
+  std::vector<size_t> cts = {8, 4};
+  std::vector<device> subDevices = dd.create_sub_devices<info::partition_property::partition_by_counts>(cts);
+
+  device d;
+  if (detail::ProgramManager::getInstance().kernel_count == 1) {
+    d = subDevices.at(0);
+  } else if (detail::ProgramManager::getInstance().kernel_count == 2) {
+    d = subDevices.at(1);
+  } else {
+    d = dd;
+  }
 
   detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
   std::cout << "=== handler === rebind device " << d.is_gpu() << std::endl;
   // MQueue->rebindDevice(dp);
   MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->MAsyncHandler, MQueue->MPropList));
-  
-  // =======================================================
+#endif
+// =======================================================
   
   // 单独对特殊情况的kernel处理 目前没有 按道理可以忽略 但必须在之前rebind 因为有调用
   const auto &type = getType();

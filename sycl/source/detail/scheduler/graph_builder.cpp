@@ -49,7 +49,7 @@ static bool doOverlap(const Requirement *LHS, const Requirement *RHS) {
           LHS->MOffsetInBytes);
 }
 
-static bool sameCtx(const ContextImplPtr &LHS, const ContextImplPtr &RHS) {
+bool sameCtx(const ContextImplPtr &LHS, const ContextImplPtr &RHS) {
   // Consider two different host contexts to be the same to avoid additional
   // allocation on the host
   return LHS == RHS || (LHS->is_host() && RHS->is_host());
@@ -941,7 +941,7 @@ static bool isInteropHostTask(ExecCGCommand *Cmd) {
   return HT.MHostTask->isInteropTask();
 }
 
-static void combineAccessModesOfReqs(std::vector<Requirement *> &Reqs) {
+void combineAccessModesOfReqs(std::vector<Requirement *> &Reqs) {
   std::unordered_map<SYCLMemObjI *, access::mode> CombinedModes;
   bool HasDuplicateMemObjects = false;
   for (const Requirement *Req : Reqs) {
@@ -1084,6 +1084,7 @@ void Scheduler::GraphBuilder::createGraphForCommand(
     bool isSameCtx = false;
 
     {
+      // 互操作主机任务 指的是直接调用其他API的任务 一般不需考虑
       const QueueImplPtr &QueueForAlloca =
           isInteropTask ? static_cast<detail::CGHostTask &>(CG).MQueue : Queue;
 

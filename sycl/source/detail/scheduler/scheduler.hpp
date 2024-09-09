@@ -189,6 +189,10 @@ using CommandPtr = std::unique_ptr<Command>;
 using FusionList = std::unique_ptr<KernelFusionCommand>;
 using FusionMap = std::unordered_map<QueueIdT, FusionList>;
 
+void combineAccessModesOfReqs(std::vector<Requirement *> &Reqs);
+
+bool sameCtx(const ContextImplPtr &LHS, const ContextImplPtr &RHS);
+
 /// Memory Object Record
 ///
 /// The MemObjRecord is used in command groups (todo better desc).
@@ -361,6 +365,9 @@ struct MemObjRecord {
 ///
 /// \ingroup sycl_graph
 class Scheduler {
+
+friend class handler;
+
 public:
   /// Registers a command group, and adds it to the dependency graph.
   ///
@@ -520,6 +527,9 @@ protected:
   ///
   /// \ingroup sycl_graph
   class GraphBuilder {
+
+  friend class handler;
+  
   public:
     GraphBuilder();
 
@@ -624,6 +634,12 @@ protected:
 
     std::vector<SYCLMemObjI *> MMemObjs;
 
+    AllocaCommandBase *getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
+                                               const QueueImplPtr &Queue,
+                                               std::vector<Command *> &ToEnqueue);
+
+    void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
+
   private:
     /// Inserts the command required to update the memory object state in the
     /// context.
@@ -685,12 +701,12 @@ protected:
     /// Searches for suitable alloca in memory record.
     ///
     /// If none found, creates new one.
-    AllocaCommandBase *
-    getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
-                            const QueueImplPtr &Queue,
-                            std::vector<Command *> &ToEnqueue);
+    // AllocaCommandBase *
+    // getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
+    //                         const QueueImplPtr &Queue,
+    //                         std::vector<Command *> &ToEnqueue);
 
-    void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
+    // void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
 
     FusionMap::iterator findFusionList(QueueIdT Id) {
       return MFusionMap.find(Id);
@@ -855,7 +871,7 @@ protected:
   void waitForRecordToFinish(MemObjRecord *Record, ReadLockT &GraphReadLock);
   bool checkLeavesCompletion(MemObjRecord *Record);
 
-  GraphBuilder MGraphBuilder;
+  // GraphBuilder MGraphBuilder;
   RWLockT MGraphLock;
 
   std::vector<Command *> MDeferredCleanupCommands;
@@ -895,6 +911,10 @@ private:
   static void printFusionWarning(const std::string &Message);
 
   static KernelFusionCommand *isPartOfActiveFusion(Command *Cmd);
+
+
+public:
+  GraphBuilder MGraphBuilder;
 };
 
 } // namespace detail

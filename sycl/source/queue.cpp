@@ -20,6 +20,8 @@
 
 #include <algorithm>
 
+// #define REBIND 1
+
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 
@@ -46,17 +48,20 @@ queue::queue(const context &SyclContext, const device &SyclDevice,
       AsyncHandler, PropList);
 }
 
-// 已经在device_selector中选择完设备，创建一个具体的queue_impl对象，将device作为属性给这个queue
-// queue::queue(const device &SyclDevice, const async_handler &AsyncHandler,
-//              const property_list &PropList) {
-//   impl = std::make_shared<detail::queue_impl>(
-//       detail::getSyclObjImpl(SyclDevice), AsyncHandler, PropList);
-// }
-queue::queue(const device &SyclDevice, const async_handler &AsyncHandler,
-             const property_list &PropList) {
-  impl = std::make_shared<detail::queue_impl>(detail::DeviceImplPtr(nullptr), AsyncHandler, PropList);
-  impl->setShell();
-}
+#ifdef REBIND
+  queue::queue(const device &SyclDevice, const async_handler &AsyncHandler,
+              const property_list &PropList) {
+    impl = std::make_shared<detail::queue_impl>(detail::DeviceImplPtr(nullptr), AsyncHandler, PropList);
+    impl->setShell();
+  }
+#else
+  // 已经在device_selector中选择完设备，创建一个具体的queue_impl对象，将device作为属性给这个queue
+  queue::queue(const device &SyclDevice, const async_handler &AsyncHandler,
+               const property_list &PropList) {
+    impl = std::make_shared<detail::queue_impl>(
+        detail::getSyclObjImpl(SyclDevice), AsyncHandler, PropList);
+  }
+#endif
 
 queue::queue(cl_command_queue clQueue, const context &SyclContext,
              const async_handler &AsyncHandler) {
@@ -143,18 +148,24 @@ event queue::discard_or_return(const event &Event) {
   return detail::createSyclObjFromImpl<event>(Impl);
 }
 
-event queue::submit_impl(std::function<void(handler &)> CGH,
-                         const detail::code_location &CodeLoc) {
-  // return impl->submit(CGH, impl, CodeLoc);
-  // 需要在这里处理替换impl的引用问题
-  event ret = impl->submit(CGH, impl, CodeLoc);
-  std::shared_ptr<detail::queue_impl> newImpl = detail::getSyclObjImpl(ret)->getQueueImpl();
-  if (newImpl) {
-    std::cout << "=== queue rebind impl" << std::endl;
-    impl = newImpl;
+#ifdef REBIND
+  event queue::submit_impl(std::function<void(handler &)> CGH,
+                          const detail::code_location &CodeLoc) {
+    event ret = impl->submit(CGH, impl, CodeLoc);
+    std::shared_ptr<detail::queue_impl> newImpl = detail::getSyclObjImpl(ret)->getQueueImpl();
+    if (newImpl) {
+      std::cout << "=== queue rebind impl" << std::endl;
+      impl = newImpl;
+    }
+    return ret;
   }
-  return ret;
-}
+#else
+  event queue::submit_impl(std::function<void(handler &)> CGH,
+                            const detail::code_location &CodeLoc) {
+    // 需要在这里处理替换impl的引用问题
+    return impl->submit(CGH, impl, CodeLoc);
+  }
+#endif
 
 event queue::submit_impl(std::function<void(handler &)> CGH, queue SecondQueue,
                          const detail::code_location &CodeLoc) {

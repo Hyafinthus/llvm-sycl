@@ -401,8 +401,8 @@ std::vector<plugin> &initialize() {
   // creating a vector of plugins. So, no additional lock is needed.
   std::call_once(PluginsInitDone, [&]() {
     initializePlugins(GlobalHandler::instance().getPlugins());
-    int fake_argc = 0;
-    char **fake_argv = NULL;
+    // int fake_argc = 0;
+    // char **fake_argv = NULL;
     // MPI_Init(&fake_argc, &fake_argv);
     // MPI_Comm_size(MPI_COMM_WORLD, &GlobalHandler::instance().mpi_size);
     // MPI_Comm_rank(MPI_COMM_WORLD, &GlobalHandler::instance().mpi_rank);
