@@ -31,6 +31,7 @@
 #include <sycl/stl.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 #define PRINT_TRACE 1
+// #define REBIND 1
 
 #include <utility>
 
@@ -90,15 +91,18 @@ public:
   /// to the queue.
   /// \param AsyncHandler is a SYCL asynchronous exception handler.
   /// \param PropList is a list of properties to use for queue construction.
-  // queue_impl(const DeviceImplPtr &Device, const async_handler &AsyncHandler,
-  //            const property_list &PropList)
-  //     : queue_impl(Device, getDefaultOrNew(Device), AsyncHandler, PropList){};
+#ifdef REBIND
   queue_impl(const DeviceImplPtr &Device, const async_handler &AsyncHandler,
              const property_list &PropList)
       : MContext(nullptr), MAsyncHandler(AsyncHandler), MPropList(PropList),
         MHostQueue(false), MAssertHappenedBuffer(range<1>{1}),
         MIsInorder(false), MDiscardEvents(false),
         MIsProfilingEnabled(false), MHasDiscardEventsSupport(false) {}
+#else
+  queue_impl(const DeviceImplPtr &Device, const async_handler &AsyncHandler,
+             const property_list &PropList)
+      : queue_impl(Device, getDefaultOrNew(Device), AsyncHandler, PropList){};
+#endif
 
   // void rebindDevice(const DeviceImplPtr &Device) {
   //   MDevice = Device;
@@ -209,11 +213,12 @@ public:
           "Device provided by native Queue not found in Context.");
   }
 
+#ifdef REBIND
   ~queue_impl() {
     if (shell) {
       std::cout << "===queue_impl.hpp=== shell queue destruct" << std::endl;
     } else {
-    throw_asynchronous();
+      throw_asynchronous();
       std::cout << "===queue_impl.hpp=== before cleanup" << std::endl;
       if (!MHostQueue) {
         std::cout << "This queue_impl: " << this << " MQueues: " << &MQueues << " size: " << MQueues.size() << std::endl;
@@ -226,6 +231,14 @@ public:
   void setShell() {
     shell = true;
   }
+#else
+  ~queue_impl() {
+    throw_asynchronous();
+    if (!MHostQueue) {
+      getPlugin().call<PiApiKind::piQueueRelease>(MQueues[0]);
+    }
+  }
+#endif
 
   /// \return an OpenCL interoperability queue handle.
   cl_command_queue get() {

@@ -1000,6 +1000,16 @@ ProgramManager::ProgramManager() {
         new std::vector<RTDeviceBinaryImageUPtr>());
     m_DeviceImages[SpvFileKSId]->push_back(std::move(ImgPtr));
   }
+
+  globalDevices = device::get_devices();
+  globalDevices.erase(
+    std::remove_if(
+      globalDevices.begin(), 
+      globalDevices.end(),
+      [](const device& d) { return d.is_accelerator(); }
+    ),
+    globalDevices.end()
+  );
 }
 
 RTDeviceBinaryImage &

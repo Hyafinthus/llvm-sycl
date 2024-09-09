@@ -183,6 +183,10 @@ using QueueImplPtr = std::shared_ptr<detail::queue_impl>;
 using EventImplPtr = std::shared_ptr<detail::event_impl>;
 using ContextImplPtr = std::shared_ptr<detail::context_impl>;
 
+void combineAccessModesOfReqs(std::vector<Requirement *> &Reqs);
+
+bool sameCtx(const ContextImplPtr &LHS, const ContextImplPtr &RHS);
+
 /// Memory Object Record
 ///
 /// The MemObjRecord is used in command groups (todo better desc).
@@ -355,6 +359,9 @@ struct MemObjRecord {
 ///
 /// \ingroup sycl_graph
 class Scheduler {
+
+friend class handler;
+
 public:
   /// Registers a command group, and adds it to the dependency graph.
   ///
@@ -507,6 +514,9 @@ protected:
   ///
   /// \ingroup sycl_graph
   class GraphBuilder {
+
+  friend class handler;
+  
   public:
     GraphBuilder();
 
@@ -609,6 +619,12 @@ protected:
 
     std::vector<SYCLMemObjI *> MMemObjs;
 
+    AllocaCommandBase *getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
+                                               const QueueImplPtr &Queue,
+                                               std::vector<Command *> &ToEnqueue);
+
+    void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
+
   private:
     /// Inserts the command required to update the memory object state in the
     /// context.
@@ -666,12 +682,12 @@ protected:
     /// Searches for suitable alloca in memory record.
     ///
     /// If none found, creates new one.
-    AllocaCommandBase *
-    getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
-                            const QueueImplPtr &Queue,
-                            std::vector<Command *> &ToEnqueue);
+    // AllocaCommandBase *
+    // getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
+    //                         const QueueImplPtr &Queue,
+    //                         std::vector<Command *> &ToEnqueue);
 
-    void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
+    // void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
 
     /// Used to track commands that need to be visited during graph traversal.
     std::queue<Command *> MCmdsToVisit;
@@ -821,7 +837,7 @@ protected:
   void waitForRecordToFinish(MemObjRecord *Record, ReadLockT &GraphReadLock);
   bool checkLeavesCompletion(MemObjRecord *Record);
 
-  GraphBuilder MGraphBuilder;
+  // GraphBuilder MGraphBuilder;
   RWLockT MGraphLock;
 
   std::vector<Command *> MDeferredCleanupCommands;
@@ -883,6 +899,9 @@ protected:
   // scheduler. If program is not correct and doesn't have necessary sync point
   // then warning will be issued.
   std::unordered_map<stream_impl *, StreamBuffers *> StreamBuffersPool;
+
+public:
+  GraphBuilder MGraphBuilder;
 };
 
 } // namespace detail

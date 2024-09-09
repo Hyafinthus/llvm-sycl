@@ -261,6 +261,9 @@ public:
   std::set<RTDeviceBinaryImage *>
   getRawDeviceImages(const std::vector<kernel_id> &KernelIDs);
 
+  std::vector<device> globalDevices;
+  int kernel_count = 0;
+
 private:
   ProgramManager(ProgramManager const &) = delete;
   ProgramManager &operator=(ProgramManager const &) = delete;

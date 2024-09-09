@@ -139,13 +139,16 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
     }
     NewEvent = NewCmd->getEvent();
 
-    // 从1开始
-    if (Type == CG::Kernel) {
-      GlobalHandler::instance().kernel_cmd_count++;
-      NewCmd->kernel_index = GlobalHandler::instance().kernel_cmd_count;
-    }
+    // // 从1开始
+    // if (Type == CG::Kernel) {
+    //   GlobalHandler::instance().kernel_cmd_count++;
+    //   NewCmd->kernel_index = GlobalHandler::instance().kernel_cmd_count;
+    // }
   }
 
+  // 先执行AuxiliaryCmds 再执行NewCmd
+  // 没有执行4那一段 没有AuxiliaryCmds
+  // 3个kernel执行了3次5 ToCleanUp是enqueue过程中被确定不需要再执行的cmd
   std::vector<Command *> ToCleanUp;
   {
     ReadLockT Lock = acquireReadLock();
