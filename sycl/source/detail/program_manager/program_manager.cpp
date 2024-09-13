@@ -15,6 +15,7 @@
 #include <detail/program_impl.hpp>
 #include <detail/program_manager/program_manager.hpp>
 #include <detail/spec_constant_impl.hpp>
+#include <detail/daemon/daemon.hpp>
 #include <sycl/aspects.hpp>
 #include <sycl/backend_types.hpp>
 #include <sycl/context.hpp>
@@ -39,6 +40,10 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <mqueue.h>
+#include <unistd.h>
+
+mqd_t mq_id_kernel, mq_id_device;
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
@@ -1010,6 +1015,36 @@ ProgramManager::ProgramManager() {
     ),
     globalDevices.end()
   );
+
+  struct mq_attr mq_attr;
+  mq_attr.mq_maxmsg = MAX_MSG_NUM;
+  mq_attr.mq_msgsize = sizeof(DeviceData);
+
+  char MESSAGE_QUEUE_DEVICE_NAME[MESSAGE_QUEUE_DEVICE_NAME_MAX];
+  sprintf(MESSAGE_QUEUE_DEVICE_NAME, MESSAGE_QUEUE_DEVICE_PATTERN, getpid());
+
+  mq_id_device = mq_open(MESSAGE_QUEUE_DEVICE_NAME, O_CREAT | O_RDONLY, 0666, &mq_attr);
+  if (mq_id_device == -1) {
+    std::cerr << "Error: mq_device open failed" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  mq_id_kernel = mq_open(MESSAGE_QUEUE_KERNEL_NAME, O_WRONLY);
+  if (mq_id_kernel == -1) {
+    std::cerr << "Error: mq_kernel open failed" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+}
+
+ProgramManager::~ProgramManager() {
+  mq_close(mq_id_device);
+  mq_close(mq_id_kernel);
+
+  char MESSAGE_QUEUE_DEVICE_NAME[MESSAGE_QUEUE_DEVICE_NAME_MAX];
+  sprintf(MESSAGE_QUEUE_DEVICE_NAME, MESSAGE_QUEUE_DEVICE_PATTERN, getpid());
+  mq_unlink(MESSAGE_QUEUE_DEVICE_NAME);
+
+  std::cout << "Message queue closed" << std::endl;
 }
 
 RTDeviceBinaryImage &

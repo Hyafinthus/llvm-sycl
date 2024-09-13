@@ -302,6 +302,7 @@ add_custom_target( sycl-toolchain
   DEPENDS ${SYCL_RT_LIBS}
           sycl-compiler
           sycl-ls
+          sycl-daemon
           ${XPTIFW_LIBS}
   COMMENT "Building SYCL compiler toolchain..."
 )
