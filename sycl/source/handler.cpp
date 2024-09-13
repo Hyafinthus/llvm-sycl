@@ -17,6 +17,7 @@
 #include <detail/scheduler/commands.hpp>
 #include <detail/scheduler/scheduler.hpp>
 #include <detail/usm/usm_impl.hpp>
+#include <detail/daemon/daemon.hpp>
 #include <sycl/detail/common.hpp>
 #include <sycl/detail/helpers.hpp>
 #include <sycl/detail/kernel_desc.hpp>
@@ -30,9 +31,15 @@
 #include <sycl/info/info_desc.hpp>
 #include <sycl/stream.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
+#include <mqueue.h>
+#include <unistd.h>
+
 #define PRINT_TRACE 1
 // #define REBIND 1
-// #define SCHEDULE 1
+#define SCHEDULE 1
+
+extern mqd_t mq_id_kernel, mq_id_device;
+
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 
@@ -169,8 +176,16 @@ event handler::finalize() {
       }
       std::cout << "=== handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
     }
-    
+
     // TODO 将每个req对应的内存对象的大小和数目发给scheduler
+    KernelData kernel_data;
+    kernel_data.pid = getpid();
+    mq_send(mq_id_kernel, (char *)&kernel_data, sizeof(KernelData), 0);
+    std::cout << "=== handler === REBIND === send kernel data: " << kernel_data.pid << std::endl;
+
+    DeviceData device_data;
+    mq_receive(mq_id_device, (char *)&device_data, sizeof(DeviceData), NULL);
+    std::cout << "=== handler === REBIND === received device data: " << device_data.dev << std::endl;
   }
 #endif
 

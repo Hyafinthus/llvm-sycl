@@ -136,6 +136,7 @@ function(add_sycl_rt_library LIB_NAME LIB_OBJ_NAME)
       ${CMAKE_DL_LIBS}
       ${CMAKE_THREAD_LIBS_INIT}
       ${MPI_CXX_LIBRARIES}
+      -lrt
   )
 
   add_common_options(${LIB_NAME} ${LIB_OBJ_NAME})
@@ -280,7 +281,13 @@ if (WIN32)
   add_library(sycl ALIAS ${LIB_NAME})
 endif()
 
-install(TARGETS ${SYCL_RT_LIBS}
+add_executable(sycl-daemon
+  "detail/daemon/daemon.cpp"
+)
+
+target_link_libraries(sycl-daemon rt pthread)
+
+install(TARGETS ${SYCL_RT_LIBS} sycl-daemon
   ARCHIVE DESTINATION "lib${LLVM_LIBDIR_SUFFIX}" COMPONENT sycl
   LIBRARY DESTINATION "lib${LLVM_LIBDIR_SUFFIX}" COMPONENT sycl
   RUNTIME DESTINATION "bin" COMPONENT sycl)

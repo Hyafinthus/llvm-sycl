@@ -275,7 +275,7 @@ public:
                     const property_list &PropList, RT::PiProgram Program);
 
   ProgramManager();
-  ~ProgramManager() = default;
+  ~ProgramManager();
 
   bool kernelUsesAssert(OSModuleHandle M, const std::string &KernelName) const;
 
