@@ -10,7 +10,7 @@
 #include <detail/queue_impl.hpp>
 #include <detail/scheduler/scheduler.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
-#define PRINT_TRACE 1
+// #define PRINT_TRACE 1
 // #define MODIFY 1
 #include <detail/global_handler.hpp>
 

@@ -19,7 +19,7 @@
 #include <map>
 #include <string>
 
-#define PRINT_PI 1
+// #define PRINT_PI 1
 
 #ifdef XPTI_ENABLE_INSTRUMENTATION
 // Include the headers necessary for emitting traces using the trace framework

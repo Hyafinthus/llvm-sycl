@@ -20,7 +20,7 @@
 #include <sycl/access/access.hpp>
 #include <sycl/exception.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
-#define PRINT_TRACE 1
+// #define PRINT_TRACE 1
 // #define PRINT_DAG 1
 
 #include <algorithm>

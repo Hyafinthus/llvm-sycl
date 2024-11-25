@@ -30,7 +30,7 @@
 #include <sycl/ext/oneapi/experimental/spec_constant.hpp>
 #include <sycl/stl.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
-#define PRINT_TRACE 1
+// #define PRINT_TRACE 1
 // #define SCHEDULE 1
 
 #include <algorithm>

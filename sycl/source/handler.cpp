@@ -34,7 +34,7 @@
 #include <mqueue.h>
 #include <unistd.h>
 
-#define PRINT_TRACE 1
+// #define PRINT_TRACE 1
 // #define REBIND 1
 // #define SCHEDULE 1
 

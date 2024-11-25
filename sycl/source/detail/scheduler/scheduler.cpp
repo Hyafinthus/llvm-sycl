@@ -14,7 +14,7 @@
 #include <sycl/device_selector.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 // #include <mpi.h>
-#define PRINT_TRACE 1
+// #define PRINT_TRACE 1
 
 #include <chrono>
 #include <cstdio>

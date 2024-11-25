@@ -28,7 +28,7 @@
 #include <sycl/detail/kernel_desc.hpp>
 #include <sycl/sampler.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
-#define PRINT_TRACE 1
+// #define PRINT_TRACE 1
 // #define PRINT_KERNEL 1
 // #define MODIFY 1
 

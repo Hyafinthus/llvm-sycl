@@ -14,7 +14,7 @@
 #include <sycl/context.hpp>
 #include <sycl/device_selector.hpp>
 #include <sycl/detail/iostream_proxy.hpp> 
-#define PRINT_TRACE 1
+// #define PRINT_TRACE 1
 // #define MODIFY 1
 
 #include "detail/config.hpp"
