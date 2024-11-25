@@ -13,7 +13,7 @@
 #include <detail/stream_impl.hpp>
 #include <sycl/device_selector.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
-#include <mpi.h>
+// #include <mpi.h>
 #define PRINT_TRACE 1
 
 #include <chrono>
@@ -162,7 +162,6 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
   }
 
   if (ShouldEnqueue) {
-
     enqueueCommandForCG(NewEvent, AuxiliaryCmds);
 
     for (auto StreamImplPtr : Streams) {
@@ -253,6 +252,7 @@ void Scheduler::enqueueCommandForCG(EventImplPtr NewEvent,
   // 但DAG应该仍需要考虑 后续Kernel分解还是涉及DAG
   // 需要能够获取KernelCG的 DAG-AllocaCmd 或 Args-Ptr
 
+  #ifdef PRINT_TRACE
   std::cout << "\n\n\n\n\nscheduler::addCG==================================" << std::endl;
   Command * KCmd = static_cast<Command *>(NewEvent->getCommand());
   std::cout << "Cmd: " << KCmd << std::endl;
@@ -269,6 +269,7 @@ void Scheduler::enqueueCommandForCG(EventImplPtr NewEvent,
   for (const Command * User : KCmd->MUsers) {
     std::cout << "User: " << User << std::endl;
   }
+  #endif
 
   // 在等待计算完毕通信
   // int mpi_size = GlobalHandler::instance().mpi_size;

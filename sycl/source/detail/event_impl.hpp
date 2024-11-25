@@ -21,6 +21,8 @@
 #include <condition_variable>
 #include <optional>
 
+// #define MODIFY 1
+
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 class context;
@@ -251,6 +253,8 @@ public:
 
   bool isContextInitialized() const noexcept { return MIsContextInitialized; }
   
+  #ifdef MODIFY
+  // scheduler.cpp调用 暂时弃用
   pi_event_status piCheckStatus() {
     pi_event_status Status = PI_EVENT_QUEUED;
     getPlugin().call<PiApiKind::piEventGetInfo>(MEvent, PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
@@ -260,6 +264,7 @@ public:
   std::shared_ptr<queue_impl> getQueueImpl() const {
     return MQueue.lock();
   }
+  #endif
 
 protected:
   // When instrumentation is enabled emits trace event for event wait begin and

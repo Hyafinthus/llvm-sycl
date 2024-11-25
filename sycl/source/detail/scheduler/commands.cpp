@@ -29,6 +29,7 @@
 #include <sycl/sampler.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 #define PRINT_TRACE 1
+// #define PRINT_KERNEL 1
 // #define MODIFY 1
 
 #include <cassert>
@@ -728,7 +729,9 @@ Command *Command::addDep(DepDesc NewDep, std::vector<Command *> &ToCleanUp) {
   Command *ConnectionCmd = nullptr;
 
   if (NewDep.MDepCommand) {
+    #ifdef PRINT_TRACE
     std::cout << "---Command---MDepCmd: " << NewDep.MDepCommand << std::endl;
+    #endif
     ConnectionCmd =
         processDepEvent(NewDep.MDepCommand->getEvent(), NewDep, ToCleanUp);
   }
@@ -764,9 +767,13 @@ Command *Command::addDep(DepDesc NewDep, std::vector<Command *> &ToCleanUp) {
 
   if (!ConnectionCmd) {
     MDeps.push_back(NewDep);
+    #ifdef PRINT_TRACE
     std::cout << "---Command---addDep---size:" << MDeps.size() << std::endl;
+    #endif
     if (NewDep.MDepCommand) {
+      #ifdef PRINT_TRACE
       std::cout << "---Command---addDep---addUser" << std::endl;
+      #endif
       NewDep.MDepCommand->addUser(this);
     }
   }
@@ -2167,11 +2174,13 @@ static pi_result SetKernelParamsAndLaunch(
              "We should have caught this earlier.");
 
       RT::PiMem MemArg = (RT::PiMem)getMemAllocationFunc(Req);
+      #ifdef PRINT_KERNEL
       std::cout << "===kind_accessor" << std::endl;
       std::cout << "Kernel: " << Kernel << std::endl;
       std::cout << "NextTrueIndex: " << NextTrueIndex << std::endl;
       std::cout << "Size: " << sizeof(RT::PiMem) << std::endl;
       std::cout << "MemArg: " << MemArg << std::endl;
+      #endif
       if (Plugin.getBackend() == backend::opencl) {
         Plugin.call<PiApiKind::piKernelSetArg>(Kernel, NextTrueIndex,
                                                sizeof(RT::PiMem), &MemArg);
@@ -2182,11 +2191,13 @@ static pi_result SetKernelParamsAndLaunch(
       break;
     }
     case kernel_param_kind_t::kind_std_layout: {
+      #ifdef PRINT_KERNEL
       std::cout << "===kind_std_layout" << std::endl;
       std::cout << "Kernel: " << Kernel << std::endl;
       std::cout << "NextTrueIndex: " << NextTrueIndex << std::endl;
       std::cout << "MSize: " << Arg.MSize << std::endl;
       std::cout << "MPtr: " << Arg.MPtr << std::endl;
+      #endif
       Plugin.call<PiApiKind::piKernelSetArg>(Kernel, NextTrueIndex, Arg.MSize,
                                              Arg.MPtr);
       break;
@@ -2252,8 +2263,10 @@ static pi_result SetKernelParamsAndLaunch(
     if (EnforcedLocalSize)
       LocalSize = RequiredWGSize;
   }
-  
+  #ifdef PRINT_TRACE
   std::cout << "SetKernelParamsAndLaunch" << std::endl;
+  #endif
+  #ifdef PRINT_KERNEL
   std::cout << "Queue->getHandleRef(): " << Queue->getHandleRef() << std::endl;
   std::cout << "Kernel: " << Kernel << std::endl;
   std::cout << "NDRDesc.Dims: " << NDRDesc.Dims << std::endl;
@@ -2268,6 +2281,7 @@ static pi_result SetKernelParamsAndLaunch(
   std::cout << "RawEvents.empty() ? nullptr : &RawEvents[0]: "
             << (RawEvents.empty() ? nullptr : &RawEvents[0]) << std::endl;
   std::cout << "OutEvent: " << OutEvent << std::endl;
+  #endif
 
   pi_result Error = Plugin.call_nocheck<PiApiKind::piEnqueueKernelLaunch>(
       Queue->getHandleRef(), Kernel, NDRDesc.Dims, &NDRDesc.GlobalOffset[0],
@@ -2424,7 +2438,9 @@ pi_int32 enqueueImpKernel(
   }
   {
     assert(KernelMutex);
+    #ifdef PRINT_TRACE
     std::cout << "===commands.cpp -> SetKernelParamsAndLaunch" << std::endl;
+    #endif
     std::lock_guard<std::mutex> Lock(*KernelMutex);
 
     // Set SLM/Cache configuration for the kernel if non-default value is
@@ -2437,7 +2453,9 @@ pi_int32 enqueueImpKernel(
           sizeof(RT::PiKernelCacheConfig), &KernelCacheConfig);
     }
     
+    #ifdef PRINT_TRACE
     std::cout << "===commands.cpp -> SetKernelParamsAndLaunch(no lock)" << std::endl;
+    #endif
     Error = SetKernelParamsAndLaunch(Queue, Args, DeviceImageImpl, Kernel,
                                      NDRDesc, EventsWaitList, OutEvent,
                                      EliminatedArgMask, getMemAllocationFunc);
@@ -2465,7 +2483,9 @@ pi_int32 ExecCGCommand::enqueueImp() {
                         MCommandGroup->MRequirements.size() == 0)
                            ? nullptr
                            : &MEvent->getHandleRef();
+  #ifdef PRINT_TRACE
   std::cout << "======CGTYPE" << static_cast<unsigned int>(MCommandGroup->getType()) << std::endl;
+  #endif
   switch (MCommandGroup->getType()) {
 
   case CG::CGTYPE::UpdateHost: {
@@ -2677,7 +2697,9 @@ pi_int32 ExecCGCommand::enqueueImp() {
         Event = &MEvent->getHandleRef();
       }
     }
+    #ifdef PRINT_TRACE
     std::cout << "commands.cpp -> enqueueImpKernel" << std::endl;
+    #endif
     pi_int32 ret = enqueueImpKernel(
         MQueue, NDRDesc, Args, ExecKernel->getKernelBundle(), SyclKernel,
         KernelName, OSModuleHandle, RawEvents, Event, getMemAllocationFunc,

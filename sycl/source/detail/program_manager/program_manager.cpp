@@ -55,7 +55,8 @@ namespace detail {
 
 using ContextImplPtr = std::shared_ptr<sycl::detail::context_impl>;
 
-static constexpr int DbgProgMgr = 1;
+// Debug开关
+static constexpr int DbgProgMgr = 0;
 
 static constexpr char UseSpvEnv[]("SYCL_USE_KERNEL_SPV");
 
@@ -991,6 +992,8 @@ ProgramManager::ProgramManager() {
     m_DeviceImages[SpvFileKSId]->push_back(std::move(ImgPtr));
   }
 
+#ifdef SCHEDULE
+  // 获取所有acc以外设备
   globalDevices = device::get_devices();
   globalDevices.erase(
     std::remove_if(
@@ -1001,7 +1004,7 @@ ProgramManager::ProgramManager() {
     globalDevices.end()
   );
 
-#ifdef SCHEDULE
+  // 向scheduler注册
   struct mq_attr mq_attr;
   mq_attr.mq_maxmsg = MAX_MSG_NUM;
   mq_attr.mq_msgsize = sizeof(DeviceData);

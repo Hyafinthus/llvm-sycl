@@ -245,7 +245,9 @@ void event_impl::wait(std::shared_ptr<sycl::detail::event_impl> Self) {
     #endif
 
     waitInternal();
+    #ifdef PRINT_TRACE
     std::cout << "===event_impl.cpp=== after waitinternal" << std::endl;
+    #endif
 
     #ifdef MODIFY
     getPlugin().call<PiApiKind::piEventGetInfo>(MEvent, PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
@@ -260,7 +262,9 @@ void event_impl::wait(std::shared_ptr<sycl::detail::event_impl> Self) {
     detail::Scheduler::getInstance().waitForEvent(Self);
   }
 
+  #ifdef PRINT_TRACE
   std::cout << "===event_impl.cpp=== after cleanup" << std::endl;
+  #endif
 
 #ifdef XPTI_ENABLE_INSTRUMENTATION
   instrumentationEpilog(TelemetryEvent, Name, StreamID, IId);

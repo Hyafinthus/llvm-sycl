@@ -47,7 +47,7 @@ class AllocaCommandBase;
 class ReleaseCommand;
 class ExecCGCommand;
 class EmptyCommand;
-class CommunicateCommand;
+// class CommunicateCommand;
 
 enum BlockingT { NON_BLOCKING = 0, BLOCKING };
 
@@ -377,15 +377,13 @@ public:
 };
 
 /// 用于在kernel执行完毕后插入
-class CommunicateCommand : public Command {
-public:
-  CommunicateCommand(QueueImplPtr Queue);
-
-  void printDot(std::ostream &Stream) const final;
-
-private:
-  pi_int32 enqueueImp() final;
-};
+// class CommunicateCommand : public Command {
+// public:
+//   CommunicateCommand(QueueImplPtr Queue);
+//   void printDot(std::ostream &Stream) const final;
+// private:
+//   pi_int32 enqueueImp() final;
+// };
 
 /// The empty command does nothing during enqueue. The task can be used to
 /// implement lock in the graph, or to merge several nodes into one.

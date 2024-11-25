@@ -21,6 +21,7 @@
 #include <sycl/exception.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 #define PRINT_TRACE 1
+// #define PRINT_DAG 1
 
 #include <algorithm>
 #include <cstdlib>
@@ -166,11 +167,15 @@ static void printDotRecursive(std::fstream &Stream,
   // 先输出依赖于此Cmd的Cmd 即先输出的是后执行的
   for (Command *User : Cmd->MUsers) {
     if (User) {
+      #if PRINT_TRACE
       std::cout << "--- Alloca Command: " << Cmd << " User Command: " << User << std::endl;
+      #endif
       printDotRecursive(Stream, Visited, User);
     }
   }
+  #if PRINT_TRACE
   std::cout << "--- before --- printDot: " << Cmd << " (" << typeid(Cmd).name() << ")" << std::endl;
+  #endif
   Cmd->printDot(Stream);
 }
 
@@ -192,7 +197,9 @@ void Scheduler::GraphBuilder::printGraphAsDot(const char *ModeName) {
   for (SYCLMemObjI *MemObject : MMemObjs)
     // 只涉及了AllocaCmd 并没有传入ExecCmd 而是作为AllocaCmd->UserCmd使用
     for (Command *AllocaCmd : MemObject->MRecord->MAllocaCommands) {
+      #if PRINT_TRACE
       std::cout << "--- before --- printDotRecursive: " << AllocaCmd << std::endl;
+      #endif
       printDotRecursive(Stream, MVisitedCmds, AllocaCmd);
     }
 
@@ -497,7 +504,9 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
   if (Record && MPrintOptionsArray[BeforeAddCopyBack])
     printGraphAsDot("before_addCopyBack");
 
+  #ifdef PRINT_TRACE
   std::cout << "\n\n\n\n\n";
+  #endif
 
   // Do nothing if there were no or only read operations with the memory object.
   if (nullptr == Record || !Record->MMemModified)
@@ -521,9 +530,13 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
   for (Command *Dep : Deps) {
     Command *ConnCmd = MemCpyCmd->addDep(
         DepDesc{Dep, MemCpyCmd->getRequirement(), SrcAllocaCmd}, ToCleanUp);
+    #ifdef PRINT_TRACE
     std::cout << "======graph_build.cpp======MemCpyCmd: " << MemCpyCmd << " Dep: " << Dep << std::endl;
+    #endif
     if (ConnCmd) {
+      #ifdef PRINT_TRACE
       std::cout << " ConnCmd: " << ConnCmd << std::endl;
+      #endif
       ToEnqueue.push_back(ConnCmd);
     }
   }
@@ -533,7 +546,9 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
   for (Command *Cmd : ToCleanUp)
     cleanupCommand(Cmd);
 
+  #ifdef PRINT_TRACE
   std::cout << "\n\n\n\n\n";
+  #endif
 
   if (MPrintOptionsArray[AfterAddCopyBack])
     printGraphAsDot("after_addCopyBack");
@@ -555,7 +570,9 @@ Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
   if (MPrintOptionsArray[BeforeAddHostAcc])
     printGraphAsDot("before_addHostAccessor");
 
+  #ifdef PRINT_TRACE
   std::cout << "\n\n\n\n\n";
+  #endif
 
   markModifiedIfWrite(Record, Req);
 
@@ -579,7 +596,9 @@ Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
 
   Req->MBlockedCmd = EmptyCmd;
 
+  #ifdef PRINT_TRACE
   std::cout << "\n\n\n\n\n";
+  #endif
 
   if (MPrintOptionsArray[AfterAddHostAcc])
     printGraphAsDot("after_addHostAccessor");
@@ -1098,22 +1117,28 @@ void Scheduler::GraphBuilder::createGraphForCommand(
           sameCtx(QueueForAlloca->getContextImplPtr(), Record->MCurContext);
     }
 
+    #ifdef PRINT_DAG
     std::cout << "--- before --- after_addCG0" << std::endl;
     if (MPrintOptionsArray[AfterAddCG])
       printGraphAsDot("after_addCG0");
+    #endif
 
     // 如果queue中上下文和内存对象不在同一个上下文 需要创建Mem移动的Command
     // If there is alloca command we need to check if the latest memory is in
     // required context.
     if (isSameCtx) {
+      #ifdef PRINT_DAG
       std::cout << "===graph_builder.cpp===isSameCtx" << std::endl;
+      #endif
       // If the memory is already in the required host context, check if the
       // required access mode is valid, remap if not.
       if (Record->MCurContext->is_host() &&
           !isAccessModeAllowed(Req->MAccessMode, Record->MHostAccess))
         remapMemoryObject(Record, Req, AllocaCmd, ToEnqueue);
     } else {
+      #ifdef PRINT_DAG
       std::cout << "===graph_builder.cpp===notSameCtx" << std::endl;
+      #endif
       // Cannot directly copy memory from OpenCL device to OpenCL device -
       // create two copies: device->host and host->device.
       bool NeedMemMoveToHost = false;
@@ -1136,16 +1161,20 @@ void Scheduler::GraphBuilder::createGraphForCommand(
       insertMemoryMove(Record, Req, MemMoveTargetQueue, ToEnqueue);
     }
 
+    #ifdef PRINT_DAG
     std::cout << "--- before --- after_addCG1" << std::endl;
     if (MPrintOptionsArray[AfterAddCG])
       printGraphAsDot("after_addCG1");
+    #endif
 
     // 下面是更新图的边 节点就是一个个Cmd 以Deps和Users作为遍历的边
     // 一个Cmd Users是依赖于此Cmd的 Deps是此Cmd依赖的 见commands.hpp
     std::set<Command *> Deps =
         findDepsForReq(Record, Req, Queue->getContextImplPtr());
 
+    #ifdef PRINT_DAG
     std::cout << "Deps Size: " << Deps.size() << std::endl;
+    #endif
 
     // 为图增加边 即A->B CmdA.Dep=CmdB CmdB.User=CmdA
     // Dep在这里都是以AllocaCmd为基准
@@ -1158,13 +1187,17 @@ void Scheduler::GraphBuilder::createGraphForCommand(
       }
     }
 
+    #ifdef PRINT_DAG
     std::cout << "--- before --- after_addCG2" << std::endl;
     if (MPrintOptionsArray[AfterAddCG])
       printGraphAsDot("after_addCG2");
+    #endif
   }
 
+  #ifdef PRINT_DAG
   std::cout << "\n\n\n\n\n";
   std::cout << "ExecCmd: " << &NewCmd << std::endl;
+  #endif
   // " AllCmd1: " << &(NewCmd->MDeps.at(0).MDepCommand)
   // << " AllCmd2: " << &(NewCmd->MDeps.at(1).MDepCommand) << std::endl;
   
@@ -1176,17 +1209,23 @@ void Scheduler::GraphBuilder::createGraphForCommand(
   // FIXME employ a reference here to eliminate copying of a vector
   std::vector<DepDesc> Deps = NewCmd->MDeps;
 
+  #ifdef PRINT_DAG
   std::cout << "Deps: " << &Deps << " count: " << Deps.size() << std::endl;
+  #endif
 
   // 更新Leaves
   for (DepDesc &Dep : Deps) {
     const Requirement *Req = Dep.MDepRequirement;
     MemObjRecord *Record = getMemObjRecord(Req->MSYCLMemObj);
+    #ifdef PRINT_DAG
     std::cout << "DepCmd: " << Dep.MDepCommand << " Req: " << Req << " Record: " << Record << std::endl;
+    #endif
     updateLeaves({Dep.MDepCommand}, Record, Req->MAccessMode, ToCleanUp);
     addNodeToLeaves(Record, NewCmd, Req->MAccessMode, ToEnqueue);
   }
+  #ifdef PRINT_DAG
   std::cout << "\n\n\n\n\n";
+  #endif
 
   // 不是用户显式制定的依赖 是这个CG的所有前置Event
   // Register all the events as dependencies

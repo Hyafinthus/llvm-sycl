@@ -15,6 +15,8 @@
 #include <sycl/device_selector.hpp>
 #include <sycl/info/info_desc.hpp>
 
+// #define REBIND 1
+
 #include <algorithm>
 
 namespace sycl {
@@ -30,9 +32,12 @@ void force_type(info::device_type &t, const info::device_type &ft) {
 }
 } // namespace detail
 
-// device::device() : device(default_selector_v) {}
 
+#ifdef REBIND
 device::device() : impl(std::make_shared<detail::device_impl>()) {}
+#else
+device::device() : device(default_selector_v) {}
+#endif
 
 device::device(cl_device_id DeviceId) {
   // The implementation constructor takes ownership of the native handle so we

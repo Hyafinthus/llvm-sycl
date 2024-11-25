@@ -212,7 +212,9 @@ public:
       MQueues.push_back(createQueue(QOrder));
       // This section is the second part of the instrumentation that uses the
       // tracepoint information and notifies
+      #ifdef PRINT_TRACE
       std::cout << "This queue_impl: " << this << " MQueues Created: " << &MQueues << " size: " << MQueues.size() << std::endl;
+      #endif
     }
   }
 
@@ -318,6 +320,18 @@ public:
   }
 #else
   ~queue_impl() {
+    // The trace event created in the constructor should be active through the
+    // lifetime of the queue object as member variables when ABI breakage is
+    // allowed. This example shows MTraceEvent as a member variable.
+#if XPTI_ENABLE_INSTRUMENTATION
+    if (xptiTraceEnabled()) {
+      // Used cached information in member variables
+      xptiNotifySubscribers(
+          MStreamID, (uint16_t)xpti::trace_point_type_t::queue_destroy, nullptr,
+          (xpti::trace_event_data_t *)MTraceEvent, MInstanceID,
+          static_cast<const void *>("queue_destroy"));
+    }
+#endif
     throw_asynchronous();
     if (!MHostQueue) {
       getPlugin().call<PiApiKind::piQueueRelease>(MQueues[0]);
@@ -520,7 +534,9 @@ public:
       Plugin.checkPiResult(Error);
     }
 
+    #ifdef PRINT_TRACE
     std::cout << "PiQueue: " << &Queue << std::endl;
+    #endif
     return Queue;
   }
 
@@ -746,9 +762,13 @@ protected:
     } else
       finalizeHandler(Handler, Type, Event);
 
+    #ifdef PRINT_TRACE
     std::cout << "===queue_impl.cpp===finalized handler" << std::endl;
+    #endif
     addEvent(Event);
+    #ifdef PRINT_TRACE
     std::cout << "===queue_impl.cpp===added event" << std::endl;
+    #endif
     return Event;
   }
 

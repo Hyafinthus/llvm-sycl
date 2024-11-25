@@ -14,6 +14,7 @@
 #include <memory>
 #include <unordered_map>
 
+// #define MODIFY 1
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 namespace detail {
@@ -85,12 +86,14 @@ public:
   // For testing purposes only
   void attachScheduler(Scheduler *Scheduler);
 
+  #ifdef MODIFY
   // int mpi_size;
   // int mpi_rank;
   // 记录创建ExecCmd时的计数 Cmd的kernel_index使用此计数
   // int kernel_cmd_count = 0;
   // 记录ExecCmd执行时的计数 graph_processor执行Cmd时使用此计数
   // int kernel_exec_count = 0;
+  #endif
 
 private:
 #ifdef XPTI_ENABLE_INSTRUMENTATION

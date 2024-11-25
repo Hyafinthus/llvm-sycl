@@ -19,6 +19,8 @@
 #include <map>
 #include <string>
 
+#define PRINT_PI 1
+
 #ifdef XPTI_ENABLE_INSTRUMENTATION
 // Include the headers necessary for emitting traces using the trace framework
 #include "xpti/xpti_trace_framework.h"
@@ -202,6 +204,7 @@ public:
     } else {
       R = PiCallInfo.getFuncPtr(*MPlugin)(Args...);
       
+      #if PRINT_PI
       int key = static_cast<int>(PiApiOffset);
       std::string value;
       auto it = PiApiKindString.find(key);
@@ -211,6 +214,7 @@ public:
       std::cout << "Call PiApi: " << key << " " << value << "\n";
       // (std::cout << ... << typeid(ArgsT).name()) << " ";
       // (std::cout << ... << Args) << '\n';
+      #endif
     }
 #ifdef XPTI_ENABLE_INSTRUMENTATION
     // Close the function begin with a call to function end

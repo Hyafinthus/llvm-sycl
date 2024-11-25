@@ -322,7 +322,9 @@ event handler::finalize() {
                 nullptr);
             Result = PI_SUCCESS;
           } else {
+            #ifdef PRINT_TRACE
             std::cout << "handler.cpp -> enqueueImpKernel" << std::endl;
+            #endif
             Result = enqueueImpKernel(MQueue, MNDRDesc, MArgs,
                                       KernelBundleImpPtr, MKernel, MKernelName,
                                       MOSModuleHandle, RawEvents, OutEvent,
