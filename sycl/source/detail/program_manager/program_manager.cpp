@@ -1025,7 +1025,7 @@ ProgramManager::ProgramManager() {
 
   mq_id_kernel = mq_open(MESSAGE_QUEUE_KERNEL_NAME, O_WRONLY);
   if (mq_id_kernel == -1) {
-    perror( "Error: mq_kernel open failed" << std::endl);
+    perror( "Error: mq_kernel open failed");
     exit(1);
   }
 #endif

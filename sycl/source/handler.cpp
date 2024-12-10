@@ -240,13 +240,15 @@ event handler::finalize() {
               // }
               std::cout << "=== handler === test_mem ==== sender get user ptr" << std::endl;
 
-              SharedMemoryHandle handle = initSharedMemory();
+              SharedMemoryHandle handle = initSharedMemory(kernel_data.pid, detail::ProgramManager::getInstance().kernel_count);
               writeToSharedMemory(handle, DataPtr);
 
               std::cout << "=== handler === REBIND === send host data" << std::endl;
 
               waitForReadCompletion(handle);
               cleanupSharedMemory(handle);
+
+              std::cout << "=== handler === REBIND === waitForReadCompletion" << std::endl;
             }
           }
 
@@ -257,6 +259,8 @@ event handler::finalize() {
           // }
           // std::cout << "=== handler === REBIND === mq send" << std::endl;
         }
+
+        std::cout << "=== handler === kernel_count: " << detail::ProgramManager::getInstance().kernel_count << " MLastEvent: " << &MLastEvent << std::endl;
         return MLastEvent;
       }
       // 如果执行 需要等待可能的通信数据 也需要host 被用的时候再从host->device
@@ -287,7 +291,7 @@ event handler::finalize() {
               std::cout << "=== handler === test_mem ==== receiver get user ptr" << std::endl;
 
               std::vector<DATA_TYPE> host_data(VECTOR_SIZE);
-              SharedMemoryHandle handle = initSharedMemory();
+              SharedMemoryHandle handle = initSharedMemory(kernel_data.pid, detail::ProgramManager::getInstance().kernel_count);
               readFromSharedMemory(handle, host_data.data());
               std::cout << "=== handler === test_mem ==== Data read successfully." << std::endl;
               cleanupSharedMemory(handle);

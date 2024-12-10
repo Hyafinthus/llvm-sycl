@@ -120,9 +120,11 @@ struct DataInfo { // daemon向SYCL进程发送的数据信息
 
 using DATA_TYPE = float;
 
-#define SHARED_MEMORY_NAME "/shared_memory_data"
-#define SEM_WRITE_NAME "/sem_write"
-#define SEM_READ_NAME "/sem_read"
+#define SHARED_MEMORY_NAME_MAX 50
+// pid_kernelcount 才能确保唯一
+#define SHARED_MEMORY_NAME_PATTERN "/sycl_shm_kernel_%d_%d"
+#define SHARED_MEMORY_WRITE_NAME_PATTERN "/sycl_shm_write_%d_%d"
+#define SHARED_MEMORY_READ_NAME_PATTERN "/sycl_shm_read_%d_%d"
 
 #define VECTOR_SIZE (256*256)
 #define MEMORY_SIZE (VECTOR_SIZE * sizeof(DATA_TYPE))
@@ -132,39 +134,42 @@ struct SharedMemoryHandle {
   void *shared_memory;
   sem_t *sem_write;
   sem_t *sem_read;
+  char shared_memory_name[SHARED_MEMORY_NAME_MAX];
+  char sem_write_name[SHARED_MEMORY_NAME_MAX];
+  char sem_read_name[SHARED_MEMORY_NAME_MAX];
 };
 
-inline SharedMemoryHandle initSharedMemory() {
+inline SharedMemoryHandle initSharedMemory(int pid, int kernel_count) {
   SharedMemoryHandle handle;
 
+  sprintf(handle.shared_memory_name, SHARED_MEMORY_NAME_PATTERN, pid, kernel_count);
+  sprintf(handle.sem_write_name, SHARED_MEMORY_WRITE_NAME_PATTERN, pid, kernel_count);
+  sprintf(handle.sem_read_name, SHARED_MEMORY_READ_NAME_PATTERN, pid, kernel_count);
+
   // 创建共享内存对象
-  handle.shm_fd = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
+  handle.shm_fd = shm_open(handle.shared_memory_name, O_CREAT | O_RDWR, 0666);
   if (handle.shm_fd == -1) {
     perror("shm_open");
     exit(EXIT_FAILURE);
   }
-
   // 调整共享内存大小
   if (ftruncate(handle.shm_fd, MEMORY_SIZE) == -1) {
     perror("ftruncate");
     exit(EXIT_FAILURE);
   }
-
   // 映射共享内存
   handle.shared_memory = mmap(nullptr, MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, handle.shm_fd, 0);
   if (handle.shared_memory == MAP_FAILED) {
     perror("mmap");
     exit(EXIT_FAILURE);
   }
-
   // 打开信号量
-  handle.sem_write = sem_open(SEM_WRITE_NAME, O_CREAT, 0666, 0);
+  handle.sem_write = sem_open(handle.sem_write_name, O_CREAT, 0666, 0);
   if (handle.sem_write == SEM_FAILED) {
     perror("sem_open sem_write");
     exit(EXIT_FAILURE);
   }
-
-  handle.sem_read = sem_open(SEM_READ_NAME, O_CREAT, 0666, 0);
+  handle.sem_read = sem_open(handle.sem_read_name, O_CREAT, 0666, 0);
   if (handle.sem_read == SEM_FAILED) {
     perror("sem_open sem_read");
     exit(EXIT_FAILURE);
@@ -176,7 +181,6 @@ inline SharedMemoryHandle initSharedMemory() {
 inline void writeToSharedMemory(SharedMemoryHandle &handle, DATA_TYPE *DataPtr) {
   // 写入数据到共享内存
   memcpy(handle.shared_memory, DataPtr, MEMORY_SIZE);
-
   // 通知读取端数据已准备好
   sem_post(handle.sem_write);
 }
@@ -189,23 +193,20 @@ inline void waitForReadCompletion(SharedMemoryHandle &handle) {
 inline void readFromSharedMemory(SharedMemoryHandle &handle, DATA_TYPE *DataPtr) {
   // 等待数据准备完成
   sem_wait(handle.sem_write);
-
   // 读取数据
   memcpy(DataPtr, handle.shared_memory, MEMORY_SIZE);
-
   // 通知写入端读取完成
   sem_post(handle.sem_read);
 }
 
 inline void cleanupSharedMemory(SharedMemoryHandle &handle) {
-  // 关闭和释放资源
   munmap(handle.shared_memory, MEMORY_SIZE);
   close(handle.shm_fd);
   sem_close(handle.sem_write);
   sem_close(handle.sem_read);
-  shm_unlink(SHARED_MEMORY_NAME);
-  sem_unlink(SEM_WRITE_NAME);
-  sem_unlink(SEM_READ_NAME);
+  shm_unlink(handle.shared_memory_name);
+  sem_unlink(handle.sem_write_name);
+  sem_unlink(handle.sem_read_name);
 }
 
 #endif

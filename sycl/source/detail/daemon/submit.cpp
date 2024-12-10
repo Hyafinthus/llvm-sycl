@@ -18,7 +18,7 @@ int main(int argc, char *argv[]) {
     }
 
     struct mq_attr mq_attr;
-    mq_attr.mq_flags = 0; // 堵塞
+    mq_attr.mq_flags = 0; // 堵塞模式
     mq_attr.mq_maxmsg = MAX_MSG_NUM;
     mq_attr.mq_msgsize = MAX_MSG_SIZE;
 

@@ -160,9 +160,6 @@ void SystemScheduler() {
       // TODO 3 [rank0] 确定执行执行rank
       // ========【固定测试】
       // A:rank0 B:rank1 C:rank0
-
-      // TODO 4 [rank0][MPI] bcast (这个kernel 由哪个rank执行 依赖于哪些数据 这些数据在哪些rank上)
-      //        [rank!0][MPI] bcast 接收并记录
       KernelExecInfo info;
       if (kernel_count == 1) {
         // A
@@ -183,34 +180,35 @@ void SystemScheduler() {
         info.data_rank["F"] = 1;
       }
 
+      // [4] [rank0][MPI] bcast (这个kernel 由哪个rank执行 依赖于哪些数据 这些数据在哪些rank上)
+      //        [rank!0][MPI] bcast 接收并记录
       BcastKernelExecInfo(mpi_rank, info);
       std::cout << "Rank " << mpi_rank << ": info.kernel_id: " << info.kernel_id << " info.exec_rank: " << info.exec_rank << std::endl;
 
-      // TODO 5 [单rank] 被依赖的kernel的数据device->host
+      // [5] [单rank] 被依赖的kernel的数据device->host
+      // TODO DataInfo的构造 是从KernelInfo中提取的
       std::vector<std::string> data_for_rank = info.get_data_for_rank(mpi_rank);
-      // 向SYCL进程发送要host的data
+      // 向负责的进程mq发送 需要device->host的data
+      // ========【固定测试】
       DataInfo data_info;
       if (mpi_rank == info.exec_rank) {
         data_info.exec = true;
       }
       data_info.kernel_count = info.kernel_count;
       data_info.data_count = 1;
+      // ========
+
       std::cout << "Rank " << mpi_rank << ": Send data info: " << data_info.exec << std::endl;
       mq_send(mq_id_device, (char *)&data_info, sizeof(DataInfo), 0);
       // 以上每个rank都要给daemon发 因为需要告诉daemon是否执行
 
       // 如果执行 要检查是否要从其他rank获取数据
       // 如果不执行 要检查是否需要host->device 给其他rank发数据
-
       // 说明有需要从其他rank获取的数据
       if (info.data_rank.size() != info.get_data_for_rank(info.exec_rank).size()) {
         std::cout << "Rank " << mpi_rank << ": Exec Rank: " << info.exec_rank << " need data from other" << std::endl;
-        // TODO 6 从SYCL进程接受host的data
-        // 我不执行 且有依赖我的
+        // 此rank不执行kernel 且kernel有依赖此rank的数据
         if (mpi_rank != info.exec_rank && data_for_rank.size() > 0) {
-          std::cout << "Rank " << mpi_rank << ": Receive notification" << std::endl;
-          // 从SYCL进程接受通知 才可以读取
-
           // DISCARD 检查消息队列内消息数量
           // struct mq_attr attr;
           // if (mq_getattr(mq_id_kernel, &attr) == -1) {
@@ -219,6 +217,7 @@ void SystemScheduler() {
           // }
           // std::cout << "Current messages in queue: " << attr.mq_curmsgs << std::endl;
           // std::cout << "Max message size: " << attr.mq_msgsize << std::endl;
+          // 从SYCL进程接受通知 才可以读取
           // ssize_t bytes_read = mq_receive(mq_id_kernel, notify, sizeof(KernelData), NULL);
           // if (bytes_read == -1) {
           //     perror("mq_receive failed");
@@ -237,40 +236,41 @@ void SystemScheduler() {
           //     exit(1);
           // }
         
+          // [6] 从SYCL进程接受host的data
+          // 因为是写读共享内存是阻塞的 不需要等待SYCL进程的通知
+          // TODO 区分多个SYCL进程的共享内存
           std::vector<DATA_TYPE> host_data(VECTOR_SIZE);
-
-          SharedMemoryHandle handle = initSharedMemory();
+          SharedMemoryHandle handle = initSharedMemory(kernel_data.pid, info.kernel_count);
           readFromSharedMemory(handle, host_data.data());
           std::cout << "Rank " << mpi_rank << ": Data read successfully." << std::endl;
           cleanupSharedMemory(handle);
 
+          // [7] [双rank][MPI] isend:host->buffer
           MPI_Send(host_data.data(), VECTOR_SIZE, MPI_FLOAT, info.exec_rank, 0, comm_daemon);
           std::cout << "Rank " << mpi_rank << ": Sent data to rank " << info.exec_rank << std::endl;
         }
 
-        // TODO 7 [双rank][MPI] isend:host->buffer irecv:buffer->host
-
-        // TODO 8 把从其他rank接受的data发给SYCL进程
-        // 外面要套一层循环 对应每个rank TEST 用rank1代替
+        // 此rank执行kernel 且必然需要从其他rank拿数据
         if (mpi_rank == info.exec_rank) {
+          // TODO 外面要套一层循环 对应每个rank TEST 用rank1代替
           std::vector<DATA_TYPE> host_data(VECTOR_SIZE);
+          // [7] [双rank][MPI] irecv:buffer->host
           MPI_Recv(host_data.data(), VECTOR_SIZE, MPI_FLOAT, 1, 0, comm_daemon, MPI_STATUS_IGNORE);
           std::cout << "Rank " << mpi_rank << ": Received data from rank 1" << std::endl;
 
-          SharedMemoryHandle handle = initSharedMemory();
+          // [8] 把从其他rank接受的data发给SYCL进程
+          SharedMemoryHandle handle = initSharedMemory(kernel_data.pid, info.kernel_count);
           writeToSharedMemory(handle, host_data.data());
           std::cout << "Rank " << mpi_rank << ": Write to shared" << std::endl;
           waitForReadCompletion(handle);
           cleanupSharedMemory(handle);
 
+          std::cout << "Rank " << mpi_rank << ": waitForReadCompletion" << std::endl;
           // DISCARD 给SYCL进程发数据 通知可以取回
           // char notify = 'R';
           // mq_send(mq_id_device, &notify, sizeof(notify), 0);
         }
-      }
-      
-      // TODO 9 [node内] 确定是否执行 如果执行具体执行device
-      
+      }  
     }
 
     mq_close(mq_id_device);
@@ -307,13 +307,12 @@ void SystemScheduler() {
 #endif
 
 void SystemSchedulerSubmit() {
-  // while(1)用户向rank0提交bin_dir
-  // 与管理单节点内的SystemScheduler是两个不同的pthread
-
   int rank;
   MPI_Comm_rank(comm_submit, &rank);
   std::cout << "SystemSchedulerSubmit: Rank " << rank << " started." << std::endl;
 
+  // while(1)用户向rank0提交bin_dir
+  // 与管理单节点内的SystemScheduler是两个不同的pthread
   while (1) {
     char binary_path[MAX_MSG_SUBMIT_SIZE];
 
