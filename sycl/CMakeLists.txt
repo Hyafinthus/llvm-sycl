@@ -321,6 +321,7 @@ add_custom_target( sycl-toolchain
           sycl-compiler
           sycl-ls
           sycl-daemon
+          sycl-submit
           ${XPTIFW_LIBS}
   COMMENT "Building SYCL compiler toolchain..."
 )

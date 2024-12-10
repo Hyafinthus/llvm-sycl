@@ -26,6 +26,8 @@
 #include <mutex>
 #include <regex>
 
+// #include <cuda_runtime.h>
+
 // Forward declarations
 void enableCUDATracing();
 void disableCUDATracing();
@@ -2542,6 +2544,27 @@ pi_result cuda_piQueueRetain(pi_queue command_queue) {
   return PI_SUCCESS;
 }
 
+void printDeviceBusID() {
+    int deviceId = -1;
+    int busId = -1;
+
+    // 获取当前上下文的设备 ID
+    CUresult err = cuCtxGetDevice(&deviceId);
+    if (err != CUDA_SUCCESS) {
+        throw std::runtime_error("Failed to get current device from context.");
+    }
+
+    // 获取设备的 PCI 总线 ID
+    err = cuDeviceGetAttribute(&busId, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, deviceId);
+    if (err != CUDA_SUCCESS) {
+        throw std::runtime_error("Failed to get PCI Bus ID for the device.");
+    }
+
+    // 输出设备 ID 和 PCI 总线 ID
+    if (busId != 29)
+      std::cout << "Device ID: " << deviceId << ", PCI Bus ID: " << busId << std::endl;
+}
+
 pi_result cuda_piQueueRelease(pi_queue command_queue) {
   assert(command_queue != nullptr);
 
@@ -2556,6 +2579,8 @@ pi_result cuda_piQueueRelease(pi_queue command_queue) {
       return PI_SUCCESS;
 
     ScopedContext active(command_queue->get_context());
+
+    printDeviceBusID();
 
     command_queue->for_each_stream([](CUstream s) {
       PI_CHECK_ERROR(cuStreamSynchronize(s));
@@ -2578,6 +2603,8 @@ pi_result cuda_piQueueFinish(pi_queue command_queue) {
     assert(command_queue !=
            nullptr); // need PI_ERROR_INVALID_EXTERNAL_HANDLE error code
     ScopedContext active(command_queue->get_context());
+
+    printDeviceBusID();
 
     command_queue->sync_streams</*ResetUsed=*/true>([&result](CUstream s) {
       result = PI_CHECK_ERROR(cuStreamSynchronize(s));

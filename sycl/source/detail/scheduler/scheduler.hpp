@@ -740,7 +740,7 @@ protected:
       AfterFusionCancel,
       Size
     };
-    std::array<bool, PrintOptions::Size> MPrintOptionsArray{true,true,true,true,true,true};//{false};
+    std::array<bool, PrintOptions::Size> MPrintOptionsArray{true,true,true,true,true,true};
   };
 
   /// Graph Processor provides interfaces for enqueueing commands and their

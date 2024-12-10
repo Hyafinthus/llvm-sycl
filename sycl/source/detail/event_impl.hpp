@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <optional>
 
+#define REBIND 1
 // #define MODIFY 1
 
 namespace sycl {
@@ -260,7 +261,9 @@ public:
     getPlugin().call<PiApiKind::piEventGetInfo>(MEvent, PI_EVENT_INFO_COMMAND_EXECUTION_STATUS, sizeof(pi_int32), &Status, nullptr);
     return Status;
   }
+  #endif
 
+  #ifdef REBIND
   std::shared_ptr<queue_impl> getQueueImpl() const {
     return MQueue.lock();
   }

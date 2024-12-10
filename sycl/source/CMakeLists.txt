@@ -285,9 +285,14 @@ add_executable(sycl-daemon
   "detail/daemon/daemon.cpp"
 )
 
-target_link_libraries(sycl-daemon rt pthread)
+add_executable(sycl-submit
+  "detail/daemon/submit.cpp"
+)
 
-install(TARGETS ${SYCL_RT_LIBS} sycl-daemon
+target_include_directories(sycl-daemon PRIVATE ${MPI_CXX_INCLUDE_PATH})
+target_link_libraries(sycl-daemon rt pthread ${MPI_CXX_LIBRARIES})
+
+install(TARGETS ${SYCL_RT_LIBS} sycl-daemon sycl-submit
   ARCHIVE DESTINATION "lib${LLVM_LIBDIR_SUFFIX}" COMPONENT sycl
   LIBRARY DESTINATION "lib${LLVM_LIBDIR_SUFFIX}" COMPONENT sycl
   RUNTIME DESTINATION "bin" COMPONENT sycl)

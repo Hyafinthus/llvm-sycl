@@ -167,13 +167,13 @@ static void printDotRecursive(std::fstream &Stream,
   // 先输出依赖于此Cmd的Cmd 即先输出的是后执行的
   for (Command *User : Cmd->MUsers) {
     if (User) {
-      #if PRINT_TRACE
+      #if PRINT_DAG
       std::cout << "--- Alloca Command: " << Cmd << " User Command: " << User << std::endl;
       #endif
       printDotRecursive(Stream, Visited, User);
     }
   }
-  #if PRINT_TRACE
+  #if PRINT_DAG
   std::cout << "--- before --- printDot: " << Cmd << " (" << typeid(Cmd).name() << ")" << std::endl;
   #endif
   Cmd->printDot(Stream);
@@ -197,7 +197,7 @@ void Scheduler::GraphBuilder::printGraphAsDot(const char *ModeName) {
   for (SYCLMemObjI *MemObject : MMemObjs)
     // 只涉及了AllocaCmd 并没有传入ExecCmd 而是作为AllocaCmd->UserCmd使用
     for (Command *AllocaCmd : MemObject->MRecord->MAllocaCommands) {
-      #if PRINT_TRACE
+      #if PRINT_DAG
       std::cout << "--- before --- printDotRecursive: " << AllocaCmd << std::endl;
       #endif
       printDotRecursive(Stream, MVisitedCmds, AllocaCmd);

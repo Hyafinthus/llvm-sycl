@@ -10,6 +10,7 @@
 #include <detail/device_binary_image.hpp>
 #include <detail/device_global_map_entry.hpp>
 #include <detail/spec_constant_impl.hpp>
+// #include <detail/accessor_impl.hpp>
 #include <sycl/detail/common.hpp>
 #include <sycl/detail/device_global_map.hpp>
 #include <sycl/detail/export.hpp>
@@ -27,6 +28,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#define REBIND 1
+#define SCHEDULE 1
 
 // +++ Entry points referenced by the offload wrapper object {
 
@@ -282,8 +286,14 @@ public:
   std::set<RTDeviceBinaryImage *>
   getRawDeviceImages(const std::vector<kernel_id> &KernelIDs);
 
+#ifdef REBIND
   std::vector<device> globalDevices;
+
+  // std::vector<detail::Requirement *> releaseReqs;
+#endif
+// #ifdef SCHEDULE
   int kernel_count = 0;
+// #endif
 
 private:
   ProgramManager(ProgramManager const &) = delete;

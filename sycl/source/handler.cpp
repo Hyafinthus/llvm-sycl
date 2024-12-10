@@ -14,6 +14,8 @@
 #include <detail/kernel_bundle_impl.hpp>
 #include <detail/kernel_impl.hpp>
 #include <detail/queue_impl.hpp>
+#include <detail/sycl_mem_obj_i.hpp>
+#include <detail/sycl_mem_obj_t.hpp>
 #include <detail/scheduler/commands.hpp>
 #include <detail/scheduler/scheduler.hpp>
 #include <detail/usm/usm_impl.hpp>
@@ -35,8 +37,8 @@
 #include <unistd.h>
 
 // #define PRINT_TRACE 1
-// #define REBIND 1
-// #define SCHEDULE 1
+#define REBIND 1
+#define SCHEDULE 1
 
 extern mqd_t mq_id_kernel, mq_id_device;
 
@@ -144,48 +146,163 @@ event handler::finalize() {
   // 如果是kernel 以graph_builder的形式获取依赖
   const auto &cmdType = getType();
   if (cmdType == detail::CG::Kernel) {
-    std::unique_ptr<detail::CG> cmdGroup;
-    // 需要cmdGroup和MQueue
-    // graph_builder里用Mrequirements和MEvents构建依赖图
-    detail::combineAccessModesOfReqs(MRequirements);
-    std::vector<Command *> ToEnqueue; // scheduler中的AuxiliaryCmds
-    std::cout << "=== handler === REBIND === BEFORE REQS"<< std::endl;
-
-    // 在gloabal_handler初始化时获取所有device，并循环判断如果使用每个device的queue会造成几次数据移动
-    for (device tempD : detail::ProgramManager::getInstance().globalDevices) {
-      detail::DeviceImplPtr tempDP = detail::getSyclObjImpl(tempD);
-      MQueue.reset(new detail::queue_impl(tempDP, detail::queue_impl::getDefaultOrNew(tempDP), MQueue->MAsyncHandler, MQueue->MPropList));
-      int notSameCtxCount = 0;
-
-      std::cout << "=== handler === REBIND === TRY: " << tempD.get_info<info::device::name>() << std::endl;
-      for (Requirement *Req : MRequirements) {
-        // Req->MAccessMode
-        MemObjRecord *record = nullptr;
-        AllocaCommandBase *allocaCmd = nullptr;
-        bool isSameCtx = false;
-
-        std::cout << "=== handler === req 1"<< std::endl;
-        record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
-        // detail::Scheduler::getInstance().MGraphBuilder.markModifiedIfWrite(record, Req);
-        // allocaCmd = detail::Scheduler::getInstance().MGraphBuilder.getOrCreateAllocaForReq(record, Req, MQueue, ToEnqueue);
-        std::cout << "=== handler === req 2"<< std::endl;
-        isSameCtx = detail::sameCtx(MQueue->getContextImplPtr(), record->MCurContext);
-        if (!isSameCtx) {
-          notSameCtxCount++;
-        }
+#ifdef TEST
+    // ====【Kernel数量】
+    {
+      detail::ProgramManager::getInstance().kernel_count++;
+      // TEST 忽略一个kernel
+      if (detail::ProgramManager::getInstance().kernel_count == 2) {
+        return MLastEvent;
       }
-      std::cout << "=== handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
     }
 
-    // TODO 将每个req对应的内存对象的大小和数目发给scheduler
-    KernelData kernel_data;
-    kernel_data.pid = getpid();
-    mq_send(mq_id_kernel, (char *)&kernel_data, sizeof(KernelData), 0);
-    std::cout << "=== handler === REBIND === send kernel data: " << kernel_data.pid << std::endl;
+    // ====【数据移动SameCtx判断】
+    {
+      std::unique_ptr<detail::CG> cmdGroup; // ?
+      // 需要cmdGroup和MQueue
+      // graph_builder里用Mrequirements和MEvents构建依赖图
+      detail::combineAccessModesOfReqs(MRequirements);
+      std::vector<Command *> ToEnqueue; // scheduler中的AuxiliaryCmds
+      std::cout << "=== handler === REBIND === BEFORE REQS" << std::endl;
 
-    DeviceData device_data;
-    mq_receive(mq_id_device, (char *)&device_data, sizeof(DeviceData), NULL);
-    std::cout << "=== handler === REBIND === received device data: " << device_data.dev << std::endl;
+      // 在gloabal_handler初始化时获取所有device，并循环判断如果使用每个device的queue会造成几次数据移动
+      for (device tempD : detail::ProgramManager::getInstance().globalDevices) {
+        detail::DeviceImplPtr tempDP = detail::getSyclObjImpl(tempD);
+        MQueue.reset(new detail::queue_impl(tempDP, detail::queue_impl::getDefaultOrNew(tempDP), MQueue->MAsyncHandler, MQueue->MPropList));
+        int notSameCtxCount = 0;
+
+        std::cout << "=== handler === REBIND === TRY: " << tempD.get_info<info::device::name>() << std::endl;
+        for (Requirement *Req : MRequirements) {
+          // Req->MAccessMode
+          MemObjRecord *record = nullptr;
+          AllocaCommandBase *allocaCmd = nullptr;
+          bool isSameCtx = false;
+
+          // std::cout << "=== handler === req 1"<< std::endl;
+          // 获取的就是内存需求 对应数组
+          record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
+          std::cout << "=== handler === test_mem ==== record: " << record << std::endl;
+
+          // 不清楚具体逻辑 不需要
+          // detail::Scheduler::getInstance().MGraphBuilder.markModifiedIfWrite(record, Req);
+          
+          // 如果找不到对应的allocaCmd就创建了 不对需要销毁 如何销毁？
+          // allocaCmd = detail::Scheduler::getInstance().MGraphBuilder.getOrCreateAllocaForReq(record, Req, MQueue, ToEnqueue);
+          // std::cout << "=== handler === test_mem ==== allocaCmd: " << allocaCmd << std::endl;
+          
+          // std::cout << "=== handler === req 2"<< std::endl;
+          isSameCtx = detail::sameCtx(MQueue->getContextImplPtr(), record->MCurContext);
+          if (!isSameCtx) {
+            notSameCtxCount++;
+          }
+        }
+        std::cout << "=== handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
+      }
+    }
+#endif
+    // ====【与Scheduler通信】
+    {
+      // TODO 将每个req对应的内存对象的大小和数目发给scheduler
+      KernelData kernel_data;
+      kernel_data.pid = getpid();
+      mq_send(mq_id_kernel, (char *)&kernel_data, sizeof(KernelData), 0);
+      std::cout << "=== handler === REBIND === send kernel data: " << kernel_data.pid << std::endl;
+
+      DataInfo data_info;
+      mq_receive(mq_id_device, (char *)&data_info, sizeof(DataInfo), NULL);
+      std::cout << "=== handler === REBIND === received data info: kernel: " << data_info.kernel_count << " exec: " << data_info.exec << std::endl;
+
+      // 已经确定了kernel执行的rank
+      detail::combineAccessModesOfReqs(MRequirements);
+      detail::ProgramManager::getInstance().kernel_count++;
+      // 如果不执行 检查是否需要host->device 完成后再返回
+      if (!data_info.exec) {
+        if (detail::ProgramManager::getInstance().kernel_count == 3) {
+          int testReqCount = 0;
+          for (Requirement *Req : MRequirements) {
+            testReqCount++;
+            if (Req->MAccessMode == access::mode::read && testReqCount == 2) {
+              Requirement *hostReq = new Requirement(*Req);
+              EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+              hostEvent->wait(hostEvent);
+              delete hostReq;
+              std::cout << "=== handler === test_mem ==== sender add host acc" << std::endl;
+
+              using DATA_TYPE = float;
+              SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+              SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+              void *UserPtr = BufferObj->getUserPtr();
+              DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+              // size_t size = 256;
+              // for(size_t i = 0; i < size; i++) {
+              //   std::cerr << DataPtr[i * size] << " ";
+              //   std::cerr << std::endl;
+              // }
+              std::cout << "=== handler === test_mem ==== sender get user ptr" << std::endl;
+
+              SharedMemoryHandle handle = initSharedMemory();
+              writeToSharedMemory(handle, DataPtr);
+
+              std::cout << "=== handler === REBIND === send host data" << std::endl;
+
+              waitForReadCompletion(handle);
+              cleanupSharedMemory(handle);
+            }
+          }
+
+          // char notify = 'W';
+          // if (mq_send(mq_id_kernel, &notify, sizeof(notify), 0) == -1) {
+          //     perror("mq_send failed");
+          //     exit(EXIT_FAILURE);
+          // }
+          // std::cout << "=== handler === REBIND === mq send" << std::endl;
+        }
+        return MLastEvent;
+      }
+      // 如果执行 需要等待可能的通信数据 也需要host 被用的时候再从host->device
+      else {
+        if (detail::ProgramManager::getInstance().kernel_count == 3) {
+          // char *notify = new char[sizeof(KernelData)];
+          // mq_receive(mq_id_device, notify, sizeof(KernelData), NULL);
+          // if (notify[0] != 'R') {
+          //   std::cerr << "Error: Daemon notification failed" << std::endl;
+          //   exit(EXIT_FAILURE);
+          // }
+
+          int testReqCount = 0;
+          for (Requirement *Req : MRequirements) {
+            testReqCount++;
+            if (Req->MAccessMode == access::mode::read && testReqCount == 2) {
+              Requirement *hostReq = new Requirement(*Req);
+              EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+              hostEvent->wait(hostEvent);
+              delete hostReq;
+              std::cout << "=== handler === test_mem ==== receiver add host acc" << std::endl;
+
+              using DATA_TYPE = float;
+              SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+              SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+              void *UserPtr = BufferObj->getUserPtr();
+              DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+              std::cout << "=== handler === test_mem ==== receiver get user ptr" << std::endl;
+
+              std::vector<DATA_TYPE> host_data(VECTOR_SIZE);
+              SharedMemoryHandle handle = initSharedMemory();
+              readFromSharedMemory(handle, host_data.data());
+              std::cout << "=== handler === test_mem ==== Data read successfully." << std::endl;
+              cleanupSharedMemory(handle);
+              std::memcpy(DataPtr, host_data.data(), MEMORY_SIZE);
+
+              std::cout << "=== handler === REBIND === mem copy" << std::endl;
+            }
+          }
+        }
+      }
+
+      // DeviceData device_data;
+      // mq_receive(mq_id_device, (char *)&device_data, sizeof(DeviceData), NULL);
+      // std::cout << "=== handler === REBIND === received device data: " << device_data.dev << std::endl;
+    }
   }
 #endif
 
@@ -193,10 +310,9 @@ event handler::finalize() {
   for (device d : detail::ProgramManager::getInstance().globalDevices) {
     std::cout << "=== handler === global device cpu: " << d.is_cpu() << " gpu: " << d.is_gpu() << " acc: " << d.is_accelerator() << std::endl;
   }
-  detail::ProgramManager::getInstance().kernel_count++;
 
   // 应被替换为运行时调度设备选择
-  // device d = detail::select_device(gpu_selector_v, true);
+  device d = detail::select_device(gpu_selector_v, true);
 
   // device d;
   // if (detail::ProgramManager::getInstance().kernel_count == 1) {
@@ -207,23 +323,97 @@ event handler::finalize() {
   //   d = detail::ProgramManager::getInstance().globalDevices.at(2);
   // }
 
-  device dd = detail::ProgramManager::getInstance().globalDevices.at(0);
-  std::vector<size_t> cts = {8, 4};
-  std::vector<device> subDevices = dd.create_sub_devices<info::partition_property::partition_by_counts>(cts);
+  // device dd = detail::ProgramManager::getInstance().globalDevices.at(0);
+  // std::vector<size_t> cts = {8, 4};
+  // std::vector<device> subDevices = dd.create_sub_devices<info::partition_property::partition_by_counts>(cts);
 
-  device d;
-  if (detail::ProgramManager::getInstance().kernel_count == 1) {
-    d = subDevices.at(0);
-  } else if (detail::ProgramManager::getInstance().kernel_count == 2) {
-    d = subDevices.at(1);
-  } else {
-    d = dd;
-  }
+  // device d;
+  // if (detail::ProgramManager::getInstance().kernel_count == 1) {
+  //   d = subDevices.at(0);
+  // } else if (detail::ProgramManager::getInstance().kernel_count == 2) {
+  //   d = subDevices.at(1);
+  // } else {
+  //   d = dd;
+  // }
 
   detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
   std::cout << "=== handler === rebind device " << d.is_gpu() << std::endl;
   // MQueue->rebindDevice(dp);
   MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->MAsyncHandler, MQueue->MPropList));
+
+#ifdef TEST
+  // ========【DONE】【测试device->host】
+  using namespace sycl::detail;
+  const auto &cmdType = getType();
+  if (cmdType == detail::CG::Kernel) {
+    detail::combineAccessModesOfReqs(MRequirements);
+    std::vector<Command *> ToEnqueue; // scheduler中的AuxiliaryCmds
+    detail::ProgramManager::getInstance().kernel_count++;
+    int notSameCtxCount = 0;
+    int testReqCount = 0;
+    for (Requirement *Req : MRequirements) {
+      testReqCount++;
+      // Req->MAccessMode
+      MemObjRecord *record = nullptr;
+      AllocaCommandBase *allocaCmd = nullptr;
+      bool isSameCtx = false;
+
+      // std::cout << "=== handler === req 1"<< std::endl;
+      // 获取的就是内存需求 对应数组
+      record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
+      std::cout << "=== handler === test_mem ==== record: " << record << std::endl;
+      std::cout << "=== handler === test_mem ==== memobj: " << Req->MSYCLMemObj << std::endl;
+
+      if (detail::ProgramManager::getInstance().kernel_count == 3) {
+        // std::cout << "=== handler === test_mem ==== kernel count 3" << std::endl;
+        if (Req->MAccessMode == access::mode::read && testReqCount == 1) {
+          // 尝试将device仅复制到host
+    
+          // addCopyBack 不太行 会导致后面再copyback的时候崩溃
+          // Command *NewCmd = detail::Scheduler::getInstance().MGraphBuilder.addCopyBack(Req, ToEnqueue);
+          // std::cout << "=== handler === test_mem ==== read copy back: " << record << std::endl;
+
+          // // addHostAccessor 会销毁device上的拷贝？
+          // EventImplPtr Event = detail::Scheduler::getInstance().addHostAccessor(Req);
+          // Event->wait(Event);
+          // // 需要在生命周期结束销毁 不知道哪里不用？
+          // detail::ProgramManager::getInstance().releaseReqs.push_back(Req);
+
+          Requirement *hostReq = new Requirement(*Req);
+          EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+          hostEvent->wait(hostEvent);
+          delete hostReq;
+          // 会导致notSameCtx 不知道是否是删除了device上的数据？下次就要再加载进device？未测试
+
+          std::cout << "=== handler === test_mem ==== add host acc" << std::endl;
+
+          // 尝试直接获取用户的数据指针
+          using DATA_TYPE = float;
+          SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+          SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+          void *UserPtr = BufferObj->getUserPtr();
+          DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+          size_t size = 256;
+          for(size_t i = 0; i < size; i++) {
+            for(size_t j = 0; j < size; j++) {
+                std::cerr << DataPtr[i * size + j] << " ";
+            }
+            std::cerr << std::endl;
+          }
+          std::cout << "=== handler === test_mem ==== get user ptr" << std::endl;
+        }
+      }
+      
+      // std::cout << "=== handler === req 2"<< std::endl;
+      isSameCtx = detail::sameCtx(MQueue->getContextImplPtr(), record->MCurContext);
+      if (!isSameCtx) {
+        notSameCtxCount++;
+      }
+    }
+    std::cout << "=== handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
+  }
+  // ========
+#endif
 #endif
 // =======================================================
   
