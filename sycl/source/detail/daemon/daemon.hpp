@@ -1,31 +1,251 @@
-#ifndef MESSAGE_QUEUE
-#define MESSAGE_QUEUE
+#pragma once
 
 #include <vector>
 #include <map>
 #include <sstream>
 #include <string>
 
-#pragma once
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <semaphore.h>
+#include <cstring>
+
+// #include <sycl/access/access.hpp>
+namespace sycl {
+    namespace access {
+        enum class mode;
+    }
+}
+
+#ifndef MESSAGE_QUEUE
+#define MESSAGE_QUEUE
 
 #define MONITOR_INTERVAL 500 // us
 
 #define MAX_MSG_NUM 10
 
 #define MAX_MSG_SUBMIT_SIZE 256
-#define MESSAGE_QUEUE_SUBMIT_NAME "/sycl_user_submit"
+#define MESSAGE_QUEUE_SUBMIT_NAME "/sycl_mq_submit"
 
-#define MESSAGE_QUEUE_KERNEL_NAME "/sycl_mq_kernel"
+#define MAX_MSG_DAEMON_SIZE 1024
+#define MESSAGE_QUEUE_DAEMON_NAME "/sycl_mq_daemon"
 
-#define MESSAGE_QUEUE_DEVICE_NAME_MAX 50
-#define MESSAGE_QUEUE_DEVICE_PATTERN "/sycl_mq_device_%d"
+#define MAX_MSG_PROGRAM_SIZE 512
+#define MESSAGE_QUEUE_PROGRAM_NAME_MAX 50
+#define MESSAGE_QUEUE_PROGRAM_PATTERN "/sycl_mq_program_%d"
 
-struct KernelData {
-  pid_t pid;
+// D2D: Daemon to Daemon
+// D2S: Daemon to SYCL
+// S2D: SYCL to Daemon
+
+// NOTE: All counts start from 1
+// NOTE: SYCL Device starts from 0
+
+// =================================
+
+struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)的信息
+  void *req_pointer;
+  int kernel_count;
+  int req_count;
+  sycl::access::mode req_accmode;
+
+  bool operator<(const SyclReqData &other) const {
+    return req_count < other.req_count;
+  }
+
+  // 不同daemon间定位同一个数组
+  // 如果指针相同 或kernel_count和req_count相同
+  bool operator==(const SyclReqData &other) const {
+    return (req_pointer == other.req_pointer) ||
+           (kernel_count == other.kernel_count && req_count == other.req_count);
+  }
+
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << reinterpret_cast<uintptr_t>(req_pointer) << "\n"
+        << kernel_count << "\n"
+        << req_count << "\n"
+        << static_cast<int>(req_accmode) << "\n";
+    return oss.str();
+  }
+
+  static SyclReqData deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    SyclReqData req;
+    uintptr_t ptr;
+    iss >> ptr;
+    req.req_pointer = reinterpret_cast<void *>(ptr);
+    iss >> req.kernel_count;
+    iss >> req.req_count;
+    int accmode;
+    iss >> accmode;
+    req.req_accmode = static_cast<sycl::access::mode>(accmode);
+    return req;
+  }
 };
 
-struct DeviceData {
-  int dev;
+struct S2DKernelReqData { // daemon需要的一个kernel的信息
+  pid_t pid;
+
+  int kernel_count;
+  int req_size;
+  std::vector<SyclReqData> reqs;
+
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << pid << "\n"
+        << kernel_count << "\n"
+        << req_size << "\n";
+
+    oss << reqs.size() << "\n";
+    for (const auto &req : reqs) {
+      oss << req.serialize();
+    }
+
+    return oss.str();
+  }
+
+  static S2DKernelReqData deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    S2DKernelReqData kernel_data;
+
+    iss >> kernel_data.pid;
+    iss >> kernel_data.kernel_count;
+    iss >> kernel_data.req_size;
+
+    size_t req_count;
+    iss >> req_count;
+    iss.ignore();
+
+    for (size_t i = 0; i < req_count; ++i) {
+      std::string req_data_serialized;
+      for (int j = 0; j < 4; ++j) {
+        std::string line;
+        std::getline(iss, line);
+        req_data_serialized += line + "\n";
+      }
+      kernel_data.reqs.push_back(SyclReqData::deserialize(req_data_serialized));
+    }
+
+    return kernel_data;
+  }
+};
+
+struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个rank执行的信息
+  // std::string kernel_id; // 没有kernel这个对象 CommandGroup还未创建
+  int kernel_count; // 是一个SYCL进程中kernel的唯一标识 体现在用户代码的顺序中
+
+  int exec_rank; // 要执行的daemon的rank
+  std::map<SyclReqData, int> req_rank; // 需要的数据 在哪个rank上
+
+  std::vector<SyclReqData> get_req_for_rank(int rank) {
+    std::vector<SyclReqData> reqs;
+    for (const auto &pair : req_rank) {
+      if (pair.second == rank) {
+        reqs.push_back(pair.first);
+      }
+    }
+    return reqs;
+  }
+  
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << kernel_count << "\n"
+        << exec_rank << "\n";
+
+    oss << req_rank.size() << "\n";
+    for (const auto &pair : req_rank) {
+      oss << pair.first.serialize();
+      oss << pair.second << "\n";
+    }
+
+    return oss.str();
+  }
+
+  static D2DKernelSchedInfo deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    D2DKernelSchedInfo sched_info;
+
+    iss >> sched_info.kernel_count;
+    iss >> sched_info.exec_rank;
+
+    size_t map_size;
+    iss >> map_size;
+    iss.ignore();
+
+    for (size_t i = 0; i < map_size; ++i) {
+      std::string req_data_serialized;
+      for (int j = 0; j < 4; ++j) {
+        std::string line;
+        std::getline(iss, line);
+        req_data_serialized += line + "\n";
+      }
+      SyclReqData req = SyclReqData::deserialize(req_data_serialized);
+
+      int rank;
+      iss >> rank;
+      iss.ignore();
+
+      sched_info.req_rank[req] = rank;
+    }
+
+    return sched_info;
+  }
+};
+
+struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执行等依赖数据信息
+  int kernel_count; // 唯一标识
+  bool exec = false; // 是否执行
+  int device_index; // 执行设备
+
+  std::vector<int> req_counts; // handler只有当前kernel的req 不需处理哪个req给哪个rank 只需发送给daemon
+
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << kernel_count << "\n"
+        << exec << "\n"
+        << device_index << "\n";
+
+    // 序列化 req_counts 的大小
+    oss << req_counts.size() << "\n";
+    for (const auto &count : req_counts) {
+      oss << count << "\n";
+    }
+
+    return oss.str();
+  }
+
+  static D2SKernelExecInfo deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    D2SKernelExecInfo kernel_info;
+
+    iss >> kernel_info.kernel_count;
+    iss >> kernel_info.exec;
+    iss >> kernel_info.device_index;
+
+    size_t req_count;
+    iss >> req_count;
+    iss.ignore();
+
+    kernel_info.req_counts.resize(req_count);
+    for (size_t i = 0; i < req_count; ++i) {
+      iss >> kernel_info.req_counts[i];
+      iss.ignore();
+    }
+
+    return kernel_info;
+  }
+};
+
+// =================================
+
+struct ProgramInfo {
+  pid_t pid;
+  std::vector<pid_t> pids; // 这个SYCLAPP在所有rank上的pid
+  std::map<pid_t, int> pid_to_rank;
+
+  // TODO 执行此SYCLAPP的rank
 };
 
 struct DAGNode {
@@ -45,78 +265,12 @@ struct DAGNode {
   bool executed = false;  
 };
 
-struct KernelExecInfo { // 广播的一个kernel由哪个rank执行的信息
-  std::string kernel_id;
-  int kernel_count;
-
-  int exec_rank; // 要执行的daemon的rank
-  std::map<std::string, int> data_rank; // 需要的数据 在哪个rank上
-
-  std::vector<std::string> get_data_for_rank(int rank) {
-    std::vector<std::string> data;
-    for (const auto &pair : data_rank) {
-      if (pair.second == rank) {
-        data.push_back(pair.first);
-      }
-    }
-    return data;
-  }
-
-  std::string serialize() const {
-    std::ostringstream oss;
-    oss << kernel_id << "\n"
-        << kernel_count << "\n"
-        << exec_rank << "\n";
-
-    oss << data_rank.size() << "\n";
-    for (const auto &pair : data_rank) {
-      oss << pair.first << "\n" << pair.second << "\n";
-    }
-
-    return oss.str();
-  }
-
-  static KernelExecInfo deserialize(const std::string &data) {
-    std::istringstream iss(data);
-    KernelExecInfo info;
-
-    std::getline(iss, info.kernel_id);
-    iss >> info.kernel_count;
-    iss >> info.exec_rank;
-
-    int map_size;
-    iss >> map_size;
-    iss.ignore();
-    for (int i = 0; i < map_size; ++i) {
-      std::string key;
-      int value;
-      std::getline(iss, key);
-      iss >> value;
-      iss.ignore();
-      info.data_rank[key] = value;
-    }
-
-    return info;
-  }
-};
-
-struct DataInfo { // daemon向SYCL进程发送的数据信息
-  int kernel_count;
-  bool exec = false; // 是否执行
-  int data_count; // 测试 无实际用处
-};
-
 #endif
 
-// TODO 共享内存扩展到多个并发SYCL进程
+// =================================
+
 #ifndef SHARED_MEMORY
 #define SHARED_MEMORY
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <semaphore.h>
-#include <cstring>
 
 using DATA_TYPE = float;
 

@@ -49,7 +49,7 @@
 #include <mqueue.h>
 #include <unistd.h>
 
-mqd_t mq_id_kernel, mq_id_device;
+mqd_t mq_id_daemon, mq_id_program;
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
@@ -1008,24 +1008,27 @@ ProgramManager::ProgramManager() {
 #endif
 
 #ifdef SCHEDULE
-  std::cout << "ProgramManager SCHEDULE register" << std::endl;
+  std::cout << "Process " << getpid() << ": ProgramManager SCHEDULE register" << std::endl;
   // 向scheduler注册
   struct mq_attr mq_attr;
+  mq_attr.mq_flags = 0;
   mq_attr.mq_maxmsg = MAX_MSG_NUM;
-  mq_attr.mq_msgsize = sizeof(DataInfo);
+  mq_attr.mq_msgsize = MAX_MSG_PROGRAM_SIZE;
 
-  char MESSAGE_QUEUE_DEVICE_NAME[MESSAGE_QUEUE_DEVICE_NAME_MAX];
-  sprintf(MESSAGE_QUEUE_DEVICE_NAME, MESSAGE_QUEUE_DEVICE_PATTERN, getpid());
+  char MESSAGE_QUEUE_PROGRAM_NAME[MESSAGE_QUEUE_PROGRAM_NAME_MAX];
+  sprintf(MESSAGE_QUEUE_PROGRAM_NAME, MESSAGE_QUEUE_PROGRAM_PATTERN, getpid());
 
-  mq_id_device = mq_open(MESSAGE_QUEUE_DEVICE_NAME, O_CREAT | O_RDONLY, 0666, &mq_attr);
-  if (mq_id_device == -1) {
-    perror("Error: mq_device open failed");
+  mq_id_program = mq_open(MESSAGE_QUEUE_PROGRAM_NAME, O_CREAT | O_RDONLY, 0666, &mq_attr);
+  if (mq_id_program == -1) {
+    std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " mq_id_program open failed";
+    perror(errorMsg.c_str());
     exit(1);
   }
 
-  mq_id_kernel = mq_open(MESSAGE_QUEUE_KERNEL_NAME, O_WRONLY);
-  if (mq_id_kernel == -1) {
-    perror( "Error: mq_kernel open failed");
+  mq_id_daemon = mq_open(MESSAGE_QUEUE_DAEMON_NAME, O_WRONLY);
+  if (mq_id_daemon == -1) {
+    std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " mq_id_daemon open failed";
+    perror(errorMsg.c_str());
     exit(1);
   }
 #endif
@@ -1033,14 +1036,14 @@ ProgramManager::ProgramManager() {
 
 #ifdef SCHEDULE
 ProgramManager::~ProgramManager() {
-  mq_close(mq_id_device);
-  mq_close(mq_id_kernel);
+  mq_close(mq_id_program);
+  mq_close(mq_id_daemon);
 
-  char MESSAGE_QUEUE_DEVICE_NAME[MESSAGE_QUEUE_DEVICE_NAME_MAX];
-  sprintf(MESSAGE_QUEUE_DEVICE_NAME, MESSAGE_QUEUE_DEVICE_PATTERN, getpid());
-  mq_unlink(MESSAGE_QUEUE_DEVICE_NAME);
+  char MESSAGE_QUEUE_PROGRAM_NAME[MESSAGE_QUEUE_PROGRAM_NAME_MAX];
+  sprintf(MESSAGE_QUEUE_PROGRAM_NAME, MESSAGE_QUEUE_PROGRAM_PATTERN, getpid());
+  mq_unlink(MESSAGE_QUEUE_PROGRAM_NAME);
 
-  std::cout << "Message queue closed" << std::endl;
+  std::cout << "Process " << getpid() <<": Message queue closed" << std::endl;
 }
 // #elif defined(REBIND)
 // ProgramManager::~ProgramManager() {
