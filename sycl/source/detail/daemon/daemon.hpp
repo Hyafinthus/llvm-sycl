@@ -39,7 +39,7 @@ namespace sycl {
 // D2S: Daemon to SYCL
 // S2D: SYCL to Daemon
 
-// NOTE: All counts start from 1
+// NOTE: All counts start from 1: kernel_count, req_count
 // NOTE: SYCL Device starts from 0
 
 // =================================
@@ -148,6 +148,16 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
     }
     return reqs;
   }
+
+  std::vector<SyclReqData> get_req_for_exec_rank(int rank) {
+    std::vector<SyclReqData> reqs;
+    for (const auto &pair : req_rank) {
+      if (pair.second != rank) {
+        reqs.push_back(pair.first);
+      }
+    }
+    return reqs;
+  }
   
   std::string serialize() const {
     std::ostringstream oss;
@@ -199,7 +209,10 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
   bool exec = false; // 是否执行
   int device_index; // 执行设备
 
-  std::vector<int> req_counts; // handler只有当前kernel的req 不需处理哪个req给哪个rank 只需发送给daemon
+  // handler只有当前kernel的req 不需处理哪个req给哪个rank 只需发送给daemon
+  // exec==false: 记录当前rank需要shmem给daemon的req
+  // exec==true: 记录需要从其他所有rank获取的req
+  std::vector<int> req_counts;
 
   std::string serialize() const {
     std::ostringstream oss;
@@ -272,14 +285,14 @@ struct DAGNode {
 #ifndef SHARED_MEMORY
 #define SHARED_MEMORY
 
-using DATA_TYPE = float;
-
 #define SHARED_MEMORY_NAME_MAX 50
-// pid_kernelcount 才能确保唯一
-#define SHARED_MEMORY_NAME_PATTERN "/sycl_shm_kernel_%d_%d"
-#define SHARED_MEMORY_WRITE_NAME_PATTERN "/sycl_shm_write_%d_%d"
-#define SHARED_MEMORY_READ_NAME_PATTERN "/sycl_shm_read_%d_%d"
+// pid_kernelcnt_reqcnt 才能确保唯一
+#define SHARED_MEMORY_NAME_PATTERN "/sycl_shm_kernel_%d_%d_%d"
+#define SHARED_MEMORY_WRITE_NAME_PATTERN "/sycl_shm_write_%d_%d_%d"
+#define SHARED_MEMORY_READ_NAME_PATTERN "/sycl_shm_read_%d_%d_%d"
 
+// ====【固定测试】
+using DATA_TYPE = float;
 #define VECTOR_SIZE (256*256)
 #define MEMORY_SIZE (VECTOR_SIZE * sizeof(DATA_TYPE))
 
@@ -293,12 +306,12 @@ struct SharedMemoryHandle {
   char sem_read_name[SHARED_MEMORY_NAME_MAX];
 };
 
-inline SharedMemoryHandle initSharedMemory(int pid, int kernel_count) {
+inline SharedMemoryHandle initSharedMemory(int pid, int kernel_count, int req_count) {
   SharedMemoryHandle handle;
 
-  sprintf(handle.shared_memory_name, SHARED_MEMORY_NAME_PATTERN, pid, kernel_count);
-  sprintf(handle.sem_write_name, SHARED_MEMORY_WRITE_NAME_PATTERN, pid, kernel_count);
-  sprintf(handle.sem_read_name, SHARED_MEMORY_READ_NAME_PATTERN, pid, kernel_count);
+  sprintf(handle.shared_memory_name, SHARED_MEMORY_NAME_PATTERN, pid, kernel_count, req_count);
+  sprintf(handle.sem_write_name, SHARED_MEMORY_WRITE_NAME_PATTERN, pid, kernel_count, req_count);
+  sprintf(handle.sem_read_name, SHARED_MEMORY_READ_NAME_PATTERN, pid, kernel_count, req_count);
 
   // 创建共享内存对象
   handle.shm_fd = shm_open(handle.shared_memory_name, O_CREAT | O_RDWR, 0666);
