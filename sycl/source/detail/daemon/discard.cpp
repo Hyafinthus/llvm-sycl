@@ -25,8 +25,26 @@
 
 // daemon.cpp ========================================================
 
+// #include <mutex>
+// std::mutex mpi_mutex;
+// mpi_mutex.lock();
+// mpi_mutex.unlock();
+
 // pthread_t thread_id = pthread_self();
 // std::cout << "Rank " << mpi_rank << ": Thread created with ID: " << thread_id << std::endl;
+
+// DISCARD 用scatter代替bcast 实现选择ranks执行SYCLAPP 但选择的ranks无感知
+// char ranks_path[mpi_size][MAX_MSG_SUBMIT_SIZE] = {{0}};
+// char recv_path[MAX_MSG_SUBMIT_SIZE] = {0};
+// std::vector<int> exec_ranks = {0, 1};
+// for (int &exec_rank : exec_ranks) {
+//   sprintf(ranks_path[exec_rank], "%s", binary_path);
+// }
+// MPI_Scatter(ranks_path, MAX_MSG_SUBMIT_SIZE, MPI_CHAR, recv_path, MAX_MSG_SUBMIT_SIZE, MPI_CHAR, 0, comm_submit);
+// if (strlen(recv_path) == 0) {
+//   std::cout << "Rank " << mpi_rank << ": Not exec" << std::endl;
+//   continue;
+// }
 
 // DISCARD 检查消息队列内消息数量
 // struct mq_attr attr;

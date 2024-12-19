@@ -10,8 +10,9 @@
 #include <unistd.h>
 #include <semaphore.h>
 #include <cstring>
+#include <mqueue.h>
+#include <mpi.h>
 
-// #include <sycl/access/access.hpp>
 namespace sycl {
     namespace access {
         enum class mode;
@@ -29,11 +30,12 @@ namespace sycl {
 #define MESSAGE_QUEUE_SUBMIT_NAME "/sycl_mq_submit"
 
 #define MAX_MSG_DAEMON_SIZE 1024
-#define MESSAGE_QUEUE_DAEMON_NAME "/sycl_mq_daemon"
+#define MESSAGE_QUEUE_DAEMON_NAME_MAX 50
+#define MESSAGE_QUEUE_DAEMON_PATTERN "/sycl_mq_daemon_%d" // pid
 
 #define MAX_MSG_PROGRAM_SIZE 512
 #define MESSAGE_QUEUE_PROGRAM_NAME_MAX 50
-#define MESSAGE_QUEUE_PROGRAM_PATTERN "/sycl_mq_program_%d"
+#define MESSAGE_QUEUE_PROGRAM_PATTERN "/sycl_mq_program_%d" // pid
 
 // D2D: Daemon to Daemon
 // D2S: Daemon to SYCL
@@ -254,11 +256,25 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
 // =================================
 
 struct ProgramInfo {
+  int global_syclapp_count;
   pid_t pid;
-  std::vector<pid_t> pids; // 这个SYCLAPP在所有rank上的pid
-  std::map<pid_t, int> pid_to_rank;
 
-  // TODO 执行此SYCLAPP的rank
+  MPI_Comm comm_syclapp;
+  int syclapp_rank;
+  int syclapp_size;
+  int master_rank;
+
+  // 只有master收集
+  std::vector<pid_t> pids; // 这个SYCLAPP在所有rank上的pid
+  std::map<pid_t, int> pid_to_rank; // rank是syclapp_rank 不是mpi/submit_rank
+  // TODO 每个syclapp_rank对应哪个物理mpi/submit_rank
+
+  void set_mpi(MPI_Comm comm, int rank, int size, int master) {
+    comm_syclapp = comm;
+    syclapp_rank = rank;
+    syclapp_size = size;
+    master_rank = master;
+  }
 };
 
 struct DAGNode {
@@ -277,6 +293,18 @@ struct DAGNode {
 
   bool executed = false;  
 };
+
+inline int master_rank_syclapp(const std::vector<int>& exec_flags) {
+  std::vector<int> non_zero_index;
+  for (int i = 0; i < exec_flags.size(); i++) {
+    if (exec_flags[i] == 2) {
+      return non_zero_index.size();
+    } else if (exec_flags[i] != 0) {
+      non_zero_index.push_back(i);
+    }
+  }
+  return -1;
+}
 
 #endif
 

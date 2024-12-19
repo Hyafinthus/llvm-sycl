@@ -288,12 +288,12 @@ public:
 
 #ifdef REBIND
   std::vector<device> globalDevices;
-
   // std::vector<detail::Requirement *> releaseReqs;
-#endif
-// #ifdef SCHEDULE
   int kernel_count = 0;
-// #endif
+#endif
+#ifdef SCHEDULE
+  bool daemon_mq_opened = false;
+#endif
 
 private:
   ProgramManager(ProgramManager const &) = delete;

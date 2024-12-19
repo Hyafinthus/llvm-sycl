@@ -49,7 +49,7 @@
 #include <mqueue.h>
 #include <unistd.h>
 
-mqd_t mq_id_daemon, mq_id_program;
+mqd_t mq_id_daemon = -1, mq_id_program;
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
@@ -1025,12 +1025,18 @@ ProgramManager::ProgramManager() {
     exit(1);
   }
 
-  mq_id_daemon = mq_open(MESSAGE_QUEUE_DAEMON_NAME, O_WRONLY);
-  if (mq_id_daemon == -1) {
-    std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " mq_id_daemon open failed";
-    perror(errorMsg.c_str());
-    exit(1);
+  char MESSAGE_QUEUE_DAEMON_NAME[MESSAGE_QUEUE_DAEMON_NAME_MAX];
+  sprintf(MESSAGE_QUEUE_DAEMON_NAME, MESSAGE_QUEUE_DAEMON_PATTERN, getpid());
+
+  // 等待daemon 先不做错误处理
+  while (mq_id_daemon == -1) {
+    mq_id_daemon = mq_open(MESSAGE_QUEUE_DAEMON_NAME, O_WRONLY);
   }
+  // if (mq_id_daemon == -1) {
+  //   std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " mq_id_daemon open failed";
+  //   perror(errorMsg.c_str());
+  //   exit(1);
+  // }
 #endif
 }
 
@@ -1042,6 +1048,10 @@ ProgramManager::~ProgramManager() {
   char MESSAGE_QUEUE_PROGRAM_NAME[MESSAGE_QUEUE_PROGRAM_NAME_MAX];
   sprintf(MESSAGE_QUEUE_PROGRAM_NAME, MESSAGE_QUEUE_PROGRAM_PATTERN, getpid());
   mq_unlink(MESSAGE_QUEUE_PROGRAM_NAME);
+
+  char MESSAGE_QUEUE_DAEMON_NAME[MESSAGE_QUEUE_DAEMON_NAME_MAX];
+  sprintf(MESSAGE_QUEUE_DAEMON_NAME, MESSAGE_QUEUE_DAEMON_PATTERN, getpid());
+  mq_unlink(MESSAGE_QUEUE_DAEMON_NAME);
 
   std::cout << "Process " << getpid() <<": Message queue closed" << std::endl;
 }

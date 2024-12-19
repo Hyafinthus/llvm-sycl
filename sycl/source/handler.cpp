@@ -202,7 +202,6 @@ event handler::finalize() {
       auto &req_counts = kernel_exec_info.req_counts;
       // 如果不执行 检查是否需要host->device 完成后再返回
       if (!kernel_exec_info.exec) {
-        // TODO 多个时要通信多次 SHMEMNAME也要改 daemon间的通信也要改
         if (req_counts.size() > 0) {
           for (int i = 0; i < MRequirements.size(); i++) {
             int daemon_req_count = i + 1;
