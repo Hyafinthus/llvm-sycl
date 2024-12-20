@@ -266,8 +266,8 @@ struct ProgramInfo {
 
   // 只有master收集
   std::vector<pid_t> pids; // 这个SYCLAPP在所有rank上的pid
-  std::map<pid_t, int> pid_to_rank; // rank是syclapp_rank 不是mpi/submit_rank
-  // TODO 每个syclapp_rank对应哪个物理mpi/submit_rank
+  std::map<pid_t, int> pid_to_rank_syclapp; // rank是syclapp_rank 不是mpi/submit_rank
+  std::map<int, int> rank_syclapp_to_submit; // 每个syclapp_rank对应哪个物理mpi/submit_rank
 
   void set_mpi(MPI_Comm comm, int rank, int size, int master) {
     comm_syclapp = comm;
@@ -293,18 +293,6 @@ struct DAGNode {
 
   bool executed = false;  
 };
-
-inline int master_rank_syclapp(const std::vector<int>& exec_flags) {
-  std::vector<int> non_zero_index;
-  for (int i = 0; i < exec_flags.size(); i++) {
-    if (exec_flags[i] == 2) {
-      return non_zero_index.size();
-    } else if (exec_flags[i] != 0) {
-      non_zero_index.push_back(i);
-    }
-  }
-  return -1;
-}
 
 #endif
 

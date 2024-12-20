@@ -8,7 +8,7 @@
 
 #include "daemon.hpp"
 
-bool is_interrupted = false;
+volatile bool is_interrupted = false;
 
 // signal pthread MPI mq shmem
 
@@ -20,7 +20,6 @@ std::map<pid_t, ProgramInfo> pid_to_program; // 当前rank上的pid_整个SYCLAP
 // ====【MPI】
 int mpi_rank, mpi_size; // main
 MPI_Comm comm_submit; // SystemSchedulerSubmit
-MPI_Comm comm_syclapp; // TODO 这个不能全局 每个进程有多个
 
 // ====【mq】
 mqd_t mq_id_submit;
@@ -30,12 +29,14 @@ std::vector<DAGNode *> dag_nodes;
 std::map<std::string, DAGNode *> kid_to_dag; // DAG leaves kernel间的依赖 ？
 std::vector<DAGNode *> dag_leaves; // ？
 
-void SignalHandler(int signum) {
-  if (signum == SIGINT) {
-    std::cout << "Interrupted!" << std::endl;
-    is_interrupted = true;
-  }
-}
+// DISCARD MPI_THREAD_MULTIPLE会劫持SIGINT
+// SIG_BLOCK和sigwait和export OMPI_MCA_mpi_signal=0都不行
+// void SignalHandler(int signum) {
+//   if (signum == SIGINT) {
+//     std::cout << "Interrupted!" << std::endl;
+//     is_interrupted = true;
+//   }
+// }
 
 mqd_t EstablishDaemon(pid_t pid) {
   struct mq_attr mq_attr;
@@ -107,6 +108,30 @@ void BcastD2DKernelSchedInfo(MPI_Comm comm_daemon, int master_rank, int daemon_r
   delete[] buffer;
 }
 
+int master_rank_syclapp(const std::vector<int>& exec_flags) {
+  std::vector<int> non_zero_index;
+  for (int i = 0; i < exec_flags.size(); i++) {
+    if (exec_flags[i] == 2) {
+      return non_zero_index.size();
+    } else if (exec_flags[i] != 0) {
+      non_zero_index.push_back(i);
+    }
+  }
+  return -1;
+}
+
+std::map<int, int> map_rank_syclapp_submit(const std::vector<int>& exec_flags) {
+  std::map<int, int> rank_syclapp_to_submit;  
+  for (int i = 0; i < exec_flags.size(); i++) {
+    if (exec_flags[i] != 0) {
+      int syclapp_rank = rank_syclapp_to_submit.size();
+      int submit_rank = i;
+      rank_syclapp_to_submit[syclapp_rank] = submit_rank;
+    }
+  }
+  return rank_syclapp_to_submit;
+}
+
 void SystemMonitor() {
   while(1) {
     {
@@ -117,6 +142,11 @@ void SystemMonitor() {
 }
 
 void *SystemSchedulerDaemon(void *arg) {
+  // sigset_t set;
+  // sigemptyset(&set);
+  // sigaddset(&set, SIGINT);
+  // pthread_sigmask(SIG_BLOCK, &set, NULL);
+
   int syclapp_count = *(int *)arg;
   int local_pid = globalcount_to_pid[syclapp_count];
   
@@ -139,6 +169,10 @@ void *SystemSchedulerDaemon(void *arg) {
       char buffer[MAX_MSG_DAEMON_SIZE];
       ssize_t bytes_received = mq_receive(mq_id_daemon, buffer, MAX_MSG_DAEMON_SIZE, nullptr);
       if (bytes_received > 0) {
+        if (std::string(buffer, bytes_received) == "EXIT") {
+          std::cout << "Rank " << daemon_rank << ": SYCLAPP finish" << std::endl;
+          break;
+        }
         std::string received_data(buffer, bytes_received);
         kernel_req_data = S2DKernelReqData::deserialize(received_data);
       } else {
@@ -268,9 +302,17 @@ void *SystemSchedulerDaemon(void *arg) {
     }
     mq_close(mq_id_program);
   }
+  
+  mq_close(mq_id_daemon);
+  return NULL;
 }
 
 void *SystemSchedulerSubmit(void *arg) {
+  // sigset_t set;
+  // sigemptyset(&set);
+  // sigaddset(&set, SIGINT);
+  // pthread_sigmask(SIG_BLOCK, &set, NULL);
+  
   int submit_rank, submit_size;
   MPI_Comm_rank(comm_submit, &submit_rank);
   MPI_Comm_size(comm_submit, &submit_size);
@@ -321,6 +363,7 @@ void *SystemSchedulerSubmit(void *arg) {
 
     // 为选择的ranks创建新的通信域 color为global_syclapp_count
     // 所有rank必须参与 不参与的color=MPI_UNDEFINED
+    MPI_Comm comm_syclapp;
     MPI_Comm_split(comm_submit, split_color, submit_rank, &comm_syclapp);
     // rank0也可能non-exec
     if (exec_flags[submit_rank] == 0) {
@@ -361,20 +404,31 @@ void *SystemSchedulerSubmit(void *arg) {
     if (syclapp_rank == master_rank) {
       std::cout << "SUBMIT_Rank " << submit_rank << " SYCLAPP_Rank " << master_rank << " collected PIDs from all processes:" << std::endl;
       for (int i = 0; i < syclapp_size; ++i) {
-        program_info.pid_to_rank.insert(std::pair<pid_t, int>(program_info.pids[i], i));
+        program_info.pid_to_rank_syclapp.insert(std::pair<pid_t, int>(program_info.pids[i], i));
         std::cout << "SYCLAPP_Rank " << i << " PID: " << program_info.pids[i] << std::endl;
       }
+      program_info.rank_syclapp_to_submit = map_rank_syclapp_submit(exec_flags);
     }
     pid_to_program.insert(std::pair<pid_t, ProgramInfo>(program_info.pid, program_info));
 
     // **注意** 每个rank的pid不同 但global_syclapp_count相同
     pthread_t daemon_tid;
     pthread_create(&daemon_tid, NULL, (void *(*)(void *))SystemSchedulerDaemon, &global_syclapp_count);
-    // TODO 要主动cancel和join此daemon
+    // 不等待 不影响主线程 无需cancel和join
+    pthread_detach(daemon_tid);
   }
+
+  return NULL;
 }
 
 int main(int argc, char *argv[]) {
+  // ====【signal】
+  // signal(SIGINT, SignalHandler);
+  // sigset_t set;
+  // sigemptyset(&set);
+  // sigaddset(&set, SIGINT);
+  // pthread_sigmask(SIG_BLOCK, &set, NULL);
+
   // ====【MPI】
   int provided;
   MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -392,9 +446,6 @@ int main(int argc, char *argv[]) {
   // split_key==mpi_rank 所以local_rank和mpi_rank相同 在线程中仍可以使用mpi_rank和mpi_size
   MPI_Comm_split(MPI_COMM_WORLD, 0, mpi_rank, &comm_submit);
 
-  // ====【signal】
-  signal(SIGINT, SignalHandler);
-
   // ====【mq】
   EstablishSubmit();
   std::cout << "MPI_Rank " << mpi_rank << ": Established" << std::endl;
@@ -406,11 +457,22 @@ int main(int argc, char *argv[]) {
   std::cout << "MPI_Rank " << mpi_rank << ": SystemSchedulerSubmit started" << std::endl;
 
   // ====【signal】
+  // while (!is_interrupted) {
+  //   pause();
+  // }
+  // int signum;
+  // while (!is_interrupted) {
+  //   sigwait(&set, &signum);
+  //   if (signum == SIGINT) {
+  //     std::cout << "Interrupted by SIGINT!" << std::endl;
+  //     is_interrupted = true;
+  //   }
+  // }
   while (1) {
     if (is_interrupted) {
       break;
     }
-    usleep(1000);
+    usleep(10000);
   }
 
   // ====【pthread】

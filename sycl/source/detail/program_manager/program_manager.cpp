@@ -1043,12 +1043,12 @@ ProgramManager::ProgramManager() {
 #ifdef SCHEDULE
 ProgramManager::~ProgramManager() {
   mq_close(mq_id_program);
-  mq_close(mq_id_daemon);
-
   char MESSAGE_QUEUE_PROGRAM_NAME[MESSAGE_QUEUE_PROGRAM_NAME_MAX];
   sprintf(MESSAGE_QUEUE_PROGRAM_NAME, MESSAGE_QUEUE_PROGRAM_PATTERN, getpid());
   mq_unlink(MESSAGE_QUEUE_PROGRAM_NAME);
 
+  mq_send(mq_id_daemon, "EXIT", strlen("EXIT"), 0);
+  mq_close(mq_id_daemon);
   char MESSAGE_QUEUE_DAEMON_NAME[MESSAGE_QUEUE_DAEMON_NAME_MAX];
   sprintf(MESSAGE_QUEUE_DAEMON_NAME, MESSAGE_QUEUE_DAEMON_PATTERN, getpid());
   mq_unlink(MESSAGE_QUEUE_DAEMON_NAME);
