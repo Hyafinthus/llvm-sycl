@@ -2361,10 +2361,14 @@ pi_result piKernelSetExecInfo(pi_kernel kernel, pi_kernel_exec_info param_name,
 
   if (param_name == PI_USM_INDIRECT_ACCESS &&
       *(static_cast<const pi_bool *>(param_value)) == PI_TRUE) {
+#ifdef PRINT_ELSE
     std::cout << "===USMSetIndirectAccess\n";
+#endif
     return USMSetIndirectAccess(kernel);
   } else {
+#ifdef PRINT_ELSE
     std::cout << "===clSetKernelExecInfo\n";
+#endif
     return cast<pi_result>(clSetKernelExecInfo(
         cast<cl_kernel>(kernel), param_name, param_value_size, param_value));
   }

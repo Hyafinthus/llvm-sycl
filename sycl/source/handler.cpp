@@ -37,8 +37,8 @@
 #include <unistd.h>
 
 // #define PRINT_TRACE 1
-#define REBIND 1
-#define SCHEDULE 1
+// #define REBIND 1
+// #define SCHEDULE 1
 
 extern mqd_t mq_id_daemon, mq_id_program;
 

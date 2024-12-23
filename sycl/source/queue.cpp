@@ -20,7 +20,7 @@
 
 #include <algorithm>
 
-#define REBIND 1
+// #define REBIND 1
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {

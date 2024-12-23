@@ -29,8 +29,8 @@
 #include <unordered_set>
 #include <vector>
 
-#define REBIND 1
-#define SCHEDULE 1
+// #define REBIND 1
+// #define SCHEDULE 1
 
 // +++ Entry points referenced by the offload wrapper object {
 

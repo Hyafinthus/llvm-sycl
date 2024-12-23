@@ -15,7 +15,7 @@
 #include <sycl/device_selector.hpp>
 #include <sycl/info/info_desc.hpp>
 
-#define REBIND 1
+// #define REBIND 1
 
 #include <algorithm>
 

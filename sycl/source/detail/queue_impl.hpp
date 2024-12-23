@@ -31,7 +31,7 @@
 #include <sycl/stl.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 // #define PRINT_TRACE 1
-#define REBIND 1
+// #define REBIND 1
 
 #include <utility>
 
