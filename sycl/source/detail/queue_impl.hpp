@@ -796,7 +796,9 @@ protected:
   /// Protects all the fields that can be changed by class' methods.
   mutable std::mutex MMutex;
 
+#ifdef REBIND
   bool shell = false;
+#endif
 
   DeviceImplPtr MDevice;
   const ContextImplPtr MContext;
@@ -809,6 +811,8 @@ protected:
   /// queue is the only owner on the runtime side.
   std::vector<event> MEventsShared;
   exception_list MExceptions;
+  const async_handler MAsyncHandler;
+  const property_list MPropList;
 
   /// List of queues created for FPGA device from a single SYCL queue.
   std::vector<RT::PiQueue> MQueues;
@@ -847,8 +851,8 @@ protected:
   uint64_t MInstanceID = 0;
 
 public:
-  const async_handler MAsyncHandler;
-  const property_list MPropList;
+  const async_handler &getAsyncHandler() const { return MAsyncHandler; }
+  const property_list &getPropertyList() const { return MPropList; }
 
   // Queue constructed with the discard_events property
   const bool MDiscardEvents;

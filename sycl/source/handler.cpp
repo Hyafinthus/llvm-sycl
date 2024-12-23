@@ -280,7 +280,7 @@ event handler::finalize() {
       device exec_device = detail::ProgramManager::getInstance().globalDevices.at(kernel_exec_info.device_index);
       detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
       std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
-      MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->MAsyncHandler, MQueue->MPropList));
+      MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
     }
   }
 #endif
@@ -307,7 +307,7 @@ event handler::finalize() {
       // 在gloabal_handler初始化时获取所有device，并循环判断如果使用每个device的queue会造成几次数据移动
       for (device tempD : detail::ProgramManager::getInstance().globalDevices) {
         detail::DeviceImplPtr tempDP = detail::getSyclObjImpl(tempD);
-        MQueue.reset(new detail::queue_impl(tempDP, detail::queue_impl::getDefaultOrNew(tempDP), MQueue->MAsyncHandler, MQueue->MPropList));
+        MQueue.reset(new detail::queue_impl(tempDP, detail::queue_impl::getDefaultOrNew(tempDP), MQueue->getAsyncHandler(), MQueue->getPropList()));
         int notSameCtxCount = 0;
 
         std::cout << "=== handler === TRY: " << tempD.get_info<info::device::name>() << std::endl;
@@ -375,7 +375,7 @@ event handler::finalize() {
   detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
   std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
   // MQueue->rebindDevice(dp);
-  MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->MAsyncHandler, MQueue->MPropList));
+  MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropList()));
 
 #ifdef TEST
   // ========【DONE】【测试device->host】
