@@ -29,8 +29,8 @@
 #include <unordered_set>
 #include <vector>
 
-// #define REBIND 1
-// #define SCHEDULE 1
+#define REBIND 1
+#define SCHEDULE 1
 
 // +++ Entry points referenced by the offload wrapper object {
 
@@ -293,6 +293,8 @@ public:
 #endif
 #ifdef SCHEDULE
   bool daemon_mq_opened = false;
+  int scale_count = 0;
+  int scale_device = -1;
 #endif
 
 private:

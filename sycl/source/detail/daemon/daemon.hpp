@@ -4,6 +4,9 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <queue>
+#include <set>
+#include <unordered_map>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -211,6 +214,8 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
   bool exec = false; // 是否执行
   int device_index; // 执行设备
 
+  int scale_count = 0; // 快速跳过前几个kernel
+
   // handler只有当前kernel的req 不需处理哪个req给哪个rank 只需发送给daemon
   // exec==false: 记录当前rank需要shmem给daemon的req
   // exec==true: 记录需要从其他所有rank获取的req
@@ -220,7 +225,8 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     std::ostringstream oss;
     oss << kernel_count << "\n"
         << exec << "\n"
-        << device_index << "\n";
+        << device_index << "\n"
+        << scale_count << "\n";
 
     // 序列化 req_counts 的大小
     oss << req_counts.size() << "\n";
@@ -238,6 +244,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     iss >> kernel_info.kernel_count;
     iss >> kernel_info.exec;
     iss >> kernel_info.device_index;
+    iss >> kernel_info.scale_count;
 
     size_t req_count;
     iss >> req_count;
@@ -259,20 +266,20 @@ struct ProgramInfo {
   int global_syclapp_count;
   pid_t pid;
 
-  MPI_Comm comm_syclapp;
-  int syclapp_rank;
-  int syclapp_size;
+  MPI_Comm comm_daemon;
+  int daemon_rank;
+  int daemon_size;
   int master_rank;
 
   // 只有master收集
-  std::vector<pid_t> pids; // 这个SYCLAPP在所有rank上的pid
-  std::map<pid_t, int> pid_to_rank_syclapp; // rank是syclapp_rank 不是mpi/submit_rank
-  std::map<int, int> rank_syclapp_to_submit; // 每个syclapp_rank对应哪个物理mpi/submit_rank
+  // std::vector<pid_t> pids; // 这个SYCLAPP在所有rank上的pid
+  // std::map<pid_t, int> pid_to_rank_syclapp; // rank是syclapp_rank 不是mpi/submit_rank
+  // std::map<int, int> rank_syclapp_to_submit; // 每个syclapp_rank对应哪个物理mpi/submit_rank
 
   void set_mpi(MPI_Comm comm, int rank, int size, int master) {
-    comm_syclapp = comm;
-    syclapp_rank = rank;
-    syclapp_size = size;
+    comm_daemon = comm;
+    daemon_rank = rank;
+    daemon_size = size;
     master_rank = master;
   }
 };

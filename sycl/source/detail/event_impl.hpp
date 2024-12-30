@@ -21,7 +21,7 @@
 #include <condition_variable>
 #include <optional>
 
-// #define REBIND 1
+#define REBIND 1
 // #define MODIFY 1
 
 namespace sycl {
