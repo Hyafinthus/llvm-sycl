@@ -271,16 +271,43 @@ void *SystemSchedulerDaemon(void *arg) {
       // TODO 2 [allrank] 其他调度决策(设备负载/性能预测)
       // TODO 3 [rank0] 确定执行执行rank
       kernel_sched_info.kernel_count = kernel_req_data.kernel_count;
-      // ========【固定测试】
+      // ========【固定测试】3mm
       // A dep no - rank1
       // B dep no - rank0
       // C dep A:rank1, B:rank0 - rank1
+      // if (daemon_rank == 1) {
+      //   if (kernel_req_data.kernel_count == 1) {
+      //     // A
+      //     kernel_sched_info.exec_rank = 1;
+      //   } else if (kernel_req_data.kernel_count == 2) {
+      //     // B
+      //     kernel_sched_info.exec_rank = 0;
+      //     {
+      //       std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+      //       pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+      //       pid_to_scalecount_cv[local_pid]->notify_one();
+      //     }
+      //     scale = true;
+      //     std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
+      //   } else if (kernel_req_data.kernel_count == 3) {
+      //     // C
+      //     kernel_sched_info.exec_rank = 1;
+      //     kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
+      //     kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+      //   }
+      // }
+
+      // ========【固定测试】calc
       if (daemon_rank == 1) {
         if (kernel_req_data.kernel_count == 1) {
-          // A
           kernel_sched_info.exec_rank = 1;
         } else if (kernel_req_data.kernel_count == 2) {
-          // B
+          kernel_sched_info.exec_rank = 1;
+        } else if (kernel_req_data.kernel_count == 3) {
+          kernel_sched_info.exec_rank = 1;
+        } else if (kernel_req_data.kernel_count == 4) {
+          kernel_sched_info.exec_rank = 1;
+        } else if (kernel_req_data.kernel_count == 5) {
           kernel_sched_info.exec_rank = 0;
           {
             std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
@@ -288,12 +315,15 @@ void *SystemSchedulerDaemon(void *arg) {
             pid_to_scalecount_cv[local_pid]->notify_one();
           }
           scale = true;
-          std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
-        } else if (kernel_req_data.kernel_count == 3) {
-          // C
+        } else if (kernel_req_data.kernel_count == 6) {
           kernel_sched_info.exec_rank = 1;
-          kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
+        } else if (kernel_req_data.kernel_count == 7) {
+          kernel_sched_info.exec_rank = 1;
+        } else if (kernel_req_data.kernel_count == 8) {
+          kernel_sched_info.exec_rank = 1;
           kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+        } else if (kernel_req_data.kernel_count == 9) {
+          kernel_sched_info.exec_rank = 1;
         }
       }
 
@@ -333,8 +363,30 @@ void *SystemSchedulerDaemon(void *arg) {
       for (int i = 0; i < req_for_rank.size(); ++i) {
         kernel_exec_info.req_counts[i] = req_for_rank[i].req_count;
       }
-      // ========【固定测试】
-      kernel_exec_info.device_index = 1;
+      // ========【固定测试】calc
+      if (daemon_rank == 1) {
+        if (kernel_req_data.kernel_count == 1) {
+          kernel_exec_info.device_index = 1;
+        } else if (kernel_req_data.kernel_count == 2) {
+          kernel_exec_info.device_index = 2;
+        } else if (kernel_req_data.kernel_count == 3) {
+          kernel_exec_info.device_index = 3;
+        } else if (kernel_req_data.kernel_count == 4) {
+          kernel_exec_info.device_index = 4;
+        } else if (kernel_req_data.kernel_count == 5) {
+          kernel_exec_info.device_index = 1;
+        } else if (kernel_req_data.kernel_count == 6) {
+          kernel_exec_info.device_index = 1;
+        } else if (kernel_req_data.kernel_count == 7) {
+          kernel_exec_info.device_index = 3;
+        } else if (kernel_req_data.kernel_count == 8) {
+          kernel_exec_info.device_index = 2;
+        } else if (kernel_req_data.kernel_count == 9) {
+          kernel_exec_info.device_index = 1;
+        }
+      }
+      else 
+        kernel_exec_info.device_index = 1;
 
       // 向负责的进程mq发送 需要device->host的data
       std::string serialized_data = kernel_exec_info.serialize();

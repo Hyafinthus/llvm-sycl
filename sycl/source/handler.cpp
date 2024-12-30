@@ -151,7 +151,7 @@ event handler::finalize() {
       return MLastEvent;
     }
     // scale_count也避免通信
-    // ========【固定测试】暂时不考虑scale的存在依赖
+    // TODO 暂时不考虑scale的存在依赖
     else if (daemon_kernel_count == daemon_scale_count) {
       device exec_device = detail::ProgramManager::getInstance().globalDevices.at(detail::ProgramManager::getInstance().scale_device);
       detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
@@ -206,7 +206,7 @@ event handler::finalize() {
         if (kernel_exec_info.scale_count > 1) {
           daemon_scale_count = kernel_exec_info.scale_count;
           detail::ProgramManager::getInstance().scale_device = kernel_exec_info.device_index;
-          std::cout << "=== handler === Process " << getpid() << " === scale_count: " << daemon_scale_count << " device_index: " <<  std::endl;
+          std::cout << "=== handler === Process " << getpid() << " === scale_count: " << daemon_scale_count << " device_index: " << kernel_exec_info.device_index << std::endl;
           return MLastEvent;
         } else {
           std::cout << "=== handler === Process " << getpid() << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count << " exec: " << kernel_exec_info.exec << " device_index: " << kernel_exec_info.device_index << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
@@ -233,7 +233,7 @@ event handler::finalize() {
                 delete hostReq;
                 std::cout << "=== handler === test_mem ==== sender add host acc" << std::endl;
 
-                // ====【固定测试】
+                // ========【固定测试】
                 using DATA_TYPE = float;
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);

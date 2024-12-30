@@ -314,9 +314,9 @@ struct DAGNode {
 #define SHARED_MEMORY_WRITE_NAME_PATTERN "/sycl_shm_write_%d_%d_%d"
 #define SHARED_MEMORY_READ_NAME_PATTERN "/sycl_shm_read_%d_%d_%d"
 
-// ====【固定测试】
+// ========【固定测试】
 using DATA_TYPE = float;
-#define VECTOR_SIZE (256*256)
+#define VECTOR_SIZE (8192*8192)
 #define MEMORY_SIZE (VECTOR_SIZE * sizeof(DATA_TYPE))
 
 struct SharedMemoryHandle {
