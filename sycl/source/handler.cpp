@@ -174,10 +174,10 @@ event handler::finalize() {
           Requirement *Req = MRequirements[i];
 
           SyclReqData req_data;
-          req_data.req_pointer = Req;
+          req_data.mem_pointer = Req->MSYCLMemObj;
           req_data.kernel_count = kernel_req_data.kernel_count;
           req_data.req_count = i + 1;
-          req_data.req_accmode = Req->MAccessMode;
+          req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
 
           kernel_req_data.reqs.push_back(req_data);
         }

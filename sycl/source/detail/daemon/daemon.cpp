@@ -9,6 +9,7 @@
 #include <condition_variable>
 
 #include "daemon.hpp"
+// #include <sycl/access/access.hpp>
 
 volatile bool is_interrupted = false;
 
@@ -35,11 +36,6 @@ int submit_rank, submit_size; // SystemSchedulerSubmit
 
 // ====【mq】
 mqd_t mq_id_submit;
-
-// 一个SYCLAPP的DAG相关
-std::vector<DAGNode *> dag_nodes;
-std::map<std::string, DAGNode *> kid_to_dag; // DAG leaves kernel间的依赖 ？
-std::vector<DAGNode *> dag_leaves; // ？
 
 // DISCARD MPI_THREAD_MULTIPLE会劫持SIGINT
 // SIG_BLOCK和sigwait和export OMPI_MCA_mpi_signal=0都不行
@@ -173,6 +169,44 @@ std::map<int, int> map_rank_syclapp_submit(const std::vector<int>& exec_flags) {
   return rank_syclapp_to_submit;
 }
 
+std::map<SyclReqData, int> generateDAG(std::vector<DAGNode *> &kernel_dag_nodes, DAGNode *node) {
+  // 一个kernel内的依赖关系对分析没有影响 重点在于kernel间相同mem的依赖关系 (在保证执行顺序的前提下)
+  // read: 必然无依赖 - 依赖前序kernel相同mem的写
+  // write: 可能读其他mem (仍需要加载到设备内存) - 不依赖前序kernel (依赖的mem已在read中)
+  // read_write: 更新自身/先读后写=更新自身/先写后读=初始化后读 - 依赖前序kernel相同mem的写
+  // discard_write: 丢弃之前并初始化 - 不依赖前序kernel
+  // discard_read_write: 丢弃之前并读写=先初始化后读 - 不依赖前序kernel
+  // atomic: 单线程执行=视作读写 - 依赖前序kernel相同mem的写
+  std::map<SyclReqData, int> req_rank;
+
+  for (SyclReqData &req : node->req_data) {
+    // 依赖前序kernel相同mem的写 read | read_write | atomic
+    if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
+      // 由后向前遍历kernel 找到相同mem最近的写作为依赖
+      for (auto it = kernel_dag_nodes.rbegin(); it != kernel_dag_nodes.rend(); ++it) {
+        DAGNode *prev_node = *it;
+        bool found = false;
+        for (SyclReqData &prev_req : prev_node->req_data) {
+          // std::cout << "generateDAG: Rank " << node->exec_rank << " prev_req_mem_pointer: " << prev_req.mem_pointer << " prev_req_accmode: " << static_cast<int>(prev_req.req_accmode) << std::endl;
+          if (prev_req.mem_pointer == req.mem_pointer && prev_req.req_accmode != acc_mode::read) {
+            node->depend_on.push_back(prev_node);
+            prev_node->depend_by.push_back(node);
+            req_rank[prev_req] = prev_node->exec_rank;
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          break;
+        }
+      }
+    }
+  }
+
+  kernel_dag_nodes.push_back(node);
+  return req_rank;
+}
+
 void SystemMonitor() {
   while(1) {
     {
@@ -241,6 +275,9 @@ void *SystemSchedulerDaemon(void *arg) {
     }
   }
 
+  // 维护一个SYCLAPP的所有kernel的依赖关系 DAG相关
+  std::vector<DAGNode *> kernel_dag_nodes; // 所有kernel对应的DAG
+
   while (1) {
     // ====【接收program通信】
     S2DKernelReqData kernel_req_data;
@@ -259,7 +296,7 @@ void *SystemSchedulerDaemon(void *arg) {
         perror(errorMsg.c_str());
         exit(1);
       }
-      std::cout << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: " << kernel_req_data.pid << " kernel_req_data count: " << kernel_req_data.kernel_count << std::endl;
+      std::cout << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: " << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count << std::endl;
     }
 
     // ====【调度决策并发给其他rank】
@@ -270,17 +307,54 @@ void *SystemSchedulerDaemon(void *arg) {
       //                遍历pid对应的kernel
       // TODO 2 [allrank] 其他调度决策(设备负载/性能预测)
       // TODO 3 [rank0] 确定执行执行rank
+
+      for (SyclReqData req : kernel_req_data.reqs) {
+        std::cout << "Rank " << daemon_rank << " req: " << req.kernel_count << "-" << req.req_count << " pointer: " << req.mem_pointer << std::endl;
+      }
+      DAGNode *node = new DAGNode(kernel_req_data.reqs);
+      std::map<SyclReqData, int> req_rank = generateDAG(kernel_dag_nodes, node);
+      for (auto pair : req_rank) {
+        std::cout << "Rank " << daemon_rank << " req_rank: " << pair.first.kernel_count << "-" << pair.first.req_count << " pointer: " << pair.first.mem_pointer << " rank: " << pair.second << std::endl;
+      }
+      // TODO 确定kernel是无依赖 还是依赖于某个kernel/某些数据 确定最适合的rank与设备
+
       kernel_sched_info.kernel_count = kernel_req_data.kernel_count;
       // ========【固定测试】3mm
       // A dep no - rank1
       // B dep no - rank0
       // C dep A:rank1, B:rank0 - rank1
+      if (daemon_rank == 1) {
+        if (kernel_req_data.kernel_count == 1) {
+          // A
+          kernel_sched_info.exec_rank = 1;
+        } else if (kernel_req_data.kernel_count == 2) {
+          // B
+          kernel_sched_info.exec_rank = 1;
+          // {
+          //   std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+          //   pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+          //   pid_to_scalecount_cv[local_pid]->notify_one();
+          // }
+          // scale = true;
+          // std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
+        } else if (kernel_req_data.kernel_count == 3) {
+          // C
+          kernel_sched_info.exec_rank = 1;
+          // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
+          // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+        }
+      }
+      // ========【固定测试】calc 在daemon决定执行rank 后续还要彼此通信 scale决定还要通知daemon
       // if (daemon_rank == 1) {
       //   if (kernel_req_data.kernel_count == 1) {
-      //     // A
       //     kernel_sched_info.exec_rank = 1;
       //   } else if (kernel_req_data.kernel_count == 2) {
-      //     // B
+      //     kernel_sched_info.exec_rank = 1;
+      //   } else if (kernel_req_data.kernel_count == 3) {
+      //     kernel_sched_info.exec_rank = 1;
+      //   } else if (kernel_req_data.kernel_count == 4) {
+      //     kernel_sched_info.exec_rank = 1;
+      //   } else if (kernel_req_data.kernel_count == 5) {
       //     kernel_sched_info.exec_rank = 0;
       //     {
       //       std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
@@ -288,44 +362,18 @@ void *SystemSchedulerDaemon(void *arg) {
       //       pid_to_scalecount_cv[local_pid]->notify_one();
       //     }
       //     scale = true;
-      //     std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
-      //   } else if (kernel_req_data.kernel_count == 3) {
-      //     // C
+      //   } else if (kernel_req_data.kernel_count == 6) {
       //     kernel_sched_info.exec_rank = 1;
-      //     kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
+      //   } else if (kernel_req_data.kernel_count == 7) {
+      //     kernel_sched_info.exec_rank = 1;
+      //   } else if (kernel_req_data.kernel_count == 8) {
+      //     kernel_sched_info.exec_rank = 1;
       //     kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+      //   } else if (kernel_req_data.kernel_count == 9) {
+      //     kernel_sched_info.exec_rank = 1;
       //   }
       // }
-
-      // ========【固定测试】calc
-      if (daemon_rank == 1) {
-        if (kernel_req_data.kernel_count == 1) {
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 2) {
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 3) {
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 4) {
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 5) {
-          kernel_sched_info.exec_rank = 0;
-          {
-            std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
-            pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
-            pid_to_scalecount_cv[local_pid]->notify_one();
-          }
-          scale = true;
-        } else if (kernel_req_data.kernel_count == 6) {
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 7) {
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 8) {
-          kernel_sched_info.exec_rank = 1;
-          kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
-        } else if (kernel_req_data.kernel_count == 9) {
-          kernel_sched_info.exec_rank = 1;
-        }
-      }
+      node->exec_rank = kernel_sched_info.exec_rank;
 
       // 对于master 告知scale需要扩充 此时scale新线程都未建立 不会向scale发
       // 对于scale_rank 等建立到到这里不应该接受
@@ -364,28 +412,28 @@ void *SystemSchedulerDaemon(void *arg) {
         kernel_exec_info.req_counts[i] = req_for_rank[i].req_count;
       }
       // ========【固定测试】calc
-      if (daemon_rank == 1) {
-        if (kernel_req_data.kernel_count == 1) {
-          kernel_exec_info.device_index = 1;
-        } else if (kernel_req_data.kernel_count == 2) {
-          kernel_exec_info.device_index = 2;
-        } else if (kernel_req_data.kernel_count == 3) {
-          kernel_exec_info.device_index = 3;
-        } else if (kernel_req_data.kernel_count == 4) {
-          kernel_exec_info.device_index = 4;
-        } else if (kernel_req_data.kernel_count == 5) {
-          kernel_exec_info.device_index = 1;
-        } else if (kernel_req_data.kernel_count == 6) {
-          kernel_exec_info.device_index = 1;
-        } else if (kernel_req_data.kernel_count == 7) {
-          kernel_exec_info.device_index = 3;
-        } else if (kernel_req_data.kernel_count == 8) {
-          kernel_exec_info.device_index = 2;
-        } else if (kernel_req_data.kernel_count == 9) {
-          kernel_exec_info.device_index = 1;
-        }
-      }
-      else 
+      // if (daemon_rank == 1) {
+      //   if (kernel_req_data.kernel_count == 1) {
+      //     kernel_exec_info.device_index = 1;
+      //   } else if (kernel_req_data.kernel_count == 2) {
+      //     kernel_exec_info.device_index = 2;
+      //   } else if (kernel_req_data.kernel_count == 3) {
+      //     kernel_exec_info.device_index = 3;
+      //   } else if (kernel_req_data.kernel_count == 4) {
+      //     kernel_exec_info.device_index = 4;
+      //   } else if (kernel_req_data.kernel_count == 5) {
+      //     kernel_exec_info.device_index = 1;
+      //   } else if (kernel_req_data.kernel_count == 6) {
+      //     kernel_exec_info.device_index = 1;
+      //   } else if (kernel_req_data.kernel_count == 7) {
+      //     kernel_exec_info.device_index = 3;
+      //   } else if (kernel_req_data.kernel_count == 8) {
+      //     kernel_exec_info.device_index = 2;
+      //   } else if (kernel_req_data.kernel_count == 9) {
+      //     kernel_exec_info.device_index = 1;
+      //   }
+      // }
+      // else 
         kernel_exec_info.device_index = 1;
 
       // 向负责的进程mq发送 需要device->host的data

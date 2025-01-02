@@ -16,11 +16,15 @@
 #include <mqueue.h>
 #include <mpi.h>
 
-namespace sycl {
-    namespace access {
-        enum class mode;
-    }
-}
+// 与sycl::access::mode保持一致
+enum class acc_mode {
+  read = 1024,
+  write = 1025,
+  read_write = 1026,
+  discard_write = 1027,
+  discard_read_write = 1028,
+  atomic = 1029
+};
 
 #ifndef MESSAGE_QUEUE
 #define MESSAGE_QUEUE
@@ -49,26 +53,35 @@ namespace sycl {
 
 // =================================
 
-struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)的信息
-  void *req_pointer;
+struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信息
+  // SYCL运行时中 不同kernel中同一个数组的Req不是同一个对象
+  void *mem_pointer;
   int kernel_count;
   int req_count;
-  sycl::access::mode req_accmode;
+  acc_mode req_accmode;
 
+  // 用于map/set/sort/priority_queue
   bool operator<(const SyclReqData &other) const {
-    return req_count < other.req_count;
+    if (req_count != other.req_count) {
+      return req_count < other.req_count;
+    }
+    if (kernel_count != other.kernel_count) {
+      return kernel_count < other.kernel_count;
+    }
+    return mem_pointer < other.mem_pointer;
   }
 
   // 不同daemon间定位同一个数组
   // 如果指针相同 或kernel_count和req_count相同
+  // 用于find/count/unique/remove/unordered
   bool operator==(const SyclReqData &other) const {
-    return (req_pointer == other.req_pointer) ||
+    return (mem_pointer == other.mem_pointer) ||
            (kernel_count == other.kernel_count && req_count == other.req_count);
   }
 
   std::string serialize() const {
     std::ostringstream oss;
-    oss << reinterpret_cast<uintptr_t>(req_pointer) << "\n"
+    oss << reinterpret_cast<uintptr_t>(mem_pointer) << "\n"
         << kernel_count << "\n"
         << req_count << "\n"
         << static_cast<int>(req_accmode) << "\n";
@@ -80,12 +93,12 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)的信息
     SyclReqData req;
     uintptr_t ptr;
     iss >> ptr;
-    req.req_pointer = reinterpret_cast<void *>(ptr);
+    req.mem_pointer = reinterpret_cast<void *>(ptr);
     iss >> req.kernel_count;
     iss >> req.req_count;
     int accmode;
     iss >> accmode;
-    req.req_accmode = static_cast<sycl::access::mode>(accmode);
+    req.req_accmode = static_cast<acc_mode>(accmode);
     return req;
   }
 };
@@ -284,21 +297,16 @@ struct ProgramInfo {
   }
 };
 
-struct DAGNode {
-  std::string kernel_id; // 在每个daemon中不同
-  int kernel_count; // 同一个SYCL进程中靠计数区分
-
-  int mpi_rank;
-  int pid;
-
-  std::vector<std::string> read_only;
-  std::vector<std::string> write_only;
-  std::vector<std::string> read_write;
+struct DAGNode { // 一个kernel的依赖关系
+  std::vector<SyclReqData> req_data;
 
   std::vector<DAGNode *> depend_on;
   std::vector<DAGNode *> depend_by;
 
-  bool executed = false;  
+  int exec_rank = -1;
+  // bool executed = false; // ？
+
+  DAGNode(const std::vector<SyclReqData> &reqs) : req_data(reqs) {}
 };
 
 #endif
@@ -316,7 +324,7 @@ struct DAGNode {
 
 // ========【固定测试】
 using DATA_TYPE = float;
-#define VECTOR_SIZE (8192*8192)
+#define VECTOR_SIZE (256*256)
 #define MEMORY_SIZE (VECTOR_SIZE * sizeof(DATA_TYPE))
 
 struct SharedMemoryHandle {
