@@ -145,6 +145,7 @@ void BcastD2DKernelSchedInfo(MPI_Comm comm_daemon, int master_rank, int daemon_r
   delete[] buffer;
 }
 
+// DISCARD Submit确定执行的ranks
 int master_rank_syclapp(const std::vector<int>& exec_flags) {
   std::vector<int> non_zero_index;
   for (int i = 0; i < exec_flags.size(); i++) {
@@ -157,6 +158,7 @@ int master_rank_syclapp(const std::vector<int>& exec_flags) {
   return -1;
 }
 
+// DISCARD Submit确定执行的ranks
 std::map<int, int> map_rank_syclapp_submit(const std::vector<int>& exec_flags) {
   std::map<int, int> rank_syclapp_to_submit;  
   for (int i = 0; i < exec_flags.size(); i++) {
@@ -177,7 +179,11 @@ std::map<SyclReqData, int> generateDAG(std::vector<DAGNode *> &kernel_dag_nodes,
   // discard_write: 丢弃之前并初始化 - 不依赖前序kernel
   // discard_read_write: 丢弃之前并读写=先初始化后读 - 不依赖前序kernel
   // atomic: 单线程执行=视作读写 - 依赖前序kernel相同mem的写
+
+  // **注意** SyclReqData相memptr会视作同一个对象 单kernelcount和reqcount不同 必须使用当前kernel生成的对象 后续会用到两个count
   std::map<SyclReqData, int> req_rank;
+
+  // TODO 因需要读一个数组会从执行的rank拷贝 所以数据最新拷贝可能在多个rank存在
 
   for (SyclReqData &req : node->req_data) {
     // 依赖前序kernel相同mem的写 read | read_write | atomic
@@ -191,7 +197,7 @@ std::map<SyclReqData, int> generateDAG(std::vector<DAGNode *> &kernel_dag_nodes,
           if (prev_req.mem_pointer == req.mem_pointer && prev_req.req_accmode != acc_mode::read) {
             node->depend_on.push_back(prev_node);
             prev_node->depend_by.push_back(node);
-            req_rank[prev_req] = prev_node->exec_rank;
+            req_rank[req] = prev_node->exec_rank;
             found = true;
             break;
           }
@@ -205,6 +211,22 @@ std::map<SyclReqData, int> generateDAG(std::vector<DAGNode *> &kernel_dag_nodes,
 
   kernel_dag_nodes.push_back(node);
   return req_rank;
+}
+
+int mostDepdRank(std::map<SyclReqData, int> &req_rank) {
+  std::map<int, int> rank_count;
+  for (auto pair : req_rank) {
+    rank_count[pair.second]++;
+  }
+  int max_count = 0;
+  int max_rank = -1;
+  for (auto pair : rank_count) {
+    if (pair.second > max_count) {
+      max_count = pair.second;
+      max_rank = pair.first;
+    }
+  }
+  return max_rank;
 }
 
 void SystemMonitor() {
@@ -303,81 +325,94 @@ void *SystemSchedulerDaemon(void *arg) {
     D2DKernelSchedInfo kernel_sched_info;
     bool scale = false;
     {
-      // TODO 1 [rank0] 构建DAG 确定依赖的kernel 查找依赖的kernel在哪个rank执行
-      //                遍历pid对应的kernel
-      // TODO 2 [allrank] 其他调度决策(设备负载/性能预测)
-      // TODO 3 [rank0] 确定执行执行rank
-
-      for (SyclReqData req : kernel_req_data.reqs) {
-        std::cout << "Rank " << daemon_rank << " req: " << req.kernel_count << "-" << req.req_count << " pointer: " << req.mem_pointer << std::endl;
-      }
-      DAGNode *node = new DAGNode(kernel_req_data.reqs);
-      std::map<SyclReqData, int> req_rank = generateDAG(kernel_dag_nodes, node);
-      for (auto pair : req_rank) {
-        std::cout << "Rank " << daemon_rank << " req_rank: " << pair.first.kernel_count << "-" << pair.first.req_count << " pointer: " << pair.first.mem_pointer << " rank: " << pair.second << std::endl;
-      }
-      // TODO 确定kernel是无依赖 还是依赖于某个kernel/某些数据 确定最适合的rank与设备
-
-      kernel_sched_info.kernel_count = kernel_req_data.kernel_count;
-      // ========【固定测试】3mm
-      // A dep no - rank1
-      // B dep no - rank0
-      // C dep A:rank1, B:rank0 - rank1
-      if (daemon_rank == 1) {
-        if (kernel_req_data.kernel_count == 1) {
-          // A
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 2) {
-          // B
-          kernel_sched_info.exec_rank = 1;
-          // {
-          //   std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
-          //   pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
-          //   pid_to_scalecount_cv[local_pid]->notify_one();
-          // }
-          // scale = true;
-          // std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
-        } else if (kernel_req_data.kernel_count == 3) {
-          // C
-          kernel_sched_info.exec_rank = 1;
-          // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
-          // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+      if (daemon_rank == master_rank) {
+        // [1] [rank0] 构建DAG 确定依赖的kernel 查找依赖的kernel在哪个rank执行
+        // for (SyclReqData req : kernel_req_data.reqs) {
+        //   std::cout << "Rank " << daemon_rank << " req: " << req.kernel_count << "-" << req.req_count << " pointer: " << req.mem_pointer << std::endl;
+        // }
+        DAGNode *node = new DAGNode(kernel_req_data.reqs);
+        std::map<SyclReqData, int> req_rank = generateDAG(kernel_dag_nodes, node);
+        for (auto pair : req_rank) {
+          std::cout << "Rank " << daemon_rank << " req_rank: " << pair.first.kernel_count << "-" << pair.first.req_count << " pointer: " << pair.first.mem_pointer << " rank: " << pair.second << std::endl;
         }
+        kernel_sched_info.kernel_count = kernel_req_data.kernel_count;
+        kernel_sched_info.req_rank = req_rank;
+        // TODO 确定kernel是无依赖 还是依赖于某个kernel/某些数据 确定最适合的rank与设备
+        // TODO 2 [allrank] 其他调度决策(设备负载/性能预测)
+        // TODO 3 [rank0] 确定执行执行rank
+        // 如果无依赖 先看本rank是否有空闲device 如果无则扩容至其他rank
+        // 如果有依赖 检查依赖最多的数据在哪个rank 在该rank上执行
+        // TODO 判断通信开销和计算开销
+        // 在master上只需要确认rank是否还有device空闲 具体的device应由各daemon监控和选择
+        // TODO 调用设备监控确认是否有空闲device
+        int most_rank = mostDepdRank(req_rank);
+        if (most_rank == -1) {
+          kernel_sched_info.exec_rank = daemon_rank;
+        } else {
+          kernel_sched_info.exec_rank = most_rank;
+        }
+        // TODO 确定是否有空闲device
+
+        // ========【固定测试】3mm
+        // A dep no - rank1
+        // B dep no - rank0
+        // C dep A:rank1, B:rank0 - rank1
+        // if (daemon_rank == 1) {
+        //   if (kernel_req_data.kernel_count == 1) {
+        //     // A
+        //     kernel_sched_info.exec_rank = 1;
+        //   } else if (kernel_req_data.kernel_count == 2) {
+        //     // B
+        //     kernel_sched_info.exec_rank = 1;
+        //     // {
+        //     //   std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+        //     //   pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+        //     //   pid_to_scalecount_cv[local_pid]->notify_one();
+        //     // }
+        //     // scale = true;
+        //     // std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
+        //   } else if (kernel_req_data.kernel_count == 3) {
+        //     // C
+        //     kernel_sched_info.exec_rank = 1;
+        //     // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
+        //     // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+        //   }
+        // }
+        // ========【固定测试】calc 在daemon决定执行rank 后续还要彼此通信 scale决定还要通知daemon
+        // if (daemon_rank == 1) {
+        //   if (kernel_req_data.kernel_count == 1) {
+        //     kernel_sched_info.exec_rank = 1;
+        //   } else if (kernel_req_data.kernel_count == 2) {
+        //     kernel_sched_info.exec_rank = 1;
+        //   } else if (kernel_req_data.kernel_count == 3) {
+        //     kernel_sched_info.exec_rank = 1;
+        //   } else if (kernel_req_data.kernel_count == 4) {
+        //     kernel_sched_info.exec_rank = 1;
+        //   } else if (kernel_req_data.kernel_count == 5) {
+        //     kernel_sched_info.exec_rank = 0;
+        //     {
+        //       std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+        //       pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+        //       pid_to_scalecount_cv[local_pid]->notify_one();
+        //     }
+        //     scale = true;
+        //   } else if (kernel_req_data.kernel_count == 6) {
+        //     kernel_sched_info.exec_rank = 1;
+        //   } else if (kernel_req_data.kernel_count == 7) {
+        //     kernel_sched_info.exec_rank = 1;
+        //   } else if (kernel_req_data.kernel_count == 8) {
+        //     kernel_sched_info.exec_rank = 1;
+        //     kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+        //   } else if (kernel_req_data.kernel_count == 9) {
+        //     kernel_sched_info.exec_rank = 1;
+        //   }
+        // }
+        node->exec_rank = kernel_sched_info.exec_rank;
       }
-      // ========【固定测试】calc 在daemon决定执行rank 后续还要彼此通信 scale决定还要通知daemon
-      // if (daemon_rank == 1) {
-      //   if (kernel_req_data.kernel_count == 1) {
-      //     kernel_sched_info.exec_rank = 1;
-      //   } else if (kernel_req_data.kernel_count == 2) {
-      //     kernel_sched_info.exec_rank = 1;
-      //   } else if (kernel_req_data.kernel_count == 3) {
-      //     kernel_sched_info.exec_rank = 1;
-      //   } else if (kernel_req_data.kernel_count == 4) {
-      //     kernel_sched_info.exec_rank = 1;
-      //   } else if (kernel_req_data.kernel_count == 5) {
-      //     kernel_sched_info.exec_rank = 0;
-      //     {
-      //       std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
-      //       pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
-      //       pid_to_scalecount_cv[local_pid]->notify_one();
-      //     }
-      //     scale = true;
-      //   } else if (kernel_req_data.kernel_count == 6) {
-      //     kernel_sched_info.exec_rank = 1;
-      //   } else if (kernel_req_data.kernel_count == 7) {
-      //     kernel_sched_info.exec_rank = 1;
-      //   } else if (kernel_req_data.kernel_count == 8) {
-      //     kernel_sched_info.exec_rank = 1;
-      //     kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
-      //   } else if (kernel_req_data.kernel_count == 9) {
-      //     kernel_sched_info.exec_rank = 1;
-      //   }
-      // }
-      node->exec_rank = kernel_sched_info.exec_rank;
 
       // 对于master 告知scale需要扩充 此时scale新线程都未建立 不会向scale发
-      // 对于scale_rank 等建立到到这里不应该接受
-      // 对于其他rank 仍需接受
+      // 对于scale_rank 等建立到到这里不应该接收
+      // 对于其他rank 仍需接收
       // [4] [rank0][MPI] bcast (这个kernel 由哪个rank执行 依赖于哪些数据 这些数据在哪些rank上)
       //     [rank!0][MPI] bcast 接收并记录
       SendD2DKernelSchedInfo(comm_daemon, master_rank, daemon_rank, globalcount_to_onrun[syclapp_count], kernel_sched_info);
