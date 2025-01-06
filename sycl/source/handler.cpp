@@ -36,9 +36,8 @@
 #include <mqueue.h>
 #include <unistd.h>
 
+#include <detail/daemon/define.hpp>
 // #define PRINT_TRACE 1
-#define REBIND 1
-#define SCHEDULE 1
 
 extern mqd_t mq_id_daemon, mq_id_program;
 
@@ -150,14 +149,82 @@ event handler::finalize() {
     if (daemon_kernel_count < daemon_scale_count) {
       return MLastEvent;
     }
-    // scale_count也避免通信
-    // TODO 暂时不考虑scale的存在依赖
+    //【scale】传输所需数据 TODO 或执行前置kernel
     else if (daemon_kernel_count == daemon_scale_count) {
-      device exec_device = detail::ProgramManager::getInstance().globalDevices.at(detail::ProgramManager::getInstance().scale_device);
-      detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-      std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
-      MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
-    } else {
+      // ====【scale 处理依赖】
+      {
+        S2DKernelReqData kernel_req_data;
+        {
+          detail::combineAccessModesOfReqs(MRequirements);
+
+          kernel_req_data.pid = getpid();
+          kernel_req_data.kernel_count = daemon_kernel_count;
+          kernel_req_data.req_size = MRequirements.size();
+
+          for (int i = 0; i < MRequirements.size(); i++) {
+            Requirement *Req = MRequirements[i];
+
+            SyclReqData req_data;
+            req_data.mem_pointer = Req->MSYCLMemObj;
+            req_data.kernel_count = kernel_req_data.kernel_count;
+            req_data.req_count = i + 1;
+            req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
+            req_data.elem_size = static_cast<int>(Req->MElemSize);
+            req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
+
+            kernel_req_data.reqs.push_back(req_data);
+          }
+
+          std::string serialized_data = kernel_req_data.serialize();
+          size_t message_size = serialized_data.size();
+
+          mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
+          std::cout << "=== handler === Process " << getpid() << " === Scale mq_send kernel_req_data" << std::endl;
+        }
+      
+        {
+          for (int i = 0; i < MRequirements.size(); i++) {
+            int daemon_req_count = i + 1;
+            Requirement *Req = MRequirements[i];
+            if (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic) {
+              Requirement *hostReq = new Requirement(*Req);
+              EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+              hostEvent->wait(hostEvent);
+              delete hostReq;
+              std::cout << "=== handler === test_mem ==== Scale receiver add host acc" << std::endl;
+
+              using DATA_TYPE = std::byte;
+              size_t elem_size = Req->MElemSize;
+              size_t buff_size = Req->MMemoryRange.size();
+              std::cout << "=== handler === test_mem ==== Scale receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
+              SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+              SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+              void *UserPtr = BufferObj->getUserPtr();
+              DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+
+              std::vector<DATA_TYPE> host_data(elem_size * buff_size);
+              SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
+              readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
+              std::cout << "=== handler === test_mem ==== Scale data read successfully." << std::endl;
+              cleanupSharedMemory(handle, elem_size * buff_size);
+              std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
+              std::cout << "=== handler === Scale mem copy" << std::endl;
+            }
+          }
+        }
+      }
+
+      // ====【scale rebind】
+      {
+        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(detail::ProgramManager::getInstance().scale_device);
+        detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
+        std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
+      }
+    }
+    //【通用情况】
+    else {
       // ====【打包kernel内req发送给daemon】
       // 因为scheduler维护了kernel历史执行 所以不需要数据移动SameCtx判断
       // 即使SameCtx判断 有的Req可能并不在同一节点上 没有必要
@@ -178,6 +245,8 @@ event handler::finalize() {
           req_data.kernel_count = kernel_req_data.kernel_count;
           req_data.req_count = i + 1;
           req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
+          req_data.elem_size = static_cast<int>(Req->MElemSize);
+          req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
 
           kernel_req_data.reqs.push_back(req_data);
         }
@@ -213,6 +282,39 @@ event handler::finalize() {
         }
       }
 
+      // ====【scale 提供依赖】
+      if (kernel_exec_info.scale_count == -1) {
+        for (int i = 0; i < MRequirements.size(); i++) {
+          int daemon_req_count = i + 1;
+          Requirement *Req = MRequirements[i];
+          if (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic) {
+            Requirement *hostReq = new Requirement(*Req);
+            EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+            hostEvent->wait(hostEvent);
+            delete hostReq;
+            std::cout << "=== handler === test_mem ==== Scale sender add host acc" << std::endl;
+
+            using DATA_TYPE = std::byte;
+            size_t elem_size = Req->MElemSize;
+            size_t buff_size = Req->MMemoryRange.size();
+            std::cout << "=== handler === test_mem ==== Scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
+            SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+            SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+            void *UserPtr = BufferObj->getUserPtr();
+            DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+
+            SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
+            writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
+            std::cout << "=== handler === Scale send host data" << std::endl;
+
+            waitForReadCompletion(handle);
+            cleanupSharedMemory(handle, elem_size * buff_size);
+            std::cout << "=== handler === Scale waitForReadCompletion" << std::endl;
+          }
+        }
+      }
+
       // ====【处理kernel的依赖数据】
       {
         if (daemon_kernel_count != kernel_exec_info.kernel_count) {
@@ -226,34 +328,29 @@ event handler::finalize() {
             for (int i = 0; i < MRequirements.size(); i++) {
               int daemon_req_count = i + 1;
               Requirement *Req = MRequirements[i];
-              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && Req->MAccessMode == access::mode::read) {
+              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic)) {
                 Requirement *hostReq = new Requirement(*Req);
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
                 std::cout << "=== handler === test_mem ==== sender add host acc" << std::endl;
 
-                // ========【固定测试】
-                using DATA_TYPE = float;
+                using DATA_TYPE = std::byte;
+                size_t elem_size = Req->MElemSize;
+                size_t buff_size = Req->MMemoryRange.size();
+                std::cout << "=== handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
                 void *UserPtr = BufferObj->getUserPtr();
                 DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
-                // int size = 256;
-                // for(int i = 0; i < size; i++) {
-                //   std::cerr << DataPtr[i * size] << " ";
-                //   std::cerr << std::endl;
-                // }
-                std::cout << "=== handler === test_mem ==== sender get user ptr" << std::endl;
 
-                SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count);
-                writeToSharedMemory(handle, DataPtr);
-
+                SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
+                writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
                 std::cout << "=== handler === send host data" << std::endl;
 
                 waitForReadCompletion(handle);
-                cleanupSharedMemory(handle);
-
+                cleanupSharedMemory(handle, elem_size * buff_size);
                 std::cout << "=== handler === waitForReadCompletion" << std::endl;
               }
             }
@@ -267,26 +364,29 @@ event handler::finalize() {
             for (int i = 0; i < MRequirements.size(); i++) {
               int daemon_req_count = i + 1;
               Requirement *Req = MRequirements[i];
-              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && Req->MAccessMode == access::mode::read) {
+              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic)) {
                 Requirement *hostReq = new Requirement(*Req);
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
                 std::cout << "=== handler === test_mem ==== receiver add host acc" << std::endl;
 
-                using DATA_TYPE = float;
+                using DATA_TYPE = std::byte;
+                size_t elem_size = Req->MElemSize;
+                size_t buff_size = Req->MMemoryRange.size();
+                std::cout << "=== handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
                 void *UserPtr = BufferObj->getUserPtr();
                 DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
-                std::cout << "=== handler === test_mem ==== receiver get user ptr" << std::endl;
 
-                std::vector<DATA_TYPE> host_data(VECTOR_SIZE);
-                SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count);
-                readFromSharedMemory(handle, host_data.data());
+                std::vector<DATA_TYPE> host_data(elem_size * buff_size);
+                SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
+                readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
                 std::cout << "=== handler === test_mem ==== Data read successfully." << std::endl;
-                cleanupSharedMemory(handle);
-                std::memcpy(DataPtr, host_data.data(), MEMORY_SIZE);
+                cleanupSharedMemory(handle, elem_size * buff_size);
+                std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
 
                 std::cout << "=== handler === mem copy" << std::endl;
               }
@@ -472,6 +572,32 @@ event handler::finalize() {
     }    
   }
 #endif
+#endif
+
+// #define TEST_WITH_CLEAN
+#ifdef TEST_WITH_CLEAN
+  using namespace sycl::detail;
+  const auto &cmdType = getType();
+  if (cmdType == detail::CG::Kernel) {
+    detail::combineAccessModesOfReqs(MRequirements);
+    for (Requirement *Req : MRequirements) {
+      SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+      SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+
+      size_t elemSize = Req->MElemSize;
+      std::cout << "=== handler === test_mem ==== elemSize: " << elemSize << std::endl;
+
+      range<3> memoryRange = Req->MMemoryRange;
+      // size_t totalSize = memoryRange[0] * memoryRange[1] * memoryRange[2];
+      size_t totalSize = memoryRange.size();
+      std::cout << "=== handler === test_mem ==== totalSize: " << totalSize << std::endl;
+      using DATA_TYPE = std::byte;
+      std::vector<DATA_TYPE> host_data(elemSize * totalSize);
+
+      void *UserPtr = BufferObj->getUserPtr();
+      DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+    }
+  }
 #endif
 // 【END】=======================================================
   

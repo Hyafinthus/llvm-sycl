@@ -29,8 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
-#define REBIND 1
-#define SCHEDULE 1
+#include <detail/daemon/define.hpp>
 
 // +++ Entry points referenced by the offload wrapper object {
 
@@ -286,11 +285,8 @@ public:
   std::set<RTDeviceBinaryImage *>
   getRawDeviceImages(const std::vector<kernel_id> &KernelIDs);
 
-#ifdef REBIND
   std::vector<device> globalDevices;
-  // std::vector<detail::Requirement *> releaseReqs;
   int kernel_count = 0;
-#endif
 #ifdef SCHEDULE
   bool daemon_mq_opened = false;
   int scale_count = 0;

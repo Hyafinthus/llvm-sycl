@@ -59,6 +59,8 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
   int kernel_count;
   int req_count;
   acc_mode req_accmode;
+  int elem_size;
+  int buff_size;
 
   // 用于map/set/sort/priority_queue
   bool operator<(const SyclReqData &other) const {
@@ -84,7 +86,9 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
     oss << reinterpret_cast<uintptr_t>(mem_pointer) << "\n"
         << kernel_count << "\n"
         << req_count << "\n"
-        << static_cast<int>(req_accmode) << "\n";
+        << static_cast<int>(req_accmode) << "\n"
+        << elem_size << "\n"
+        << buff_size << "\n";
     return oss.str();
   }
 
@@ -99,6 +103,8 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
     int accmode;
     iss >> accmode;
     req.req_accmode = static_cast<acc_mode>(accmode);
+    iss >> req.elem_size;
+    iss >> req.buff_size;
     return req;
   }
 };
@@ -138,7 +144,7 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
 
     for (size_t i = 0; i < req_count; ++i) {
       std::string req_data_serialized;
-      for (int j = 0; j < 4; ++j) {
+      for (int j = 0; j < 6; ++j) {
         std::string line;
         std::getline(iss, line);
         req_data_serialized += line + "\n";
@@ -204,7 +210,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
 
     for (size_t i = 0; i < map_size; ++i) {
       std::string req_data_serialized;
-      for (int j = 0; j < 4; ++j) {
+      for (int j = 0; j < 6; ++j) {
         std::string line;
         std::getline(iss, line);
         req_data_serialized += line + "\n";
@@ -227,7 +233,11 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
   bool exec = false; // 是否执行
   int device_index; // 执行设备
 
-  int scale_count = 0; // 快速跳过前几个kernel
+  // 快速跳过前几个kernel
+  // 0: kernel_count从1开始 默认值
+  // >1: 告知daemon需要scale
+  // -1: 告知master提供依赖
+  int scale_count = 0;
 
   // handler只有当前kernel的req 不需处理哪个req给哪个rank 只需发送给daemon
   // exec==false: 记录当前rank需要shmem给daemon的req
@@ -322,10 +332,9 @@ struct DAGNode { // 一个kernel的依赖关系
 #define SHARED_MEMORY_WRITE_NAME_PATTERN "/sycl_shm_write_%d_%d_%d"
 #define SHARED_MEMORY_READ_NAME_PATTERN "/sycl_shm_read_%d_%d_%d"
 
-// ========【固定测试】
-using DATA_TYPE = float;
-#define VECTOR_SIZE (256*256)
-#define MEMORY_SIZE (VECTOR_SIZE * sizeof(DATA_TYPE))
+using DATA_TYPE = std::byte;
+// #define VECTOR_SIZE (256*256)
+// #define MEMORY_SIZE (VECTOR_SIZE * sizeof(DATA_TYPE))
 
 struct SharedMemoryHandle {
   int shm_fd;
@@ -337,7 +346,7 @@ struct SharedMemoryHandle {
   char sem_read_name[SHARED_MEMORY_NAME_MAX];
 };
 
-inline SharedMemoryHandle initSharedMemory(int pid, int kernel_count, int req_count) {
+inline SharedMemoryHandle initSharedMemory(int pid, int kernel_count, int req_count, int MEMORY_SIZE) {
   SharedMemoryHandle handle;
 
   sprintf(handle.shared_memory_name, SHARED_MEMORY_NAME_PATTERN, pid, kernel_count, req_count);
@@ -376,7 +385,7 @@ inline SharedMemoryHandle initSharedMemory(int pid, int kernel_count, int req_co
   return handle;
 }
 
-inline void writeToSharedMemory(SharedMemoryHandle &handle, DATA_TYPE *DataPtr) {
+inline void writeToSharedMemory(SharedMemoryHandle &handle, DATA_TYPE *DataPtr, int MEMORY_SIZE) {
   // 写入数据到共享内存
   memcpy(handle.shared_memory, DataPtr, MEMORY_SIZE);
   // 通知读取端数据已准备好
@@ -388,7 +397,7 @@ inline void waitForReadCompletion(SharedMemoryHandle &handle) {
   sem_wait(handle.sem_read);
 }
 
-inline void readFromSharedMemory(SharedMemoryHandle &handle, DATA_TYPE *DataPtr) {
+inline void readFromSharedMemory(SharedMemoryHandle &handle, DATA_TYPE *DataPtr, int MEMORY_SIZE) {
   // 等待数据准备完成
   sem_wait(handle.sem_write);
   // 读取数据
@@ -397,7 +406,7 @@ inline void readFromSharedMemory(SharedMemoryHandle &handle, DATA_TYPE *DataPtr)
   sem_post(handle.sem_read);
 }
 
-inline void cleanupSharedMemory(SharedMemoryHandle &handle) {
+inline void cleanupSharedMemory(SharedMemoryHandle &handle, int MEMORY_SIZE) {
   munmap(handle.shared_memory, MEMORY_SIZE);
   close(handle.shm_fd);
   sem_close(handle.sem_write);

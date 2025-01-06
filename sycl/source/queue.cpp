@@ -17,10 +17,9 @@
 #include <sycl/handler.hpp>
 #include <sycl/queue.hpp>
 #include <sycl/stl.hpp>
+#include <detail/daemon/define.hpp>
 
 #include <algorithm>
-
-#define REBIND 1
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {

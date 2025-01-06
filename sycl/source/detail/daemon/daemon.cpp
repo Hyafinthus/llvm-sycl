@@ -294,13 +294,16 @@ void *SystemSchedulerDaemon(void *arg) {
   int &daemon_size = program_info.daemon_size;
   int &master_rank = program_info.master_rank;
 
-  // 如果是被扩容 在handler第一次时告知 handler在包括scalecount之前都不通信
+  //【scale】在handler第一次时告知 handler在包括scalecount之前都不通信
   {
     if (globalcount_to_scalecount.find(syclapp_count) == globalcount_to_scalecount.end()) {
       std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) + " globalcount_to_scalecount not found";
       perror(errorMsg.c_str());
+      exit(1);
     }
     int scale_count = globalcount_to_scalecount[syclapp_count];
+    
+    // ====【scale 第一个kernel】
     if (scale_count > 1) {
       std::cout << "SystemSchedulerDaemon: Rank " << daemon_rank << " for PID " << local_pid << " with ScaleCount " << scale_count << " started." << std::endl;
 
@@ -331,7 +334,9 @@ void *SystemSchedulerDaemon(void *arg) {
         }
         kernel_exec_info.scale_count = scale_count;
         // ========【固定测试】
-        kernel_exec_info.device_index = 1;
+        // kernel_exec_info.exec = true;
+        // kernel_exec_info.kernel_count = 1;
+        kernel_exec_info.device_index = 1; // scalecount也用这个device
         std::string serialized_data = kernel_exec_info.serialize();
         size_t message_size = serialized_data.size();
         mq_send(mq_id_program, serialized_data.c_str(), message_size, 0);
@@ -340,11 +345,55 @@ void *SystemSchedulerDaemon(void *arg) {
     } else {
       std::cout << "SystemSchedulerDaemon: Rank " << daemon_rank << " for PID " << local_pid << " started." << std::endl;
     }
+
+    // ====【scale daemon处理依赖】
+    // 下一次接收kernel必然是scalecount
+    if (scale_count > 1) {
+      S2DKernelReqData kernel_req_data;
+      {
+        char buffer[MAX_MSG_DAEMON_SIZE];
+        ssize_t bytes_received = mq_receive(mq_id_daemon, buffer, MAX_MSG_DAEMON_SIZE, nullptr);
+        if (bytes_received > 0) {
+          std::string received_data(buffer, bytes_received);
+          kernel_req_data = S2DKernelReqData::deserialize(received_data);
+          for (SyclReqData &req : kernel_req_data.reqs) {
+            std::cout << "Rank " << daemon_rank << ": Scale mq_receive kernel_req_data pid: " << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count << " req_count: " << req.req_count << " pointer: " << req.mem_pointer << std::endl;
+          }
+        } else {
+          std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) + " DAEMON mq_receive failed";
+          perror(errorMsg.c_str());
+          exit(1);
+        }
+        std::cout << "Rank " << daemon_rank << ": Scale mq_receive kernel_req_data pid: " << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count << std::endl;
+      }
+
+      {
+        for (SyclReqData &req : kernel_req_data.reqs) {
+          if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
+            int elem_size = req.elem_size;
+            int buff_size = req.buff_size;
+            int data_rank = master_rank;
+
+            std::vector<DATA_TYPE> host_data(elem_size * buff_size);
+            MPI_Recv(host_data.data(), elem_size * buff_size, MPI_BYTE, data_rank, 0, comm_daemon, MPI_STATUS_IGNORE);
+            std::cout << "Rank " << daemon_rank << ": Scale received data from rank " << data_rank << std::endl;
+
+            SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, kernel_req_data.kernel_count, req.req_count, elem_size * buff_size);
+            writeToSharedMemory(handle, host_data.data(), elem_size * buff_size);
+            std::cout << "Rank " << daemon_rank << ": Scale write to shared" << std::endl;
+            waitForReadCompletion(handle);
+            cleanupSharedMemory(handle, elem_size * buff_size);
+            std::cout << "Rank " << daemon_rank << ": Scale waitForReadCompletion" << std::endl;
+          }
+        }
+      }
+    }
   }
 
   // 维护一个SYCLAPP的所有kernel的依赖关系 DAG相关
   std::vector<DAGNode *> kernel_dag_nodes; // 所有kernel对应的DAG
 
+  //【通用情况】
   while (1) {
     // ====【接收program通信】
     S2DKernelReqData kernel_req_data;
@@ -358,6 +407,9 @@ void *SystemSchedulerDaemon(void *arg) {
         }
         std::string received_data(buffer, bytes_received);
         kernel_req_data = S2DKernelReqData::deserialize(received_data);
+        for (SyclReqData &req : kernel_req_data.reqs) {
+          std::cout << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: " << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count << " req_count: " << req.req_count << " pointer: " << req.mem_pointer << std::endl;
+        }
       } else {
         std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) + " DAEMON mq_receive failed";
         perror(errorMsg.c_str());
@@ -396,27 +448,27 @@ void *SystemSchedulerDaemon(void *arg) {
         // A dep no - rank1
         // B dep no - rank0
         // C dep A:rank1, B:rank0 - rank1
-        // if (daemon_rank == 1) {
-        //   if (kernel_req_data.kernel_count == 1) {
-        //     // A
-        //     kernel_sched_info.exec_rank = 1;
-        //   } else if (kernel_req_data.kernel_count == 2) {
-        //     // B
-        //     kernel_sched_info.exec_rank = 1;
-        //     // {
-        //     //   std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
-        //     //   pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
-        //     //   pid_to_scalecount_cv[local_pid]->notify_one();
-        //     // }
-        //     // scale = true;
-        //     // std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
-        //   } else if (kernel_req_data.kernel_count == 3) {
-        //     // C
-        //     kernel_sched_info.exec_rank = 1;
-        //     // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
-        //     // kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
-        //   }
-        // }
+        if (kernel_req_data.kernel_count == 1) {
+          kernel_sched_info.exec_rank = 1;
+        } else if (kernel_req_data.kernel_count == 2) {
+          // A
+          kernel_sched_info.exec_rank = 1;
+        } else if (kernel_req_data.kernel_count == 3) {
+          // B
+          kernel_sched_info.exec_rank = 0;
+          {
+            std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+            pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+            pid_to_scalecount_cv[local_pid]->notify_one();
+          }
+          scale = true;
+          std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
+        } else if (kernel_req_data.kernel_count == 4) {
+          // C
+          kernel_sched_info.exec_rank = 1;
+          kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
+          kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+        }
         // ========【固定测试】calc 在daemon决定执行rank 后续还要彼此通信 scale决定还要通知daemon
         // if (daemon_rank == 1) {
         //   if (kernel_req_data.kernel_count == 1) {
@@ -446,7 +498,7 @@ void *SystemSchedulerDaemon(void *arg) {
         //     kernel_sched_info.exec_rank = 1;
         //   }
         // }
-        node->exec_rank = kernel_sched_info.exec_rank;
+        // node->exec_rank = kernel_sched_info.exec_rank;
       }
 
       // 对于master 告知scale需要扩充 此时scale新线程都未建立 不会向scale发
@@ -473,6 +525,9 @@ void *SystemSchedulerDaemon(void *arg) {
         exit(1);
       }
 
+      if (scale) {
+        kernel_exec_info.scale_count = -1;
+      }
       kernel_exec_info.kernel_count = kernel_sched_info.kernel_count;
       if (daemon_rank == kernel_sched_info.exec_rank) {
         kernel_exec_info.exec = true;
@@ -514,7 +569,27 @@ void *SystemSchedulerDaemon(void *arg) {
       std::string serialized_data = kernel_exec_info.serialize();
       size_t message_size = serialized_data.size();
       mq_send(mq_id_program, serialized_data.c_str(), message_size, 0);
-      std::cout << "Rank " << daemon_rank << ": mq_send kernel_exec_info exec: " << kernel_exec_info.exec << std::endl;
+      std::cout << "Rank " << daemon_rank << ": mq_send kernel_exec_info exec: " << kernel_exec_info.exec << " req_counts.size: " << kernel_exec_info.req_counts.size() << std::endl;
+    }
+
+    // ====【scale 向daemon发送依赖数据】
+    // master发送 若其他rank发送还需等待master通知 默认scale所需master都有最新
+    if (scale) {
+      for (SyclReqData &req : kernel_req_data.reqs) {
+        if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
+          int elem_size = req.elem_size;
+          int buff_size = req.buff_size;
+
+          std::vector<DATA_TYPE> host_data(elem_size * buff_size);
+          SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, kernel_req_data.kernel_count, req.req_count, elem_size * buff_size);
+          readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
+          std::cout << "Rank " << daemon_rank << ": Scale data read successfully." << std::endl;
+          cleanupSharedMemory(handle, elem_size * buff_size);
+
+          MPI_Send(host_data.data(), elem_size * buff_size, MPI_BYTE, kernel_sched_info.exec_rank, 0, comm_daemon);
+          std::cout << "Rank " << daemon_rank << ": Scale sent data to rank " << kernel_sched_info.exec_rank << std::endl;
+        }
+      }
     }
 
     // ====【为执行的rank满足依赖】
@@ -527,43 +602,43 @@ void *SystemSchedulerDaemon(void *arg) {
         std::cout << "Rank " << daemon_rank << ": Exec Rank: " << kernel_sched_info.exec_rank << " need data from other" << std::endl;
         // 此rank不执行kernel 且kernel有依赖此rank的数据
         if (daemon_rank != kernel_sched_info.exec_rank && req_for_rank.size() > 0) {
-          for (int i = 0; i < kernel_exec_info.req_counts.size(); i++) {
+          for (SyclReqData &req : req_for_rank) {
+            // std::cout << "Rank " << daemon_rank << ": Req " << i << std::endl;x x x x x x
             // [6] 从SYCL进程接受host的data
             // 因为是写读共享内存是阻塞的 不需要等待SYCL进程的通知
-            std::vector<DATA_TYPE> host_data(VECTOR_SIZE);
-            SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, kernel_sched_info.kernel_count, kernel_exec_info.req_counts[i]);
-            readFromSharedMemory(handle, host_data.data());
+            int elem_size = req.elem_size;
+            int buff_size = req.buff_size;
+
+            std::vector<DATA_TYPE> host_data(elem_size * buff_size);
+            SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, kernel_sched_info.kernel_count, req.req_count, elem_size * buff_size);
+            readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
             std::cout << "Rank " << daemon_rank << ": Data read successfully." << std::endl;
-            cleanupSharedMemory(handle);
+            cleanupSharedMemory(handle, elem_size * buff_size);
 
             // [7] [双rank][MPI] isend:host->buffer
-            MPI_Send(host_data.data(), VECTOR_SIZE, MPI_FLOAT, kernel_sched_info.exec_rank, 0, comm_daemon);
+            MPI_Send(host_data.data(), elem_size * buff_size, MPI_BYTE, kernel_sched_info.exec_rank, 0, comm_daemon);
             std::cout << "Rank " << daemon_rank << ": Sent data to rank " << kernel_sched_info.exec_rank << std::endl;
           }
         }
 
         // 此rank执行kernel 且必然需要从其他rank拿数据
         if (daemon_rank == kernel_sched_info.exec_rank) {
-          for (int i = 0; i < kernel_exec_info.req_counts.size(); i++) {
-            SyclReqData &req = req_for_rank[i];
+          for (SyclReqData &req : req_for_rank) {
+            int elem_size = req.elem_size;
+            int buff_size = req.buff_size;
             int data_rank = kernel_sched_info.req_rank[req];
-            // if (daemon_rank == data_rank) {
-            //   std::cout << "Rank " << daemon_rank << "req " << i << ": Data from self" << std::endl;
-            //   continue;
-            // }
 
-            std::vector<DATA_TYPE> host_data(VECTOR_SIZE);
+            std::vector<DATA_TYPE> host_data(elem_size * buff_size);
             // [7] [双rank][MPI] irecv:buffer->host
-            MPI_Recv(host_data.data(), VECTOR_SIZE, MPI_FLOAT, data_rank, 0, comm_daemon, MPI_STATUS_IGNORE);
+            MPI_Recv(host_data.data(), elem_size * buff_size, MPI_BYTE, data_rank, 0, comm_daemon, MPI_STATUS_IGNORE);
             std::cout << "Rank " << daemon_rank << ": Received data from rank " << data_rank << std::endl;
 
             // [8] 把从其他rank接受的data发给SYCL进程
-            SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, kernel_sched_info.kernel_count, kernel_exec_info.req_counts[i]);
-            writeToSharedMemory(handle, host_data.data());
+            SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, kernel_sched_info.kernel_count, req.req_count, elem_size * buff_size);
+            writeToSharedMemory(handle, host_data.data(), elem_size * buff_size);
             std::cout << "Rank " << daemon_rank << ": Write to shared" << std::endl;
             waitForReadCompletion(handle);
-            cleanupSharedMemory(handle);
-
+            cleanupSharedMemory(handle, elem_size * buff_size);
             std::cout << "Rank " << daemon_rank << ": waitForReadCompletion" << std::endl;
           }
         }
@@ -648,7 +723,7 @@ void *SystemSchedulerScale(void *arg) {
         queue->pop();
         std::cout << "SYCLAPP_Rank " << syclapp_rank << " scale_count: " << scale_pair.first << " rank: " << scale_pair.second << std::endl;
       
-        // ========【固定测试】
+        // DISCARD 不应该在Scale选择扩容的rank 否则要多一次向Daemon通信rank
         // int scale_rank;
         // for (int i = 0; i < submit_size; i++) {
         //   if (globalcount_to_onrun[syclapp_count].find(i) == globalcount_to_onrun[syclapp_count].end()) {

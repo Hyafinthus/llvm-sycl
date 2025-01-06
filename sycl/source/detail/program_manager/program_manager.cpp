@@ -33,9 +33,8 @@
 #include <sycl/stl.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 
+#include <detail/daemon/define.hpp>
 // #define PRINT_TRACE 1
-#define REBIND 1
-#define SCHEDULE 1
 
 #include <algorithm>
 #include <cassert>
@@ -1057,12 +1056,6 @@ ProgramManager::~ProgramManager() {
 
   std::cout << "Process " << getpid() <<": Message queue closed" << std::endl;
 }
-// #elif defined(REBIND)
-// ProgramManager::~ProgramManager() {
-//   for (detail::Requirement *Reqs : releaseReqs) {
-//     detail::Scheduler::getInstance().releaseHostAccessor(Reqs);
-//   }
-// }
 #else
 ProgramManager::~ProgramManager() = default;
 #endif

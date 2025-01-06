@@ -14,8 +14,7 @@
 #include <sycl/device.hpp>
 #include <sycl/device_selector.hpp>
 #include <sycl/info/info_desc.hpp>
-
-#define REBIND 1
+#include <detail/daemon/define.hpp>
 
 #include <algorithm>
 

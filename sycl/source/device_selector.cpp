@@ -17,13 +17,14 @@
 #include <sycl/exception.hpp>
 #include <sycl/ext/oneapi/filter_selector.hpp>
 #include <sycl/stl.hpp>
+#include <detail/daemon/define.hpp>
 // 4.6.1 Device selection class
 
 #include <algorithm>
 #include <cctype>
 #include <regex>
 
-#define REBIND 1
+
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
