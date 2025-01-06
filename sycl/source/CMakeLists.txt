@@ -5,6 +5,7 @@
 #include(AddLLVM)
 
 find_package(MPI REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/version.rc.in
@@ -291,11 +292,13 @@ add_executable(sycl-submit
 
 target_include_directories(sycl-daemon PRIVATE
   # ${SYCL_INCLUDE_DIR}
+  ${CUDAToolkit_INCLUDE_DIRS}
   ${MPI_CXX_INCLUDE_PATH}
 )
 target_link_libraries(sycl-daemon
   rt
   pthread
+  CUDA::nvml
   ${MPI_CXX_LIBRARIES}
 )
 
