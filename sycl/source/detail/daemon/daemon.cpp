@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <signal.h>
 #include <unistd.h>
 #include <mqueue.h>
@@ -7,6 +8,7 @@
 #include <mpi.h>
 #include <mutex>
 #include <condition_variable>
+#include <nvml.h>
 
 #include "daemon.hpp"
 // #include <sycl/access/access.hpp>
@@ -28,7 +30,7 @@ std::map<int, int> globalcount_to_scalecount; // globalcount_对于本rank从哪
 std::unordered_map<pid_t, std::shared_ptr<std::queue<std::pair<int, int>>>> pid_to_scalecount_queue; // pid_扩容kernelcount_执行rank
 std::unordered_map<pid_t, std::shared_ptr<std::mutex>> pid_to_scalecount_mutex; // pid_扩容kernelcount_mutex
 std::unordered_map<pid_t, std::shared_ptr<std::condition_variable>> pid_to_scalecount_cv; // pid_扩容kernelcount_cv
-
+std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
 // ====【MPI】
 int mpi_rank, mpi_size; // main
 MPI_Comm comm_submit; // SystemSchedulerSubmit
@@ -229,11 +231,154 @@ int mostDepdRank(std::map<SyclReqData, int> &req_rank) {
   return max_rank;
 }
 
-void SystemMonitor() {
-  while(1) {
-    {
+void CPUMonitor() {
+  std::ifstream file;
+  std::string line;
 
+  static CpuTimes prev, curr;
+  file.open("/proc/stat");
+  if(!file.is_open()) {
+    std::string errorMsg = "Error: Rank " + std::to_string(mpi_rank) + " /proc/stat open failed";
+    perror(errorMsg.c_str());
+    return;
+  }
+
+  while (std::getline(file, line)) {
+      if (line.substr(0, 3) == "cpu") {
+          std::sscanf(line.c_str(), "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                      &curr.user, &curr.nice, &curr.system, &curr.idle,
+                      &curr.iowait, &curr.irq, &curr.softirq, &curr.steal);
+          break;
+      }
+  }
+  file.close();
+
+  unsigned long long prevIdle = prev.idle + prev.iowait;
+  unsigned long long currIdle = curr.idle + curr.iowait;
+
+  unsigned long long prevTotal = prevIdle + prev.user + prev.nice + prev.system + prev.irq + prev.softirq + prev.steal;
+  unsigned long long currTotal = currIdle + curr.user + curr.nice + curr.system + curr.irq + curr.softirq + curr.steal;
+
+  unsigned long long totalDiff = currTotal - prevTotal;
+  unsigned long long idleDiff = currIdle - prevIdle;
+
+  double utilization = totalDiff ? (1.0 - (double)idleDiff / totalDiff) * 100.0 : 0.0;
+  // std::cout << "CPU Utilization: " << utilization << "%" << std::endl;
+  prev = curr;
+
+  size_t mem_available;
+  file.open("/proc/meminfo");
+  if(!file.is_open()) {
+    std::string errorMsg = "Error: Rank " + std::to_string(mpi_rank) + " /proc/meminfo open failed";
+    perror(errorMsg.c_str());
+    return;
+  }
+
+  while (std::getline(file, line)) {
+      if (line.find("MemAvailable:") == 0) {
+          std::sscanf(line.c_str(), "MemAvailable: %llu kB", &mem_available);
+          break;
+      }
+  }
+  file.close();
+  // std::cout << "Memory available: " << mem_available << " kB" << std::endl;
+
+  device_monitor_info[0] = MonitorInfo{"CPU", utilization, mem_available};
+}
+
+int MonitorInit() {
+  nvmlReturn_t result;
+  
+  result = nvmlInit();
+  if (result != NVML_SUCCESS) {
+    std::string errorMsg = "Failed to initialize NVML: " + std::string(nvmlErrorString(result));
+    perror(errorMsg.c_str());
+    return -1;
+  }
+
+  unsigned int device_count = 0;
+  result = nvmlDeviceGetCount(&device_count);
+  if (result != NVML_SUCCESS) {
+      std::string errorMsg = "Failed to get device count: " + std::string(nvmlErrorString(result));
+      perror(errorMsg.c_str());
+
+      nvmlShutdown();
+      return -1;
+  }
+  std::cout << "Number of GPUs: " << device_count << std::endl;
+
+  return device_count;
+}
+
+void CudaMonitor(int device_count) {
+  nvmlReturn_t result;
+
+  for (unsigned int i = 0; i < device_count; ++i) {
+      nvmlDevice_t device;
+      char name[NVML_DEVICE_NAME_BUFFER_SIZE];
+      nvmlUtilization_t utilization;
+      nvmlMemory_t memoryInfo;
+
+      result = nvmlDeviceGetHandleByIndex(i, &device);
+      if (result != NVML_SUCCESS) {
+        std::string errorMsg = "Failed to get handle for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
+        perror(errorMsg.c_str());
+        continue;
+      }
+
+      result = nvmlDeviceGetName(device, name, NVML_DEVICE_NAME_BUFFER_SIZE);
+      if (result != NVML_SUCCESS) {
+        std::string errorMsg = "Failed to get name for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
+        perror(errorMsg.c_str());
+        continue;
+      }
+
+      result = nvmlDeviceGetUtilizationRates(device, &utilization);
+      if (result != NVML_SUCCESS) {
+        std::string errorMsg = "Failed to get utilization for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
+        perror(errorMsg.c_str());
+        continue;
+      }
+
+      // std::cout << "GPU " << i << " (" << name << "):" << std::endl;
+      // std::cout << "  GPU Utilization: " << utilization.gpu << "%" << std::endl;
+      // std::cout << "  Memory Utilization: " << utilization.memory << "%" << std::endl;
+
+      result = nvmlDeviceGetMemoryInfo(device, &memoryInfo);
+      if (result != NVML_SUCCESS) {
+        std::string errorMsg = "Failed to get memory info for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
+        perror(errorMsg.c_str());
+        continue;
+      }
+
+      // std::cout << "GPU " << i << " (" << name << "):" << std::endl;
+      // std::cout << "  Memory Total: " << memoryInfo.total / 1024.0 << " kB" << std::endl;
+      // std::cout << "  Memory Used: " << memoryInfo.used / 1024.0 << " kB" << std::endl;
+      // std::cout << "  Memory Free: " << memoryInfo.free / 1024.0 << " kB" << std::endl;
+
+      device_monitor_info[i + 1] = MonitorInfo{name, utilization.gpu, memoryInfo.free / 1024.0};
+  }
+}
+
+void SystemMonitor() {
+  int device_count = MonitorInit();
+  if (device_count != -1) {
+    device_monitor_info.resize(device_count + 1);
+  }
+  
+  while(1) {
+    CPUMonitor();
+    
+    if(device_count != -1) {
+      CudaMonitor(device_count);
     }
+
+    for(int i = 0; i < device_monitor_info.size(); i++) {
+      std::cout << "Device " << i << " (" << device_monitor_info[i].name << "):" << std::endl;
+      std::cout << "  Utilization: " << device_monitor_info[i].util_used << "%" << std::endl;
+      std::cout << "  Memory Available: " << device_monitor_info[i].mem_available << " kB" << std::endl;
+    }
+
     usleep(MONITOR_INTERVAL);
   }
 }
@@ -731,7 +876,7 @@ int main(int argc, char *argv[]) {
 
   // ====【pthread】
   pthread_t monitor_tid, submit_tid;
-  // pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemMonitor, NULL);
+  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemMonitor, NULL);
   pthread_create(&submit_tid, NULL, (void *(*)(void *))SystemSchedulerSubmit, NULL);
   std::cout << "MPI_Rank " << mpi_rank << ": SystemSchedulerSubmit started" << std::endl;
 

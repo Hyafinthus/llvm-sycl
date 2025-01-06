@@ -29,7 +29,7 @@ enum class acc_mode {
 #ifndef MESSAGE_QUEUE
 #define MESSAGE_QUEUE
 
-#define MONITOR_INTERVAL 500 // us
+#define MONITOR_INTERVAL 50000 // us
 
 #define MAX_MSG_NUM 10
 
@@ -307,6 +307,16 @@ struct DAGNode { // 一个kernel的依赖关系
   // bool executed = false; // ？
 
   DAGNode(const std::vector<SyclReqData> &reqs) : req_data(reqs) {}
+};
+
+struct CpuTimes {
+  unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+};
+
+struct MonitorInfo {
+  std::string name;
+  double util_used;
+  size_t mem_available; //kB
 };
 
 #endif
