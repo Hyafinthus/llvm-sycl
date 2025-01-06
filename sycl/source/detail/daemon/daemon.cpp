@@ -173,7 +173,7 @@ std::map<int, int> map_rank_syclapp_submit(const std::vector<int>& exec_flags) {
   return rank_syclapp_to_submit;
 }
 
-std::map<SyclReqData, int> generateDAG(std::vector<DAGNode *> &kernel_dag_nodes, DAGNode *node) {
+std::map<SyclReqData, std::set<int>> generateDAG(std::vector<DAGNode *> &kernel_dag_nodes, DAGNode *node) {
   // 一个kernel内的依赖关系对分析没有影响 重点在于kernel间相同mem的依赖关系 (在保证执行顺序的前提下)
   // read: 必然无依赖 - 依赖前序kernel相同mem的写
   // write: 可能读其他mem (仍需要加载到设备内存) - 不依赖前序kernel (依赖的mem已在read中)
@@ -183,42 +183,69 @@ std::map<SyclReqData, int> generateDAG(std::vector<DAGNode *> &kernel_dag_nodes,
   // atomic: 单线程执行=视作读写 - 依赖前序kernel相同mem的写
 
   // **注意** SyclReqData相memptr会视作同一个对象 单kernelcount和reqcount不同 必须使用当前kernel生成的对象 后续会用到两个count
-  std::map<SyclReqData, int> req_rank;
+  std::map<SyclReqData, std::set<int>> req_ranks;
 
-  // TODO 因需要读一个数组会从执行的rank拷贝 所以数据最新拷贝可能在多个rank存在
-
+  // 【优化】因需要读一个数组会从执行的rank拷贝 所以数据最新拷贝可能在多个rank存在
+  // write: 在最近被写过的kernel上必然是最新的
+  // read: 同时在最近被写 之后读过的所有rank 因会从写处拷回host并通信传输 也是最新的
   for (SyclReqData &req : node->req_data) {
     // 依赖前序kernel相同mem的写 read | read_write | atomic
     if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
       // 由后向前遍历kernel 找到相同mem最近的写作为依赖
+      bool found_write = false;
       for (auto it = kernel_dag_nodes.rbegin(); it != kernel_dag_nodes.rend(); ++it) {
         DAGNode *prev_node = *it;
-        bool found = false;
         for (SyclReqData &prev_req : prev_node->req_data) {
-          // std::cout << "generateDAG: Rank " << node->exec_rank << " prev_req_mem_pointer: " << prev_req.mem_pointer << " prev_req_accmode: " << static_cast<int>(prev_req.req_accmode) << std::endl;
-          if (prev_req.mem_pointer == req.mem_pointer && prev_req.req_accmode != acc_mode::read) {
-            node->depend_on.push_back(prev_node);
-            prev_node->depend_by.push_back(node);
-            req_rank[req] = prev_node->exec_rank;
-            found = true;
-            break;
+          if (prev_req.mem_pointer == req.mem_pointer) {
+            if (prev_req.req_accmode != acc_mode::read) {
+              node->depend_on.push_back(prev_node);
+              prev_node->depend_by.push_back(node);
+              req_ranks[req].insert(prev_node->exec_rank);
+              found_write = true;
+              break;
+            }
+            else { // 优化
+              req_ranks[req].insert(prev_node->exec_rank);
+            }
           }
         }
-        if (found) {
+        if (found_write) {
           break;
         }
       }
     }
   }
+  // DISCARD 【优化】写后被读的rank可以作为依赖
+  // std::map<SyclReqData, int> req_rank;
+  // for (auto it = kernel_dag_nodes.rbegin(); it != kernel_dag_nodes.rend(); ++it) {
+  //   DAGNode *prev_node = *it;
+  //   bool found = false;
+  //   for (SyclReqData &prev_req : prev_node->req_data) {
+  //     std::cout << "generateDAG: Rank " << node->exec_rank << " prev_req_mem_pointer: " << prev_req.mem_pointer << " prev_req_accmode: " << static_cast<int>(prev_req.req_accmode) << std::endl;
+  //     if (prev_req.mem_pointer == req.mem_pointer && prev_req.req_accmode != acc_mode::read) {
+  //       node->depend_on.push_back(prev_node);
+  //       prev_node->depend_by.push_back(node);
+  //       req_rank[req] = prev_node->exec_rank;
+  //       found = true;
+  //       break;
+  //     }
+  //   }
+  //   if (found) {
+  //     break;
+  //   }
+  // }
 
   kernel_dag_nodes.push_back(node);
-  return req_rank;
+  return req_ranks;
 }
 
-int mostDepdRank(std::map<SyclReqData, int> &req_rank) {
+// TODO 根据数据量判断不同rank所需的总体通信量
+int mostDepdRank(std::map<SyclReqData, std::set<int>> &req_ranks) {
   std::map<int, int> rank_count;
-  for (auto pair : req_rank) {
-    rank_count[pair.second]++;
+  for (auto pair : req_ranks) {
+    for (int rank : pair.second) {
+      rank_count[rank]++;
+    }
   }
   int max_count = 0;
   int max_rank = -1;
@@ -229,6 +256,24 @@ int mostDepdRank(std::map<SyclReqData, int> &req_rank) {
     }
   }
   return max_rank;
+}
+
+// TODO 同一个req在多个rank上有最新时的选择方案 尽量集中还是分散？
+std::map<SyclReqData, int> chooseReqRank(std::map<SyclReqData, std::set<int>> &req_ranks, int rank) {
+  std::map<SyclReqData, int> req_rank;
+  for (auto pair : req_ranks) {
+    if (pair.second.find(rank) != pair.second.end()) {
+      req_rank[pair.first] = rank;
+    }
+    // 在集合中随机选一个
+    else {
+      int rand_index = rand() % pair.second.size();
+      auto it = pair.second.begin();
+      std::advance(it, rand_index);
+      req_rank[pair.first] = *it;
+    }
+  }
+  return req_rank;
 }
 
 void CPUMonitor() {
@@ -472,31 +517,25 @@ void *SystemSchedulerDaemon(void *arg) {
     {
       if (daemon_rank == master_rank) {
         // [1] [rank0] 构建DAG 确定依赖的kernel 查找依赖的kernel在哪个rank执行
-        // for (SyclReqData req : kernel_req_data.reqs) {
-        //   std::cout << "Rank " << daemon_rank << " req: " << req.kernel_count << "-" << req.req_count << " pointer: " << req.mem_pointer << std::endl;
-        // }
         DAGNode *node = new DAGNode(kernel_req_data.reqs);
-        std::map<SyclReqData, int> req_rank = generateDAG(kernel_dag_nodes, node);
-        for (auto pair : req_rank) {
-          std::cout << "Rank " << daemon_rank << " req_rank: " << pair.first.kernel_count << "-" << pair.first.req_count << " pointer: " << pair.first.mem_pointer << " rank: " << pair.second << std::endl;
+        std::map<SyclReqData, std::set<int>> req_ranks = generateDAG(kernel_dag_nodes, node);
+        for (auto pair : req_ranks) {
+          std::cout << "Rank " << daemon_rank << " req_rank: " << pair.first.kernel_count << "-" << pair.first.req_count << " pointer: " << pair.first.mem_pointer << " rank: ";
+          for (int rank : pair.second) {
+            std::cout << rank << " ";
+          }
+          std::cout << std::endl;
         }
         kernel_sched_info.kernel_count = kernel_req_data.kernel_count;
-        kernel_sched_info.req_rank = req_rank;
-        // TODO 确定kernel是无依赖 还是依赖于某个kernel/某些数据 确定最适合的rank与设备
-        // TODO 2 [allrank] 其他调度决策(设备负载/性能预测)
-        // TODO 3 [rank0] 确定执行执行rank
-        // 如果无依赖 先看本rank是否有空闲device 如果无则扩容至其他rank
-        // 如果有依赖 检查依赖最多的数据在哪个rank 在该rank上执行
-        // TODO 判断通信开销和计算开销
+        // TODO 2 [allrank] 调度决策(设备负载/性能预测/通信开销/计算开销)
         // 在master上只需要确认rank是否还有device空闲 具体的device应由各daemon监控和选择
-        // TODO 调用设备监控确认是否有空闲device
-        int most_rank = mostDepdRank(req_rank);
-        if (most_rank == -1) {
+        int most_rank = mostDepdRank(req_ranks);
+        if (most_rank == -1) { // 没依赖 master有空闲就执行 无空闲应该扩容
           kernel_sched_info.exec_rank = daemon_rank;
-        } else {
+        } else { // 有依赖 有最多依赖的rank
           kernel_sched_info.exec_rank = most_rank;
         }
-        // TODO 确定是否有空闲device
+        kernel_sched_info.req_rank = chooseReqRank(req_ranks, daemon_rank);
 
         // ========【固定测试】3mm
         // A dep no - rank1
