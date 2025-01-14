@@ -179,7 +179,7 @@ event handler::finalize() {
           size_t message_size = serialized_data.size();
 
           mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
-          std::cout << "=== handler === Process " << getpid() << " === Scale mq_send kernel_req_data" << std::endl;
+          std::cout << getpid() << " === handler === Process " << getpid() << " === Scale mq_send kernel_req_data" << std::endl;
         }
       
         {
@@ -191,12 +191,12 @@ event handler::finalize() {
               EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
               hostEvent->wait(hostEvent);
               delete hostReq;
-              std::cout << "=== handler === test_mem ==== Scale receiver add host acc" << std::endl;
+              std::cout << getpid() << " === handler === test_mem ==== Scale receiver add host acc" << std::endl;
 
               using DATA_TYPE = std::byte;
               size_t elem_size = Req->MElemSize;
               size_t buff_size = Req->MMemoryRange.size();
-              std::cout << "=== handler === test_mem ==== Scale receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+              std::cout << getpid() << " === handler === test_mem ==== Scale receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
               SYCLMemObjI *MemObj = Req->MSYCLMemObj;
               SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -206,10 +206,10 @@ event handler::finalize() {
               std::vector<DATA_TYPE> host_data(elem_size * buff_size);
               SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
               readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
-              std::cout << "=== handler === test_mem ==== Scale data read successfully." << std::endl;
+              std::cout << getpid() << " === handler === test_mem ==== Scale data read successfully." << std::endl;
               cleanupSharedMemory(handle, elem_size * buff_size);
               std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
-              std::cout << "=== handler === Scale mem copy" << std::endl;
+              std::cout << getpid() << " === handler === Scale mem copy" << std::endl;
             }
           }
         }
@@ -219,7 +219,7 @@ event handler::finalize() {
       {
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(detail::ProgramManager::getInstance().scale_device);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-        std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
         MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
       }
     }
@@ -255,7 +255,7 @@ event handler::finalize() {
         size_t message_size = serialized_data.size();
 
         mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
-        std::cout << "=== handler === Process " << getpid() << " === mq_send kernel_req_data" << std::endl;
+        std::cout << getpid() << " === handler === Process " << getpid() << " === mq_send kernel_req_data" << std::endl;
       }
 
       // ====【接收daemon执行决策】
@@ -275,10 +275,10 @@ event handler::finalize() {
         if (kernel_exec_info.scale_count > 1) {
           daemon_scale_count = kernel_exec_info.scale_count;
           detail::ProgramManager::getInstance().scale_device = kernel_exec_info.device_index;
-          std::cout << "=== handler === Process " << getpid() << " === scale_count: " << daemon_scale_count << " device_index: " << kernel_exec_info.device_index << std::endl;
+          std::cout << getpid() << " === handler === Process " << getpid() << " === scale_count: " << daemon_scale_count << " device_index: " << kernel_exec_info.device_index << std::endl;
           return MLastEvent;
         } else {
-          std::cout << "=== handler === Process " << getpid() << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count << " exec: " << kernel_exec_info.exec << " device_index: " << kernel_exec_info.device_index << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
+          std::cout << getpid() << " === handler === Process " << getpid() << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count << " exec: " << kernel_exec_info.exec << " device_index: " << kernel_exec_info.device_index << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       }
 
@@ -292,12 +292,12 @@ event handler::finalize() {
             EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
             hostEvent->wait(hostEvent);
             delete hostReq;
-            std::cout << "=== handler === test_mem ==== Scale sender add host acc" << std::endl;
+            std::cout << getpid() << " === handler === test_mem ==== Scale sender add host acc" << std::endl;
 
             using DATA_TYPE = std::byte;
             size_t elem_size = Req->MElemSize;
             size_t buff_size = Req->MMemoryRange.size();
-            std::cout << "=== handler === test_mem ==== Scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+            std::cout << getpid() << " === handler === test_mem ==== Scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
             SYCLMemObjI *MemObj = Req->MSYCLMemObj;
             SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -306,19 +306,20 @@ event handler::finalize() {
 
             SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
             writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
-            std::cout << "=== handler === Scale send host data" << std::endl;
+            std::cout << getpid() << " === handler === Scale send host data" << std::endl;
 
             waitForReadCompletion(handle);
             cleanupSharedMemory(handle, elem_size * buff_size);
-            std::cout << "=== handler === Scale waitForReadCompletion" << std::endl;
+            std::cout << getpid() << " === handler === Scale waitForReadCompletion" << std::endl;
           }
         }
+        return MLastEvent; // 提供完不执行要返回
       }
 
-      // ====【处理kernel的依赖数据】
-      {
+      // ====【处理kernel的依赖数据】scale完就不需要走这段流程
+      else {
         if (daemon_kernel_count != kernel_exec_info.kernel_count) {
-          std::cout << "=== handler === Process " << getpid() << " === kernel count not match" << std::endl;
+          std::cout << getpid() << " === handler === Process " << getpid() << " === kernel count not match" << std::endl;
           exit(1);
         }
         auto &req_counts = kernel_exec_info.req_counts;
@@ -333,12 +334,12 @@ event handler::finalize() {
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << "=== handler === test_mem ==== sender add host acc" << std::endl;
+                std::cout << getpid() << " === handler === test_mem ==== sender add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << "=== handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                std::cout << getpid() << " === handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -347,15 +348,15 @@ event handler::finalize() {
 
                 SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
                 writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
-                std::cout << "=== handler === send host data" << std::endl;
+                std::cout << getpid() << " === handler === send host data" << std::endl;
 
                 waitForReadCompletion(handle);
                 cleanupSharedMemory(handle, elem_size * buff_size);
-                std::cout << "=== handler === waitForReadCompletion" << std::endl;
+                std::cout << getpid() << " === handler === waitForReadCompletion" << std::endl;
               }
             }
           }
-          std::cout << "=== handler === kernel_count: " << daemon_kernel_count << " MLastEvent: " << &MLastEvent << std::endl;
+          std::cout << getpid() << " === handler === kernel_count: " << daemon_kernel_count << " MLastEvent: " << &MLastEvent << std::endl;
           return MLastEvent;
         }
         // 如果执行 需要等待可能的通信数据 也需要host 被用的时候再从host->device
@@ -369,12 +370,12 @@ event handler::finalize() {
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << "=== handler === test_mem ==== receiver add host acc" << std::endl;
+                std::cout << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << "=== handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                std::cout << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -384,11 +385,11 @@ event handler::finalize() {
                 std::vector<DATA_TYPE> host_data(elem_size * buff_size);
                 SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
                 readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
-                std::cout << "=== handler === test_mem ==== Data read successfully." << std::endl;
+                std::cout << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
                 cleanupSharedMemory(handle, elem_size * buff_size);
                 std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
 
-                std::cout << "=== handler === mem copy" << std::endl;
+                std::cout << getpid() << " === handler === mem copy" << std::endl;
               }
             }
           }
@@ -399,7 +400,7 @@ event handler::finalize() {
       if (kernel_exec_info.exec) {
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(kernel_exec_info.device_index);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-        std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
         MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
       }
     }
@@ -423,7 +424,7 @@ event handler::finalize() {
       // graph_builder里用Mrequirements和MEvents构建依赖图
       detail::combineAccessModesOfReqs(MRequirements);
       std::vector<Command *> ToEnqueue; // scheduler.cpp中的AuxiliaryCmds
-      std::cout << "=== handler === BEFORE REQS" << std::endl;
+      std::cout << getpid() << " === handler === BEFORE REQS" << std::endl;
 
       // 在gloabal_handler初始化时获取所有device，并循环判断如果使用每个device的queue会造成几次数据移动
       for (device tempD : detail::ProgramManager::getInstance().globalDevices) {
@@ -431,40 +432,40 @@ event handler::finalize() {
         MQueue.reset(new detail::queue_impl(tempDP, detail::queue_impl::getDefaultOrNew(tempDP), MQueue->getAsyncHandler(), MQueue->getPropList()));
         int notSameCtxCount = 0;
 
-        std::cout << "=== handler === TRY: " << tempD.get_info<info::device::name>() << std::endl;
+        std::cout << getpid() << " === handler === TRY: " << tempD.get_info<info::device::name>() << std::endl;
         for (Requirement *Req : MRequirements) {
           // Req->MAccessMode
           MemObjRecord *record = nullptr;
           AllocaCommandBase *allocaCmd = nullptr;
           bool isSameCtx = false;
-          // std::cout << "=== handler === req 1"<< std::endl;
+          // std::cout << getpid() << " === handler === req 1"<< std::endl;
 
           // SYCLMemObj生命周期由用户代码管理 MemObjRecord生命周期由syclrt管理
           // SYCLMemObjI *MemObject = Req->MSYCLMemObj;
           // MemObjRecord *Record = getMemObjRecord(MemObject);
           //                      = MemObject->MRecord.get();
           record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
-          std::cout << "=== handler === test_mem ==== record: " << record << std::endl;
+          std::cout << getpid() << " === handler === test_mem ==== record: " << record << std::endl;
 
           // 不清楚具体逻辑 不需要
           // detail::Scheduler::getInstance().MGraphBuilder.markModifiedIfWrite(record, Req);
           
           // 如果找不到对应的allocaCmd就创建了 不对需要销毁 如何销毁？
           // allocaCmd = detail::Scheduler::getInstance().MGraphBuilder.getOrCreateAllocaForReq(record, Req, MQueue, ToEnqueue);
-          // std::cout << "=== handler === test_mem ==== allocaCmd: " << allocaCmd << std::endl;
+          // std::cout << getpid() << " === handler === test_mem ==== allocaCmd: " << allocaCmd << std::endl;
           
-          // std::cout << "=== handler === req 2"<< std::endl;
+          // std::cout << getpid() << " === handler === req 2"<< std::endl;
           isSameCtx = detail::sameCtx(MQueue->getContextImplPtr(), record->MCurContext);
           if (!isSameCtx) {
             notSameCtxCount++;
           }
         }
-        std::cout << "=== handler === notSameCtx: " << notSameCtxCount << std::endl;
+        std::cout << getpid() << " === handler === notSameCtx: " << notSameCtxCount << std::endl;
       }
     }
 #endif
   for (device d : detail::ProgramManager::getInstance().globalDevices) {
-    std::cout << "=== handler === Process " << getpid() << " === global_device cpu: " << d.is_cpu() << " gpu: " << d.is_gpu() << " acc: " << d.is_accelerator() << std::endl;
+    std::cout << getpid() << " === handler === Process " << getpid() << " === global_device cpu: " << d.is_cpu() << " gpu: " << d.is_gpu() << " acc: " << d.is_accelerator() << std::endl;
   }
 
   // 应被替换为运行时调度设备选择
@@ -494,7 +495,7 @@ event handler::finalize() {
   // }
 
   detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
-  std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
+  std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
   // MQueue->rebindDevice(dp);
   MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropList()));
 
@@ -516,20 +517,20 @@ event handler::finalize() {
         AllocaCommandBase *allocaCmd = nullptr;
         bool isSameCtx = false;
 
-        // std::cout << "=== handler === req 1"<< std::endl;
+        // std::cout << getpid() << " === handler === req 1"<< std::endl;
         // 获取的就是内存需求 对应数组
         record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
-        std::cout << "=== handler === test_mem ==== record: " << record << std::endl;
-        std::cout << "=== handler === test_mem ==== memobj: " << Req->MSYCLMemObj << std::endl;
+        std::cout << getpid() << " === handler === test_mem ==== record: " << record << std::endl;
+        std::cout << getpid() << " === handler === test_mem ==== memobj: " << Req->MSYCLMemObj << std::endl;
 
         if (detail::ProgramManager::getInstance().kernel_count == 3) {
-          // std::cout << "=== handler === test_mem ==== kernel count 3" << std::endl;
+          // std::cout << getpid() << " === handler === test_mem ==== kernel count 3" << std::endl;
           if (Req->MAccessMode == access::mode::read && testReqCount == 1) {
             // 尝试将device仅复制到host
       
             // addCopyBack 不太行 会导致后面再copyback的时候崩溃
             // Command *NewCmd = detail::Scheduler::getInstance().MGraphBuilder.addCopyBack(Req, ToEnqueue);
-            // std::cout << "=== handler === test_mem ==== read copy back: " << record << std::endl;
+            // std::cout << getpid() << " === handler === test_mem ==== read copy back: " << record << std::endl;
 
             // // addHostAccessor 会销毁device上的拷贝？
             // EventImplPtr Event = detail::Scheduler::getInstance().addHostAccessor(Req);
@@ -543,7 +544,7 @@ event handler::finalize() {
             delete hostReq;
             // 会导致notSameCtx 不知道是否是删除了device上的数据？下次就要再加载进device？未测试
 
-            std::cout << "=== handler === test_mem ==== add host acc" << std::endl;
+            std::cout << getpid() << " === handler === test_mem ==== add host acc" << std::endl;
 
             // 尝试直接获取用户的数据指针
             using DATA_TYPE = float;
@@ -558,17 +559,17 @@ event handler::finalize() {
               }
               std::cerr << std::endl;
             }
-            std::cout << "=== handler === test_mem ==== get user ptr" << std::endl;
+            std::cout << getpid() << " === handler === test_mem ==== get user ptr" << std::endl;
           }
         }
         
-        // std::cout << "=== handler === req 2"<< std::endl;
+        // std::cout << getpid() << " === handler === req 2"<< std::endl;
         isSameCtx = detail::sameCtx(MQueue->getContextImplPtr(), record->MCurContext);
         if (!isSameCtx) {
           notSameCtxCount++;
         }
       }
-      std::cout << "=== handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
+      std::cout << getpid() << " === handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
     }    
   }
 #endif
@@ -579,18 +580,20 @@ event handler::finalize() {
   using namespace sycl::detail;
   const auto &cmdType = getType();
   if (cmdType == detail::CG::Kernel) {
+    detail::ProgramManager::getInstance().kernel_count++;
+    std::cout << "=== handler === kernel_count: " << detail::ProgramManager::getInstance().kernel_count << std::endl;
     detail::combineAccessModesOfReqs(MRequirements);
     for (Requirement *Req : MRequirements) {
       SYCLMemObjI *MemObj = Req->MSYCLMemObj;
       SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
 
       size_t elemSize = Req->MElemSize;
-      std::cout << "=== handler === test_mem ==== elemSize: " << elemSize << std::endl;
+      std::cout << getpid() << " === handler === test_mem ==== elemSize: " << elemSize << std::endl;
 
       range<3> memoryRange = Req->MMemoryRange;
       // size_t totalSize = memoryRange[0] * memoryRange[1] * memoryRange[2];
       size_t totalSize = memoryRange.size();
-      std::cout << "=== handler === test_mem ==== totalSize: " << totalSize << std::endl;
+      std::cout << getpid() << " === handler === test_mem ==== totalSize: " << totalSize << std::endl;
       using DATA_TYPE = std::byte;
       std::vector<DATA_TYPE> host_data(elemSize * totalSize);
 
@@ -891,9 +894,9 @@ event handler::finalize() {
 
   MLastEvent = detail::createSyclObjFromImpl<event>(Event);
 
-  // #ifdef PRINT_TRACE
-  // std::cout << "======handler.cpp after === queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
-  // #endif
+  #ifdef PRINT_TRACE
+  std::cout << "======handler.cpp after === queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
+  #endif
 
   return MLastEvent;
 }

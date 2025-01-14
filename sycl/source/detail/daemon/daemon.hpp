@@ -30,6 +30,8 @@ enum class acc_mode {
 #define MESSAGE_QUEUE
 
 #define MONITOR_INTERVAL 50000 // us
+#define MONITOR_GATHER_INTERVAL 2000000
+#define MONITOR_THRESHOLD 20
 
 #define MAX_MSG_NUM 10
 

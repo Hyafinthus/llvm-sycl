@@ -8,9 +8,11 @@
 #include <mpi.h>
 #include <mutex>
 #include <condition_variable>
+#include <cuda_runtime_api.h>
 #include <nvml.h>
 
 #include "daemon.hpp"
+#include <sycl/device.hpp>
 // #include <sycl/access/access.hpp>
 
 volatile bool is_interrupted = false;
@@ -30,11 +32,19 @@ std::map<int, int> globalcount_to_scalecount; // globalcount_对于本rank从哪
 std::unordered_map<pid_t, std::shared_ptr<std::queue<std::pair<int, int>>>> pid_to_scalecount_queue; // pid_扩容kernelcount_执行rank
 std::unordered_map<pid_t, std::shared_ptr<std::mutex>> pid_to_scalecount_mutex; // pid_扩容kernelcount_mutex
 std::unordered_map<pid_t, std::shared_ptr<std::condition_variable>> pid_to_scalecount_cv; // pid_扩容kernelcount_cv
+
+// ====【Monitor】
+std::map<int, int> index_sycl_nvml; // 根据busid确定sycl::device到gpu映射
+std::map<int, int> index_nvml_sycl;
 std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
+std::vector<int> ranks_idle;
+
 // ====【MPI】
 int mpi_rank, mpi_size; // main
 MPI_Comm comm_submit; // SystemSchedulerSubmit
 int submit_rank, submit_size; // SystemSchedulerSubmit
+MPI_Comm comm_monitor; // SystemSchedulerMonitor
+int monitor_rank, monitor_size; // SystemSchedulerMonitor
 
 // ====【mq】
 mqd_t mq_id_submit;
@@ -331,28 +341,95 @@ void CPUMonitor() {
   device_monitor_info[0] = MonitorInfo{"CPU", utilization, mem_available};
 }
 
+int getCudaPciBusId(const sycl::device &device) {
+  if (device.get_backend() != sycl::backend::ext_oneapi_cuda) {
+      return -1;
+  }
+  int cudaDevice;
+  cudaError_t err = cudaGetDevice(&cudaDevice);
+  if (err != cudaSuccess) {
+      throw std::runtime_error("Failed to get current CUDA device.");
+  }
+  int busId;
+  err = cudaDeviceGetAttribute(&busId, cudaDevAttrPciBusId, cudaDevice);
+  if (err != cudaSuccess) {
+      throw std::runtime_error("Failed to get PCI Bus ID for the CUDA device.");
+  }
+  return busId;
+}
+
 int MonitorInit() {
   nvmlReturn_t result;
-  
   result = nvmlInit();
   if (result != NVML_SUCCESS) {
     std::string errorMsg = "Failed to initialize NVML: " + std::string(nvmlErrorString(result));
     perror(errorMsg.c_str());
     return -1;
   }
-
+  
   unsigned int device_count = 0;
   result = nvmlDeviceGetCount(&device_count);
   if (result != NVML_SUCCESS) {
       std::string errorMsg = "Failed to get device count: " + std::string(nvmlErrorString(result));
       perror(errorMsg.c_str());
-
       nvmlShutdown();
       return -1;
   }
   std::cout << "Number of GPUs: " << device_count << std::endl;
+  
+  std::vector<int> nvmlBusIds;
+  for (int i = 0; i < device_count; ++i) {
+    nvmlDevice_t device;
+    result = nvmlDeviceGetHandleByIndex(i, &device);
+    if (result != NVML_SUCCESS) {
+      std::string errorMsg = "Failed to get device handle for device " + std::to_string(i) + ": " + std::string(nvmlErrorString(result));
+      perror(errorMsg.c_str());
+      continue;
+    }
+
+    nvmlPciInfo_t pciInfo;
+    result = nvmlDeviceGetPciInfo(device, &pciInfo);
+    if (result != NVML_SUCCESS) {
+      std::string errorMsg = "Failed to get PCI info for device " + std::to_string(i) + ": " + std::string(nvmlErrorString(result));
+      perror(errorMsg.c_str());
+      continue;
+    }
+
+    int nvmlBusId = std::stoi(std::string(pciInfo.busId).substr(9, 2), nullptr, 16);
+    std::cout << "GPU " << i << ": PCI Bus ID: " << pciInfo.busId << " int: " << nvmlBusId << std::endl;
+    nvmlBusIds.push_back(nvmlBusId);
+  }
+
+  std::vector<sycl::device> globalDevices = sycl::device::get_devices();
+  globalDevices.erase(
+    std::remove_if(
+      globalDevices.begin(), 
+      globalDevices.end(),
+      [](const sycl::device& d) { return d.is_accelerator(); }
+    ),
+    globalDevices.end()
+  );
+  for (int i = 0; i < globalDevices.size(); i++) {
+    sycl::device device = globalDevices[i];
+    // **注意** 获取device::name必不可少 不然无法切换cuda上下文
+    device.get_info<sycl::info::device::name>();
+    int busId = getCudaPciBusId(device);
+    std::cout << "SYCL Device " << i << ": PCI Bus ID: " << busId << std::endl;
+
+    if (busId != -1) {
+      auto it = std::find(nvmlBusIds.begin(), nvmlBusIds.end(), busId);
+      if (it != nvmlBusIds.end()) {
+        index_sycl_nvml[i] = std::distance(nvmlBusIds.begin(), it) + 1;
+        index_nvml_sycl[index_sycl_nvml[i]] = i;
+      }
+    }
+  }
+  for (auto pair : index_sycl_nvml) {
+    std::cout << "SYCL Device " << pair.first << " mapped to GPU " << pair.second << std::endl;
+  }
 
   return device_count;
+  // return 2; // scale测试用
 }
 
 void CudaMonitor(int device_count) {
@@ -405,7 +482,7 @@ void CudaMonitor(int device_count) {
   }
 }
 
-void SystemMonitor() {
+void *SystemMonitor(void *arg) {
   int device_count = MonitorInit();
   if (device_count != -1) {
     device_monitor_info.resize(device_count + 1);
@@ -418,13 +495,43 @@ void SystemMonitor() {
       CudaMonitor(device_count);
     }
 
-    for(int i = 0; i < device_monitor_info.size(); i++) {
-      std::cout << "Device " << i << " (" << device_monitor_info[i].name << "):" << std::endl;
-      std::cout << "  Utilization: " << device_monitor_info[i].util_used << "%" << std::endl;
-      std::cout << "  Memory Available: " << device_monitor_info[i].mem_available << " kB" << std::endl;
-    }
+    // for(int i = 0; i < device_monitor_info.size(); i++) {
+    //   std::cout << "Device " << i << " (" << device_monitor_info[i].name << "):" << std::endl;
+    //   std::cout << "  Utilization: " << device_monitor_info[i].util_used << "%" << std::endl;
+    //   std::cout << "  Memory Available: " << device_monitor_info[i].mem_available << " kB" << std::endl;
+    // }
 
     usleep(MONITOR_INTERVAL);
+  }
+}
+
+void *SystemSchedulerMonitor(void *arg) {
+  MPI_Comm_rank(comm_monitor, &monitor_rank);
+  MPI_Comm_size(comm_monitor, &monitor_size);
+  std::cout << "SystemSchedulerMonitor: MONITOR_Rank " << monitor_rank << " started." << std::endl;
+
+  pthread_t monitor_tid;
+  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemMonitor, NULL);
+  pthread_detach(monitor_tid);
+
+  ranks_idle.resize(monitor_size, false);
+
+  // 每个rank彼此感知是否有空闲即可 无需传递所有状态？
+  while (1) {
+    int is_idle = 0;
+    for (int i = 1; i < device_monitor_info.size(); i++) {
+      if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
+        is_idle = 1;
+        break;
+      }
+    }
+
+    MPI_Allgather(&is_idle, 1, MPI_INT, ranks_idle.data(), 1, MPI_INT, comm_monitor);
+    // for (int i = 0; i < monitor_size; i++) {
+    //   std::cout << "SystemSchedulerMonitor: MONITOR_Rank " << monitor_rank << " ranks_idle[" << i << "]: " << ranks_idle[i] << std::endl;
+    // }
+
+    usleep(MONITOR_GATHER_INTERVAL);
   }
 }
 
@@ -478,10 +585,19 @@ void *SystemSchedulerDaemon(void *arg) {
           exit(1);
         }
         kernel_exec_info.scale_count = scale_count;
+        int min_util = 100;
+        int min_util_index = -1;
+        for (int i = 1; i < device_monitor_info.size(); i++) {
+          if (device_monitor_info[i].util_used < min_util) {
+            min_util = device_monitor_info[i].util_used;
+            min_util_index = i;
+          }
+        }
+        kernel_exec_info.device_index = min_util_index;
         // ========【固定测试】
         // kernel_exec_info.exec = true;
         // kernel_exec_info.kernel_count = 1;
-        kernel_exec_info.device_index = 1; // scalecount也用这个device
+        // kernel_exec_info.device_index = 1; // scalecount也用这个device
         std::string serialized_data = kernel_exec_info.serialize();
         size_t message_size = serialized_data.size();
         mq_send(mq_id_program, serialized_data.c_str(), message_size, 0);
@@ -543,6 +659,7 @@ void *SystemSchedulerDaemon(void *arg) {
     // ====【接收program通信】
     S2DKernelReqData kernel_req_data;
     {
+      std::cout << "Rank " << daemon_rank << ": waiting req from handler" << std::endl;
       char buffer[MAX_MSG_DAEMON_SIZE];
       ssize_t bytes_received = mq_receive(mq_id_daemon, buffer, MAX_MSG_DAEMON_SIZE, nullptr);
       if (bytes_received > 0) {
@@ -582,38 +699,101 @@ void *SystemSchedulerDaemon(void *arg) {
         // TODO 2 [allrank] 调度决策(设备负载/性能预测/通信开销/计算开销)
         // 在master上只需要确认rank是否还有device空闲 具体的device应由各daemon监控和选择
         int most_rank = mostDepdRank(req_ranks);
-        if (most_rank == -1) { // 没依赖 master有空闲就执行 无空闲应该扩容
-          kernel_sched_info.exec_rank = daemon_rank;
-        } else { // 有依赖 有最多依赖的rank
-          kernel_sched_info.exec_rank = most_rank;
+        // 没依赖 master有空闲就执行 无空闲应该扩容
+        // 不太可能没依赖 必然会依赖初始化的write 无空闲扩容的情况很少
+        if (most_rank == -1) { 
+          bool idle = false;
+          for (int i = 1; i < device_monitor_info.size(); i++) {
+            if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
+              idle = true;
+              break;
+            }
+          }
+          if (idle) {
+            kernel_sched_info.exec_rank = daemon_rank;
+          } else {
+            for (int i = 0; i < ranks_idle.size(); i++) {
+              if (i == monitor_rank) {
+                continue;
+              }
+              if (ranks_idle[i]) {
+                kernel_sched_info.exec_rank = i;
+
+                std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+                pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+                pid_to_scalecount_cv[local_pid]->notify_one();
+
+                scale = true;
+                std::cout << "Rank " << daemon_rank << " NO DEPD NOTIFY SCALE rank: " << i << std::endl;
+                break;
+              }
+            }
+          }
+
+        }
+        // 有依赖 有最多依赖的rank 如果rank没空也应该扩容
+        // 依赖在master上就扩容 在其他rank就继续执行 TODO 未实现其他rank满足依赖
+        else {
+          if (most_rank == daemon_rank) { // 依赖在master
+            bool idle = false;
+            for (int i = 1; i < device_monitor_info.size(); i++) {
+              if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
+                idle = true;
+                break;
+              }
+            }
+            if (idle) { // master空闲
+              kernel_sched_info.exec_rank = daemon_rank;
+            } else { // master不空闲 找空闲rank扩容
+              for (int i = 0; i < ranks_idle.size(); i++) {
+                if (i == monitor_rank) {
+                  continue;
+                }
+                if (ranks_idle[i]) {
+                  kernel_sched_info.exec_rank = i;
+
+                  std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+                  pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+                  pid_to_scalecount_cv[local_pid]->notify_one();
+
+                  scale = true;
+                  std::cout << "Rank " << daemon_rank << " YES DEPD NOTIFY SCALE rank: " << i << std::endl;
+                  break;
+                }
+              }
+            }
+          } else { // 依赖在其他rank
+            kernel_sched_info.exec_rank = most_rank;
+          }
         }
         kernel_sched_info.req_rank = chooseReqRank(req_ranks, daemon_rank);
+        node->exec_rank = kernel_sched_info.exec_rank;
 
         // ========【固定测试】3mm
         // A dep no - rank1
         // B dep no - rank0
         // C dep A:rank1, B:rank0 - rank1
-        if (kernel_req_data.kernel_count == 1) {
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 2) {
-          // A
-          kernel_sched_info.exec_rank = 1;
-        } else if (kernel_req_data.kernel_count == 3) {
-          // B
-          kernel_sched_info.exec_rank = 0;
-          {
-            std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
-            pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
-            pid_to_scalecount_cv[local_pid]->notify_one();
-          }
-          scale = true;
-          std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
-        } else if (kernel_req_data.kernel_count == 4) {
-          // C
-          kernel_sched_info.exec_rank = 1;
-          kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
-          kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
-        }
+        // if (kernel_req_data.kernel_count == 1) {
+        //   kernel_sched_info.exec_rank = 1;
+        // } else if (kernel_req_data.kernel_count == 2) {
+        //   // A
+        //   kernel_sched_info.exec_rank = 1;
+        // } else if (kernel_req_data.kernel_count == 3) {
+        //   // B
+        //   kernel_sched_info.exec_rank = 0;
+        //   {
+        //     std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+        //     pid_to_scalecount_queue[local_pid]->push(std::make_pair(kernel_req_data.kernel_count, 0));
+        //     pid_to_scalecount_cv[local_pid]->notify_one();
+        //   }
+        //   scale = true;
+        //   std::cout << "Rank " << daemon_rank << " NOTIFY SCALE" << std::endl;
+        // } else if (kernel_req_data.kernel_count == 4) {
+        //   // C
+        //   kernel_sched_info.exec_rank = 1;
+        //   kernel_sched_info.req_rank.insert({kernel_req_data.reqs[0], 1});
+        //   kernel_sched_info.req_rank.insert({kernel_req_data.reqs[1], 0});
+        // }
         // ========【固定测试】calc 在daemon决定执行rank 后续还要彼此通信 scale决定还要通知daemon
         // if (daemon_rank == 1) {
         //   if (kernel_req_data.kernel_count == 1) {
@@ -643,7 +823,6 @@ void *SystemSchedulerDaemon(void *arg) {
         //     kernel_sched_info.exec_rank = 1;
         //   }
         // }
-        // node->exec_rank = kernel_sched_info.exec_rank;
       }
 
       // 对于master 告知scale需要扩充 此时scale新线程都未建立 不会向scale发
@@ -677,6 +856,17 @@ void *SystemSchedulerDaemon(void *arg) {
       if (daemon_rank == kernel_sched_info.exec_rank) {
         kernel_exec_info.exec = true;
         req_for_rank = kernel_sched_info.get_req_for_exec_rank(daemon_rank);
+        // 可能无依赖或有依赖 可能是master也可能是接收通信的其他rank
+        // 空闲状态可能有变化 但一定执行 选择最空闲的device执行
+        int min_util = 100;
+        int min_util_index = -1;
+        for (int i = 1; i < device_monitor_info.size(); i++) {
+          if (device_monitor_info[i].util_used < min_util) {
+            min_util = device_monitor_info[i].util_used;
+            min_util_index = i;
+          }
+        }
+        kernel_exec_info.device_index = min_util_index;
       }
       else {
         req_for_rank = kernel_sched_info.get_req_for_rank(daemon_rank);
@@ -685,6 +875,7 @@ void *SystemSchedulerDaemon(void *arg) {
       for (int i = 0; i < req_for_rank.size(); ++i) {
         kernel_exec_info.req_counts[i] = req_for_rank[i].req_count;
       }
+
       // ========【固定测试】calc
       // if (daemon_rank == 1) {
       //   if (kernel_req_data.kernel_count == 1) {
@@ -708,17 +899,17 @@ void *SystemSchedulerDaemon(void *arg) {
       //   }
       // }
       // else 
-        kernel_exec_info.device_index = 1;
+      //   kernel_exec_info.device_index = 1;
 
       // 向负责的进程mq发送 需要device->host的data
       std::string serialized_data = kernel_exec_info.serialize();
       size_t message_size = serialized_data.size();
       mq_send(mq_id_program, serialized_data.c_str(), message_size, 0);
-      std::cout << "Rank " << daemon_rank << ": mq_send kernel_exec_info exec: " << kernel_exec_info.exec << " req_counts.size: " << kernel_exec_info.req_counts.size() << std::endl;
+      std::cout << "Rank " << daemon_rank << ": mq_send kernel_exec_info exec: " << kernel_exec_info.exec << " req_counts.size: " << kernel_exec_info.req_counts.size() << " device_index: " << kernel_exec_info.device_index << std::endl;
     }
 
     // ====【scale 向daemon发送依赖数据】
-    // master发送 若其他rank发送还需等待master通知 默认scale所需master都有最新
+    // TODO master发送 若其他rank发送还需等待master通知 默认scale所需master都有最新？
     if (scale) {
       for (SyclReqData &req : kernel_req_data.reqs) {
         if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
@@ -737,8 +928,8 @@ void *SystemSchedulerDaemon(void *arg) {
       }
     }
 
-    // ====【为执行的rank满足依赖】
-    {
+    // ====【为执行的rank满足依赖】scale完就不需要走这段流程
+    else {
       // [5] [单rank] 被依赖的kernel的数据device->host
       // 如果执行 要检查是否要从其他rank获取数据
       // 如果不执行 要检查是否需要host->device 给其他rank发数据
@@ -983,6 +1174,7 @@ int main(int argc, char *argv[]) {
   std::cout << "MPI_Rank " << mpi_rank << ": " << proc_name << " of " << mpi_size << " started" << std::endl;
   // split_key==mpi_rank 所以local_rank和mpi_rank相同 在线程中仍可以使用mpi_rank和mpi_size
   MPI_Comm_split(MPI_COMM_WORLD, 0, mpi_rank, &comm_submit);
+  MPI_Comm_split(MPI_COMM_WORLD, 0, mpi_rank, &comm_monitor);
 
   // ====【mq】
   EstablishSubmit();
@@ -990,7 +1182,7 @@ int main(int argc, char *argv[]) {
 
   // ====【pthread】
   pthread_t monitor_tid, submit_tid;
-  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemMonitor, NULL);
+  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemSchedulerMonitor, NULL);
   pthread_create(&submit_tid, NULL, (void *(*)(void *))SystemSchedulerSubmit, NULL);
   std::cout << "MPI_Rank " << mpi_rank << ": SystemSchedulerSubmit started" << std::endl;
 

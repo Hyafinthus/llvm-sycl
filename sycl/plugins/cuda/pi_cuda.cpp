@@ -15,6 +15,7 @@
 #include <sycl/detail/cuda_definitions.hpp>
 #include <sycl/detail/defines.hpp>
 #include <sycl/detail/pi.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -26,7 +27,9 @@
 #include <mutex>
 #include <regex>
 
-// #include <cuda_runtime.h>
+#ifdef CUDA_RT
+#include <cuda_runtime.h>
+#endif
 
 // Forward declarations
 void enableCUDATracing();
@@ -2216,14 +2219,19 @@ pi_result cuda_piMemBufferCreate(pi_context context, pi_mem_flags flags,
     if ((flags & PI_MEM_FLAGS_HOST_PTR_USE) && enableUseHostPtr) {
       retErr = PI_CHECK_ERROR(
           cuMemHostRegister(host_ptr, size, CU_MEMHOSTREGISTER_DEVICEMAP));
+      // std::cout << "Using host ptr\n";
       retErr = PI_CHECK_ERROR(cuMemHostGetDevicePointer(&ptr, host_ptr, 0));
+      // std::cout << "Using host ptr 2\n";
       allocMode = _pi_mem::mem_::buffer_mem_::alloc_mode::use_host_ptr;
     } else if (flags & PI_MEM_FLAGS_HOST_PTR_ALLOC) {
       retErr = PI_CHECK_ERROR(cuMemAllocHost(&host_ptr, size));
+      // std::cout << "Allocating host ptr\n";
       retErr = PI_CHECK_ERROR(cuMemHostGetDevicePointer(&ptr, host_ptr, 0));
+      // std::cout << "Allocating host ptr 2\n";
       allocMode = _pi_mem::mem_::buffer_mem_::alloc_mode::alloc_host_ptr;
     } else {
       retErr = PI_CHECK_ERROR(cuMemAlloc(&ptr, size));
+      // std::cout << "Allocating device ptr\n";
       if (flags & PI_MEM_FLAGS_HOST_PTR_COPY) {
         allocMode = _pi_mem::mem_::buffer_mem_::alloc_mode::copy_in;
       }
@@ -2242,9 +2250,11 @@ pi_result cuda_piMemBufferCreate(pi_context context, pi_mem_flags flags,
           // Synchronize with default stream implicitly used by cuMemcpyHtoD
           // to make buffer data available on device before any other PI call
           // uses it.
+          // std::cout << "Synchronizing default stream\n";
           if (retErr == PI_SUCCESS) {
             CUstream defaultStream = 0;
             retErr = PI_CHECK_ERROR(cuStreamSynchronize(defaultStream));
+            // std::cout << "Synchronized default stream\n";
           }
         }
       } else {
@@ -2544,23 +2554,25 @@ pi_result cuda_piQueueRetain(pi_queue command_queue) {
   return PI_SUCCESS;
 }
 
-// void printDeviceBusID() {
-//     int deviceId = -1;
-//     int busId = -1;
-//     // 获取当前上下文的设备 ID
-//     CUresult err = cuCtxGetDevice(&deviceId);
-//     if (err != CUDA_SUCCESS) {
-//         throw std::runtime_error("Failed to get current device from context.");
-//     }
-//     // 获取设备的 PCI 总线 ID
-//     err = cuDeviceGetAttribute(&busId, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, deviceId);
-//     if (err != CUDA_SUCCESS) {
-//         throw std::runtime_error("Failed to get PCI Bus ID for the device.");
-//     }
-//     // 输出设备 ID 和 PCI 总线 ID
-//     if (busId != 29)
-//       std::cout << "Device ID: " << deviceId << ", PCI Bus ID: " << busId << std::endl;
-// }
+#ifdef CUDA_RT
+void printDeviceBusID() {
+    int deviceId = -1;
+    int busId = -1;
+    // 获取当前上下文的设备 ID
+    CUresult err = cuCtxGetDevice(&deviceId);
+    if (err != CUDA_SUCCESS) {
+        throw std::runtime_error("Failed to get current device from context.");
+    }
+    // 获取设备的 PCI 总线 ID
+    err = cuDeviceGetAttribute(&busId, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, deviceId);
+    if (err != CUDA_SUCCESS) {
+        throw std::runtime_error("Failed to get PCI Bus ID for the device.");
+    }
+    // 输出设备 ID 和 PCI 总线 ID
+    if (busId != 29)
+      std::cout << "Device ID: " << deviceId << ", PCI Bus ID: " << busId << std::endl;
+}
+#endif
 
 pi_result cuda_piQueueRelease(pi_queue command_queue) {
   assert(command_queue != nullptr);
@@ -4248,6 +4260,19 @@ static pi_result commonEnqueueMemBufferCopyRect(
   params.dstPitch = dst_row_pitch;
   params.dstHeight = dst_slice_pitch / dst_row_pitch;
 
+  #ifdef CUDA_RT
+  cudaError_t status = cudaStreamQuery(cu_stream);
+  if (status == cudaSuccess) {
+      std::cout << "Stream is idle, ready for new operations.\n";
+  } else if (status == cudaErrorNotReady) {
+      std::cout << "Stream is busy, previous operations are still running.\n";
+  }
+  #endif
+
+  // std::cout << "bef cuMemcpy3DAsync\n";
+  // pi_result result = PI_CHECK_ERROR(cuMemcpy3DAsync(&params, cu_stream));
+  // std::cout << "aft cuMemcpy3DAsync\n";
+  // return result;
   return PI_CHECK_ERROR(cuMemcpy3DAsync(&params, cu_stream));
 }
 
@@ -4322,17 +4347,20 @@ pi_result cuda_piEnqueueMemBufferWriteRect(
     CUstream cuStream = command_queue->get_next_transfer_stream();
     retErr = enqueueEventsWait(command_queue, cuStream, num_events_in_wait_list,
                                event_wait_list);
+    // std::cout << "enqueueEventsWait\n";
 
     if (event) {
       retImplEv = std::unique_ptr<_pi_event>(_pi_event::make_native(
           PI_COMMAND_TYPE_MEM_BUFFER_WRITE_RECT, command_queue, cuStream));
       retImplEv->start();
     }
+    // std::cout << "start\n";
 
     retErr = commonEnqueueMemBufferCopyRect(
         cuStream, region, ptr, CU_MEMORYTYPE_HOST, host_offset, host_row_pitch,
         host_slice_pitch, &devPtr, CU_MEMORYTYPE_DEVICE, buffer_offset,
         buffer_row_pitch, buffer_slice_pitch);
+    // std::cout << "commonEnqueueMemBufferCopyRect\n";
 
     if (event) {
       retErr = retImplEv->record();
@@ -4341,6 +4369,7 @@ pi_result cuda_piEnqueueMemBufferWriteRect(
     if (blocking_write) {
       retErr = PI_CHECK_ERROR(cuStreamSynchronize(cuStream));
     }
+    // std::cout << "cuStreamSynchronize\n";
 
     if (event) {
       *event = retImplEv.release();

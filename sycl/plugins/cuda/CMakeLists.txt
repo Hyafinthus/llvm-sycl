@@ -6,6 +6,12 @@ message(STATUS "Including the PI API CUDA backend.")
 
 find_package(CUDA 10.1 REQUIRED)
 
+# Locate CUDA Runtime Library
+find_library(CUDA_CUDART_LIBRARY cudart HINTS ${CUDA_TOOLKIT_ROOT_DIR}/lib64)
+if (NOT CUDA_CUDART_LIBRARY)
+  message(FATAL_ERROR "CUDA Runtime Library (libcudart.so) not found!")
+endif()
+
 # Make imported library global to use it within the project.
 add_library(cudadrv SHARED IMPORTED GLOBAL)
 
@@ -56,9 +62,11 @@ add_sycl_plugin(cuda
     ${XPTI_PROXY_SRC}
   INCLUDE_DIRS
     ${sycl_inc_dir}
+    ${CUDA_INCLUDE_DIRS}  # Add CUDA include directories
     ${XPTI_INCLUDE}
   LIBRARIES
     cudadrv
+    ${CUDA_CUDART_LIBRARY}  # Add CUDA Runtime Library
     ${XPTI_LIBS}
   HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/features.hpp"
 )

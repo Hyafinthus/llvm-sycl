@@ -290,14 +290,18 @@ add_executable(sycl-submit
   "detail/daemon/submit.cpp"
 )
 
+add_dependencies(sycl-daemon sycl)
+
 target_include_directories(sycl-daemon PRIVATE
-  # ${SYCL_INCLUDE_DIR}
+  ${sycl_inc_dir}
   ${CUDAToolkit_INCLUDE_DIRS}
   ${MPI_CXX_INCLUDE_PATH}
 )
 target_link_libraries(sycl-daemon
+  sycl
   rt
   pthread
+  CUDA::cudart
   CUDA::nvml
   ${MPI_CXX_LIBRARIES}
 )
