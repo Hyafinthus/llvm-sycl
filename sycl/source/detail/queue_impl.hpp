@@ -712,6 +712,8 @@ protected:
       MLastCGType = Type;
     } else
       EventRet = Handler.finalize();
+
+    EventRet.setHandler(&Handler);
   }
 
 protected:

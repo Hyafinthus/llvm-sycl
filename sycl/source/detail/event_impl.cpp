@@ -13,7 +13,7 @@
 #include <detail/scheduler/scheduler.hpp>
 #include <sycl/context.hpp>
 #include <sycl/device_selector.hpp>
-#include <sycl/detail/iostream_proxy.hpp> 
+#include <sycl/detail/iostream_proxy.hpp>
 // #define PRINT_TRACE 1
 // #define MODIFY 1
 
@@ -228,6 +228,8 @@ void event_impl::wait(std::shared_ptr<sycl::detail::event_impl> Self) {
   TelemetryEvent = instrumentationProlog(Name, StreamID, IId);
 #endif
 
+  // 很多内存和清理操作也会涉及event::wait
+  // 不能在这里区分用户调用API
   if (MEvent) {
     // presence of MEvent means the command has been enqueued, so no need to
     // go via the slow path event waiting in the scheduler

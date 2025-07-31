@@ -24,6 +24,7 @@ namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 // Forward declaration
 class context;
+class handler; // Offline: event中需要取到wait前最后一个handler
 
 template <backend BackendName, class SyclObjectT>
 auto get_native(const SyclObjectT &Obj)
@@ -84,6 +85,10 @@ public:
   /// Wait for the event.
   void wait();
 
+  void setHandler(handler *h) { kernel_handler = h; }
+
+  handler* getHandler() const { return kernel_handler; }
+
   /// Synchronously wait on a list of events.
   ///
   /// \param EventList is a vector of SYCL events.
@@ -132,6 +137,8 @@ public:
   backend get_backend() const noexcept;
 
 private:
+  handler *kernel_handler = nullptr;
+
   event(std::shared_ptr<detail::event_impl> EventImpl);
 
   pi_native_handle getNative() const;

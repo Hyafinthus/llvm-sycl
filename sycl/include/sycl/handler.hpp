@@ -97,6 +97,8 @@ template <typename T, int Dimensions, typename AllocatorT, typename Enable>
 class buffer;
 namespace detail {
 
+struct SyclKernelCg;
+
 class handler_impl;
 class kernel_impl;
 class queue_impl;
@@ -1475,6 +1477,9 @@ public:
   handler(handler &&) = delete;
   handler &operator=(const handler &) = delete;
   handler &operator=(handler &&) = delete;
+
+  event resubmit(detail::SyclKernelCg &sycl_kernel_cg);
+  event scheduleOffline();
 
   template <auto &SpecName>
   void set_specialization_constant(

@@ -1008,7 +1008,8 @@ ProgramManager::ProgramManager() {
   );
 #endif
 
-#ifdef SCHEDULE
+// #ifdef SCHEDULE
+#ifdef SCHEDULE_OFFLINE
   std::cout << "Process " << getpid() << ": ProgramManager SCHEDULE register" << std::endl;
   // 向scheduler注册
   struct mq_attr mq_attr;
@@ -1026,13 +1027,34 @@ ProgramManager::ProgramManager() {
     exit(1);
   }
 
+  // std::cout << "Process " << getpid() << ": ProgramManager SCHEDULE opened mq_id_program: " << MESSAGE_QUEUE_PROGRAM_NAME << std::endl;
+  // struct mq_attr check_attr;
+  // mq_getattr(mq_id_program, &check_attr);
+  // std::cout << "[PM Debug] mq_curmsgs = " << check_attr.mq_curmsgs << ", mq_msgsize = " << check_attr.mq_msgsize << std::endl;
+
+  // 在与daemon建立连接时接收scale_count
+  char buffer[MAX_MSG_PROGRAM_SIZE];
+  ssize_t bytes_received = mq_receive(mq_id_program, buffer, MAX_MSG_PROGRAM_SIZE, nullptr);
+
+  if (bytes_received > 0) {
+    std::string received_str(buffer, bytes_received);
+    std::cout << "Process " << getpid() << ": ProgramManager SCHEDULE scale_count = " << std::stoi(received_str) << std::endl;
+    scale_count = std::stoi(received_str);
+  } else {
+    std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " ProgramManager mq_receive failed";
+    perror(errorMsg.c_str());
+    exit(1);
+  }
+
   char MESSAGE_QUEUE_DAEMON_NAME[MESSAGE_QUEUE_DAEMON_NAME_MAX];
   sprintf(MESSAGE_QUEUE_DAEMON_NAME, MESSAGE_QUEUE_DAEMON_PATTERN, getpid());
 
+  std::cout << "Process " << getpid() << ": ProgramManager SCHEDULE waiting mq_id_daemon" << std::endl;
   // 等待daemon 先不做错误处理
   while (mq_id_daemon == -1) {
     mq_id_daemon = mq_open(MESSAGE_QUEUE_DAEMON_NAME, O_WRONLY);
   }
+  std::cout << "Process " << getpid() << ": ProgramManager SCHEDULE opened mq_id_daemon" << std::endl;
   // if (mq_id_daemon == -1) {
   //   std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " mq_id_daemon open failed";
   //   perror(errorMsg.c_str());
@@ -1041,7 +1063,8 @@ ProgramManager::ProgramManager() {
 #endif
 }
 
-#ifdef SCHEDULE
+// #ifdef SCHEDULE
+#ifdef SCHEDULE_OFFLINE
 ProgramManager::~ProgramManager() {
   mq_close(mq_id_program);
   char MESSAGE_QUEUE_PROGRAM_NAME[MESSAGE_QUEUE_PROGRAM_NAME_MAX];

@@ -7,4 +7,5 @@
 // #define CUDA_RT 1 // pi_cuda.cpp中调用cuda运行时
 
 #define REBIND 1 // 重绑定queue与device
-#define SCHEDULE 1 // 重绑定的调度决策
+// #define SCHEDULE 1 // 重绑定的调度决策
+#define SCHEDULE_OFFLINE 1 // 延迟提交kernel的离线调度

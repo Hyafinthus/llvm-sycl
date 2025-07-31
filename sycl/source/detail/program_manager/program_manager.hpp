@@ -17,6 +17,7 @@
 #include <sycl/detail/os_util.hpp>
 #include <sycl/detail/pi.hpp>
 #include <sycl/detail/util.hpp>
+#include <sycl/detail/cg.hpp>
 #include <sycl/device.hpp>
 #include <sycl/kernel_bundle.hpp>
 #include <sycl/stl.hpp>
@@ -29,6 +30,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <detail/daemon/daemon.hpp>
 #include <detail/daemon/define.hpp>
 
 // +++ Entry points referenced by the offload wrapper object {
@@ -78,6 +80,19 @@ enum class DeviceLibExt : std::uint32_t {
   cl_intel_devicelib_imf_bf16,
   cl_intel_devicelib_bfloat16,
 };
+
+#ifdef SCHEDULE_OFFLINE
+// 暂时不用存储整个handler 看后面运行情况
+struct SyclKernelCg {
+  int kernel_count;
+  std::unique_ptr<detail::CG> kernel_cg;
+  std::shared_ptr<detail::queue_impl> kernel_queue;
+
+  SyclKernelCg(int count, std::unique_ptr<detail::CG> cg,
+               std::shared_ptr<detail::queue_impl> queue)
+      : kernel_count(count), kernel_cg(std::move(cg)), kernel_queue(std::move(queue)) {}
+};
+#endif
 
 // Provides single loading and building OpenCL programs with unique contexts
 // that is necessary for no interoperability cases with lambda.
@@ -287,10 +302,18 @@ public:
 
   std::vector<device> globalDevices;
   int kernel_count = 0;
-#ifdef SCHEDULE
-  bool daemon_mq_opened = false;
+// #ifdef SCHEDULE
+#ifdef SCHEDULE_OFFLINE
+  bool daemon_mq_opened = false; // ？没用上
   int scale_count = 0;
   int scale_device = -1;
+#endif
+
+#ifdef SCHEDULE_OFFLINE
+  int wait_count = 0;
+  std::vector<S2DKernelReqData> kernel_reqs;
+  std::vector<SyclKernelCg *> kernel_cgs;
+  std::vector<D2SKernelExecInfo> kernel_scale_exec_infos; // scale_count
 #endif
 
 private:

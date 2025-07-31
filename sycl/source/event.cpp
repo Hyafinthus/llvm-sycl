@@ -15,9 +15,15 @@
 #include <sycl/event.hpp>
 #include <sycl/info/info_desc.hpp>
 #include <sycl/stl.hpp>
+#include <sycl/detail/iostream_proxy.hpp>
+#include <detail/program_manager/program_manager.hpp>
+#include <sycl/handler.hpp>
 
 #include <memory>
 #include <unordered_set>
+
+#include <detail/daemon/define.hpp>
+// #define PRINT_TRACE 1
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
@@ -43,7 +49,40 @@ bool event::is_host() const {
   return IsHost;
 }
 
-void event::wait() { impl->wait(impl); }
+// #ifdef SCHEDULE_OFFLINE
+//   event resubmit(detail::SyclKernelCg &sycl_kernel_cg); // 应该不用
+//   event scheduleOffline();
+// #endif
+
+void event::wait() {
+#ifdef PRINT_TRACE
+  std::cout << "===event.cpp=== user kernel wait" << std::endl;
+#endif
+
+// #ifdef TEST_OFFLINE
+//   // 在此把所有存储的CG向后端运行时submit
+//   // 面向用户的API 不会被额外调用
+//   // wait(list)的情况按道理也符合 第一次调用wait()清空存储的CG
+//   std::vector<detail::TestNode *> &TestNodes = detail::ProgramManager::getInstance().testNodes;
+//   for (detail::TestNode *Node : TestNodes) {
+//     std::cout << "===event.cpp=== submit testNode: kernel_count " << Node->kernel_count << std::endl;
+//   }
+//   resubmit(*TestNodes[2]);
+//   resubmit(*TestNodes[1]);
+//   resubmit(*TestNodes[0]);
+//   event last_event = resubmit(*TestNodes[3]);
+//   last_event.impl->wait(last_event.impl);
+// #endif
+
+#ifdef SCHEDULE_OFFLINE
+  event last_event = getHandler()->scheduleOffline();
+  std::cout << "===event.cpp=== scheduleOffline last_event" << std::endl;
+  last_event.impl->wait(last_event.impl);
+  std::cout << "===event.cpp=== scheduleOffline wait finished" << std::endl;
+#else
+  impl->wait(impl);
+#endif
+}
 
 void event::wait(const std::vector<event> &EventList) {
   for (auto E : EventList) {

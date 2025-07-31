@@ -162,9 +162,19 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
   // std::string kernel_id; // 没有kernel这个对象 CommandGroup还未创建
   int kernel_count; // 是一个SYCL进程中kernel的唯一标识 体现在用户代码的顺序中
 
+  int exec_order; // SCHEDULE_OFFLINE中的顺序
   int exec_rank; // 要执行的daemon的rank
+  // ONLINE 作为给各个daemon的提示
+  //   -1:随机 0:未指定 >=1:存kernel_count
+  // OFFLINE daemon指定需要哪个device执行
+  int exec_device = 0;
   std::map<SyclReqData, int> req_rank; // 需要的数据 在哪个rank上
 
+  bool operator<(const D2DKernelSchedInfo &other) const {
+    return exec_order < other.exec_order;
+  }
+
+  // rank不是执行的rank 返回需要给其他rank提供的req
   std::vector<SyclReqData> get_req_for_rank(int rank) {
     std::vector<SyclReqData> reqs;
     for (const auto &pair : req_rank) {
@@ -175,6 +185,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
     return reqs;
   }
 
+  // rank是执行的rank 返回需要从其他rank获取的req
   std::vector<SyclReqData> get_req_for_exec_rank(int rank) {
     std::vector<SyclReqData> reqs;
     for (const auto &pair : req_rank) {
@@ -188,7 +199,9 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
   std::string serialize() const {
     std::ostringstream oss;
     oss << kernel_count << "\n"
-        << exec_rank << "\n";
+        << exec_order << "\n"
+        << exec_rank << "\n"
+        << exec_device << "\n";
 
     oss << req_rank.size() << "\n";
     for (const auto &pair : req_rank) {
@@ -204,7 +217,9 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
     D2DKernelSchedInfo sched_info;
 
     iss >> sched_info.kernel_count;
+    iss >> sched_info.exec_order;
     iss >> sched_info.exec_rank;
+    iss >> sched_info.exec_device;
 
     size_t map_size;
     iss >> map_size;
@@ -237,7 +252,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
 
   // 快速跳过前几个kernel
   // 0: kernel_count从1开始 默认值
-  // >1: 告知daemon需要scale
+  // >1: 告知daemon需要scale *offline>=1
   // -1: 告知master提供依赖
   int scale_count = 0;
 
@@ -310,15 +325,17 @@ struct ProgramInfo {
 };
 
 struct DAGNode { // 一个kernel的依赖关系
+  int kernel_count;
+  int depth = 0; // 如果没有依赖 在DAG中的深度为0
   std::vector<SyclReqData> req_data;
 
   std::vector<DAGNode *> depend_on;
   std::vector<DAGNode *> depend_by;
 
   int exec_rank = -1;
-  // bool executed = false; // ？
+  // bool executed = false; // online无法获取 --offline用于区别kernel是否已被调度 暂时用不上--
 
-  DAGNode(const std::vector<SyclReqData> &reqs) : req_data(reqs) {}
+  DAGNode(int count, const std::vector<SyclReqData> &reqs) : kernel_count(count), req_data(reqs) {}
 };
 
 struct CpuTimes {

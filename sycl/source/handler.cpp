@@ -19,7 +19,6 @@
 #include <detail/scheduler/commands.hpp>
 #include <detail/scheduler/scheduler.hpp>
 #include <detail/usm/usm_impl.hpp>
-#include <detail/daemon/daemon.hpp>
 #include <sycl/detail/common.hpp>
 #include <sycl/detail/helpers.hpp>
 #include <sycl/detail/kernel_desc.hpp>
@@ -36,7 +35,11 @@
 #include <mqueue.h>
 #include <unistd.h>
 
+#include <detail/daemon/daemon.hpp>
 #include <detail/daemon/define.hpp>
+#include <detail/program_manager/program_manager.hpp>
+
+using sycl::detail::SyclKernelCg;
 // #define PRINT_TRACE 1
 
 extern mqd_t mq_id_daemon, mq_id_program;
@@ -149,7 +152,7 @@ event handler::finalize() {
     if (daemon_kernel_count < daemon_scale_count) {
       return MLastEvent;
     }
-    //【scale】传输所需数据 TODO 或执行前置kernel
+    //【scale】传输所需数据 OPTI 或执行前置kernel
     else if (daemon_kernel_count == daemon_scale_count) {
       // ====【scale 处理依赖】
       {
@@ -228,7 +231,7 @@ event handler::finalize() {
       // ====【打包kernel内req发送给daemon】
       // 因为scheduler维护了kernel历史执行 所以不需要数据移动SameCtx判断
       // 即使SameCtx判断 有的Req可能并不在同一节点上 没有必要
-      // TODO Req对应内存的具体信息 如大小
+      // OPTI Req对应内存的具体信息 如大小
       S2DKernelReqData kernel_req_data;
       {
         detail::combineAccessModesOfReqs(MRequirements);
@@ -407,6 +410,48 @@ event handler::finalize() {
   }
 #endif
 
+// 先不考虑scale
+#ifdef SCHEDULE_OFFLINE
+  using namespace sycl::detail;
+  const auto &cmdType = getType();
+  if (cmdType == detail::CG::Kernel) {
+    int &daemon_kernel_count = detail::ProgramManager::getInstance().kernel_count;
+    daemon_kernel_count++;
+    //【通用情况】
+    std::vector<S2DKernelReqData> &kernel_reqs = detail::ProgramManager::getInstance().kernel_reqs;
+    // ====【打包存储kenrel内req】
+    S2DKernelReqData kernel_req_data;
+    {
+      detail::combineAccessModesOfReqs(MRequirements);
+
+      kernel_req_data.pid = getpid();
+      kernel_req_data.kernel_count = daemon_kernel_count;
+      kernel_req_data.req_size = MRequirements.size();
+
+      for (int i = 0; i < MRequirements.size(); i++) {
+        Requirement *Req = MRequirements[i];
+
+        SyclReqData req_data;
+        req_data.mem_pointer = Req->MSYCLMemObj;
+        req_data.kernel_count = kernel_req_data.kernel_count;
+        req_data.req_count = i + 1;
+        req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
+        req_data.elem_size = static_cast<int>(Req->MElemSize);
+        req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
+
+        kernel_req_data.reqs.push_back(req_data);
+      }
+    }
+    kernel_reqs.push_back(kernel_req_data);
+
+    std::cout << "=== handler === Process " << getpid() << " === set sycl_kernel_cg: " << detail::ProgramManager::getInstance().kernel_count << " MQueue: " << MQueue << " MRequirements: " << MRequirements.size() << " -";
+    for (Requirement *req : MRequirements) {
+      std::cout << " " << req->MSYCLMemObj;
+    }
+    std::cout << " MEvents: " << MEvents.size() << std::endl;  
+  }
+#endif
+
 #ifdef REBIND_DISCARD
 #ifdef TEST
     // ====【DONE】【测试忽略Kernel】
@@ -497,7 +542,7 @@ event handler::finalize() {
   detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
   std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
   // MQueue->rebindDevice(dp);
-  MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropList()));
+  MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
 
 #ifdef TEST
   // ========【DONE】【测试device->host】
@@ -575,7 +620,6 @@ event handler::finalize() {
 #endif
 #endif
 
-// #define TEST_WITH_CLEAN
 #ifdef TEST_WITH_CLEAN
   using namespace sycl::detail;
   const auto &cmdType = getType();
@@ -583,6 +627,8 @@ event handler::finalize() {
     detail::ProgramManager::getInstance().kernel_count++;
     std::cout << "=== handler === kernel_count: " << detail::ProgramManager::getInstance().kernel_count << std::endl;
     detail::combineAccessModesOfReqs(MRequirements);
+
+    // ===【获取Req实际数据指针】
     for (Requirement *Req : MRequirements) {
       SYCLMemObjI *MemObj = Req->MSYCLMemObj;
       SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -600,6 +646,12 @@ event handler::finalize() {
       void *UserPtr = BufferObj->getUserPtr();
       DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
     }
+
+    // ===【REBIND】
+    device d = detail::select_device(gpu_selector_v, true);
+    detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
+    std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
+    MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
   }
 #endif
 // 【END】=======================================================
@@ -607,6 +659,7 @@ event handler::finalize() {
 
 
   // 单独对特殊情况的kernel处理 目前没有 按道理可以忽略 但必须在之前rebind 因为有调用
+  // **注意** 因目前没有 忽略这段代码中对MQueue的操作 在此前MQueue为空未rebind
   const auto &type = getType();
   if (type == detail::CG::Kernel) {
     // If there were uses of set_specialization_constant build the kernel_bundle
@@ -753,6 +806,7 @@ event handler::finalize() {
     }
   }
 
+  // **注意** 只有cmdType==detail::CG::Kernel会参与MQueue的rebind
   std::unique_ptr<detail::CG> CommandGroup;
   switch (type) {
   case detail::CG::Kernel:
@@ -880,15 +934,25 @@ event handler::finalize() {
     return MLastEvent;
   }
 
-  if (!CommandGroup)
+  if (!CommandGroup) {
     throw sycl::runtime_error(
         "Internal Error. Command group cannot be constructed.",
         PI_ERROR_INVALID_OPERATION);
+  }
 
   #ifdef PRINT_TRACE
   std::cout << "======handler.cpp === type: " << type << " req: " << MRequirements.size() << " queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
   #endif
 
+
+
+// 【START】=======================================================
+#ifdef SCHEDULE_OFFLINE
+  // 只CommandGroup和MQueue是合理的 MRequirements和其他已被move进CommandGroup
+  SyclKernelCg *sycl_kernel_cg = new SyclKernelCg(detail::ProgramManager::getInstance().kernel_count, std::move(CommandGroup), MQueue);
+  detail::ProgramManager::getInstance().kernel_cgs.push_back(sycl_kernel_cg);
+  return MLastEvent;
+#else
   detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
       std::move(CommandGroup), std::move(MQueue));
 
@@ -899,7 +963,455 @@ event handler::finalize() {
   #endif
 
   return MLastEvent;
+#endif
+// 【END】=======================================================
 }
+
+
+
+// 【START】=======================================================
+#ifdef SCHEDULE_OFFLINE
+event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
+  std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
+  detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
+      std::move(sycl_kernel_cg.kernel_cg), std::move(sycl_kernel_cg.kernel_queue));
+  event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
+  return MLastEvent;
+}
+
+// **注意** 由event::wait()调用
+// 所有与daemon通信都由handler完成
+// 返回最后一个kernel的对应event给调用者event
+// 无法跳过的串行代码视作冷启动开销的一部分 暂时不考虑
+event handler::scheduleOffline() {
+  using namespace sycl::detail;
+  // **注意** 一组kernel只调用一次
+  
+  // 【流程】
+  // master接收一组kernel 确定需要扩容
+  // master通知其他scale 起对应daemom
+  // daemon起对应syclapp 同时接收master的execinfo
+  // syclapp的handler到达第一个wait 调用此函数
+  // 调用此函数时 handler已知会
+  // 1.一组kernel都不执行 跳过此wait
+  // 2.一组kernel的执行信息已知 不需要重新收集kenrel信息 只需要跟随execinfo
+  // 3.一组kernel的执行信息未知 需要重新收集kernel信息 即通用情况
+
+  // **注意** online如何确定启动的syclapp是否为scale
+  // 解释: daemon通知scale时传递scalecount
+  //   在handler的通用流程的第一次与daemon通信时传输scalecount
+  //   handler随即跳过第一次通信（必然为第一个kernel 不会扩容）
+  //   handler跳过后续scalecount前所有kernel 在scalecount走入scale流程
+
+  // 这里拿kernel_count没啥用
+  int &daemon_wait_count = detail::ProgramManager::getInstance().wait_count;
+  daemon_wait_count++;
+  int &daemon_scale_count = detail::ProgramManager::getInstance().scale_count;
+
+  std::cout << "=== handler === Process " << getpid() << " === daemon_wait_count: " << daemon_wait_count << " daemon_scale_count: " << daemon_scale_count << std::endl;
+
+  // 除了第一次扩容后的的后续扩容 即跳过前几个wait
+  if (daemon_wait_count < daemon_scale_count) {
+    std::cout << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " skip first wait" << std::endl;
+    event empty;
+    return empty;
+  }
+  else if (daemon_wait_count == daemon_scale_count) {
+    std::cout << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " first wait" << std::endl;
+
+    // TODO 要在这里从scale的daemon接收D2S 没有mq_recv
+    // 先只考虑初始扩容
+    // std::vector<D2SKernelExecInfo> &kernel_exec_infos = detail::ProgramManager::getInstance().kernel_scale_exec_infos;
+    std::vector<D2SKernelExecInfo> kernel_exec_infos;
+    {
+      char buffer[MAX_MSG_DAEMON_SIZE];
+      ssize_t bytes_received = mq_receive(mq_id_program, buffer, MAX_MSG_PROGRAM_SIZE, nullptr);
+      
+      std::cout << "=== handler === Process " << getpid() << " === scale mq_receive kernel_exec_infos" << std::endl;
+
+      if (bytes_received > 0) {
+        std::string received_data(buffer, bytes_received);
+        std::istringstream stream(received_data);
+        std::string line;
+
+        while (std::getline(stream, line)) {
+          std::string obj_data = line + "\n";  // kernel_count
+          std::getline(stream, line);
+          obj_data += line + "\n";             // exec
+          std::getline(stream, line);
+          obj_data += line + "\n";             // device_index
+          std::getline(stream, line);
+          obj_data += line + "\n";             // scale_count
+          std::getline(stream, line);
+          obj_data += line + "\n";             // req_counts.size()
+          int req_count = std::stoi(line);
+          for (int i = 0; i < req_count; ++i) {
+            std::getline(stream, line);
+            obj_data += line + "\n";
+          }
+          kernel_exec_infos.push_back(D2SKernelExecInfo::deserialize(obj_data));
+        }
+
+        for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
+          std::cout << "=== handler === Process " << getpid()
+                    << " === scale mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
+                    << " exec: " << kernel_exec_info.exec
+                    << " device_index: " << kernel_exec_info.device_index
+                    << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
+        }
+      } else {
+        std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " PROGRAM mq_receive failed";
+        perror(errorMsg.c_str());
+        exit(1);
+      }
+    }
+    
+    // return commDepend(kernel_exec_infos);
+    // DONE ====【按kernel执行顺序 为每个kernel处理满足依赖 -> rebind -> resubmit】
+    // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
+    std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
+    for (int exec_num = 0; exec_num < kernel_exec_infos.size(); exec_num++) {
+      std::cout << "=== handler === Process " << getpid() << " === scale commDepend exec_num: " << exec_num << std::endl;
+      D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
+      int kernel_count = kernel_exec_info.kernel_count;
+      detail::SyclKernelCg *sycl_kernel_cg = kernel_cgs.at(kernel_count - 1);
+
+      // **注意** 满足依赖的逻辑仍与online一致
+      // 不需要与daemon建立连接 因daemon对所有kernel的依赖都已知
+      // 在一个kernel执行rebind前满足依赖
+      // OPTI 并非前置kernel结束后就发给各个rank 因为可能新rank还没启动 暂时不考虑
+      {
+        auto &req_counts = kernel_exec_info.req_counts;
+        if (!kernel_exec_info.exec) {
+          if (req_counts.size() > 0) {
+            for (int i = 0; i < sycl_kernel_cg->kernel_cg->MRequirements.size(); i++) {
+              std::cout << getpid() << " === handler === scale kernel_count: " << kernel_count << " req_counts.size(): " << req_counts.size();
+              for (int req_count : req_counts) {
+                std::cout << " " << req_count;
+              }
+              std::cout << std::endl;
+
+              int daemon_req_count = i + 1;
+              Requirement *Req = sycl_kernel_cg->kernel_cg->MRequirements[i];
+              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic)) {
+                Requirement *hostReq = new Requirement(*Req);
+                EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+                hostEvent->wait(hostEvent);
+                delete hostReq;
+                std::cout << getpid() << " === handler === test_mem ==== scale sender add host acc" << std::endl;
+
+                using DATA_TYPE = std::byte;
+                size_t elem_size = Req->MElemSize;
+                size_t buff_size = Req->MMemoryRange.size();
+                std::cout << getpid() << " === handler === test_mem ==== scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
+                SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+                SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+                void *UserPtr = BufferObj->getUserPtr();
+                DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+
+                SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
+                writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
+                std::cout << getpid() << " === handler === scale send host data" << std::endl;
+
+                waitForReadCompletion(handle);
+                cleanupSharedMemory(handle, elem_size * buff_size);
+                std::cout << getpid() << " === handler === scale waitForReadCompletion" << std::endl;
+              }
+            }
+          }
+          std::cout << getpid() << " === handler === scale kernel_count: " << kernel_count << " end hostacc" << std::endl;
+        }
+        else {
+          if (req_counts.size() > 0) {
+            for (int i = 0; i < sycl_kernel_cg->kernel_cg->MRequirements.size(); i++) {
+              int daemon_req_count = i + 1;
+              Requirement *Req = sycl_kernel_cg->kernel_cg->MRequirements[i];
+              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic)) {
+                Requirement *hostReq = new Requirement(*Req);
+                EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+                hostEvent->wait(hostEvent);
+                delete hostReq;
+                std::cout << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
+
+                using DATA_TYPE = std::byte;
+                size_t elem_size = Req->MElemSize;
+                size_t buff_size = Req->MMemoryRange.size();
+                std::cout << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
+                SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+                SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+                void *UserPtr = BufferObj->getUserPtr();
+                DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+
+                std::vector<DATA_TYPE> host_data(elem_size * buff_size);
+                SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
+                readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
+                std::cout << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
+                cleanupSharedMemory(handle, elem_size * buff_size);
+                std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
+
+                std::cout << getpid() << " === handler === mem copy" << std::endl;
+              }
+            }
+          }
+        }
+      }
+      
+      // **注意** MQueue在此才rebind 之前有暂未出现过的逻辑使用MQueue
+      // 此时有刚启动的daemon
+      if (kernel_exec_info.exec) {
+        std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
+        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(kernel_exec_info.device_index);
+        detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
+        std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        kernel_queue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), kernel_queue->getAsyncHandler(), kernel_queue->getPropertyList()));
+
+        // resubmit
+        event last_event = resubmit(*sycl_kernel_cg);
+        std::cout << "=== handler === Process " << getpid() << " === resubmit kernel: " << kernel_count << std::endl;
+        if (exec_num == kernel_exec_infos.size() - 1) {
+          return last_event;
+        }
+      }
+      else {
+        std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
+        if (exec_num == kernel_exec_infos.size() - 1) {
+          event empty;
+          return empty;
+        }
+      }
+    }
+  }
+  //【通用情况】
+  else {
+    // DONE ====【发送每个kernel的reqs给daemon】
+    std::vector<S2DKernelReqData> &kernel_req_datas = detail::ProgramManager::getInstance().kernel_reqs;
+    // DEBUG用
+    // for (S2DKernelReqData &kernel_req_data : kernel_req_datas) {
+    //   std::cout << "=== handler === Process " << getpid() << " === kernel_req_data: " << kernel_req_data.serialize();
+    // }
+    int kernel_nums = kernel_req_datas.size();
+    {
+      std::string serialized_data;
+      for (const auto &kernel_req_data : kernel_req_datas) {
+        serialized_data += kernel_req_data.serialize();
+      }
+      size_t message_size = serialized_data.size();
+
+      mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
+      std::cout << "=== handler === Process " << getpid() << " === mq_send kernel_req_datas" << std::endl;
+    }
+
+    // DONE ====【接收daemon对每个kernel的执行决策】
+    std::vector<D2SKernelExecInfo> kernel_exec_infos;
+    {
+      char buffer[MAX_MSG_DAEMON_SIZE];
+      ssize_t bytes_received = mq_receive(mq_id_program, buffer, MAX_MSG_PROGRAM_SIZE, nullptr);
+      
+      std::cout << "=== handler === Process " << getpid() << " === mq_receive kernel_exec_infos" << std::endl;
+
+      if (bytes_received > 0) {
+        std::string received_data(buffer, bytes_received);
+        std::istringstream stream(received_data);
+        std::string line;
+
+        while (std::getline(stream, line)) {
+          std::string obj_data = line + "\n";  // kernel_count
+          std::getline(stream, line);
+          obj_data += line + "\n";             // exec
+          std::getline(stream, line);
+          obj_data += line + "\n";             // device_index
+          std::getline(stream, line);
+          obj_data += line + "\n";             // scale_count
+          std::getline(stream, line);
+          obj_data += line + "\n";             // req_counts.size()
+
+          int req_count = std::stoi(line);
+          for (int i = 0; i < req_count; ++i) {
+            std::getline(stream, line);
+            obj_data += line + "\n";
+          }
+
+          kernel_exec_infos.push_back(D2SKernelExecInfo::deserialize(obj_data));
+        }
+
+        for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
+          std::cout << "=== handler === Process " << getpid()
+                    << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
+                    << " exec: " << kernel_exec_info.exec
+                    << " device_index: " << kernel_exec_info.device_index
+                    << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
+        }
+      } else {
+        std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " PROGRAM mq_receive failed";
+        perror(errorMsg.c_str());
+        exit(1);
+      }
+
+      // **注意** 这里与online不同 不会有scaledevice 也不会返回跳过
+      // offline的scale与通用流程有什么不一样 为什么online需要分开做handler流程
+      // 解释: online的scale流程针对一个kernel 只有scale新起的handler执行 master要为这一个daemon服务
+      //   offline的流程针对这一组kernel 所有的handler都要执行 逻辑相同
+
+      // 如果info中有scale_count 说明此daemon是scale起的
+      // 全局视图 此时通用流程的daemon不会接收到scale_count
+      if (kernel_exec_infos.at(0).scale_count >= 1) {
+        daemon_scale_count = kernel_exec_infos.at(0).scale_count;
+        std::cout << "=== handler === Process " << getpid() << " === kernel_exec_info scale_count: " << daemon_scale_count << std::endl;
+      
+        // 只属于被scale的daemon的流程
+        // 如果wait_count与scale_count不同 说明不是从第一个wait开始scale 需要跳过第一个走skip分支流程
+        //   直到相同 也需要重走通用流程 就不会接收到scale_count
+        // 如果wait_count与scale_count相同（且一定是1）说明此wait是第一个 后续通用流程直接处理
+
+        // 其他daemon: scale_count==0 不会执行
+        // 被count==1时scale的daemon: scale_count==1时 不满足 不会执行
+        // 被count>1时scale的daemon: 满足 返回跳过第一个
+        if (daemon_wait_count != daemon_scale_count) {
+          std::cout << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " skip first wait" << std::endl;
+          detail::ProgramManager::getInstance().kernel_scale_exec_infos = kernel_exec_infos;
+
+          event empty;
+          return empty;
+        }
+      }
+    }
+    
+    // return commDepend(kernel_exec_infos);
+    // DONE ====【按kernel执行顺序 为每个kernel处理满足依赖 -> rebind -> resubmit】
+    // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
+    std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
+    std::cout << "=== handler === Process " << getpid() << " === kernel_exec_infos.size(): " << kernel_exec_infos.size() << std::endl;
+    for (int exec_num = 0; exec_num < kernel_exec_infos.size(); exec_num++) {
+      D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
+      int kernel_count = kernel_exec_info.kernel_count;
+      detail::SyclKernelCg *sycl_kernel_cg = kernel_cgs.at(kernel_count - 1);
+      std::cout << "=== handler === Process " << getpid() << " === kernel_count: " << kernel_count << std::endl;
+
+      // **注意** 满足依赖的逻辑仍与online一致
+      // 不需要与daemon建立连接 因daemon对所有kernel的依赖都已知
+      // 在一个kernel执行rebind前满足依赖
+      // OPTI 并非前置kernel结束后就发给各个rank 因为可能新rank还没启动 暂时不考虑
+      {
+        auto &req_counts = kernel_exec_info.req_counts;
+        std::cout << "=== handler === Process " << getpid() << " === req_counts.size(): " << req_counts.size() << std::endl;
+        for (int i = 0; i < req_counts.size(); i++) {
+          std::cout << "=== handler === Process " << getpid() << " === req_counts[" << i << "]: " << req_counts[i] << std::endl;
+        }
+
+        if (!kernel_exec_info.exec) {
+          std::cout << "=== NOEXEC ===" << std::endl;
+          if (req_counts.size() > 0) {
+            std::cout << "=== NEED SEND SHMEM ===" << std::endl;
+            for (int i = 0; i < sycl_kernel_cg->kernel_cg->MRequirements.size(); i++) {
+              int daemon_req_count = i + 1;
+              Requirement *Req = sycl_kernel_cg->kernel_cg->MRequirements[i];
+              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic)) {
+                Requirement *hostReq = new Requirement(*Req);
+                EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+                hostEvent->wait(hostEvent);
+                delete hostReq;
+                std::cout << getpid() << " === handler === test_mem ==== sender add host acc" << std::endl;
+
+                using DATA_TYPE = std::byte;
+                size_t elem_size = Req->MElemSize;
+                size_t buff_size = Req->MMemoryRange.size();
+                std::cout << getpid() << " === handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
+                SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+                SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+                void *UserPtr = BufferObj->getUserPtr();
+                DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+
+                SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
+                writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
+                std::cout << getpid() << " === handler === send host data" << std::endl;
+
+                waitForReadCompletion(handle);
+                cleanupSharedMemory(handle, elem_size * buff_size);
+                std::cout << getpid() << " === handler === waitForReadCompletion" << std::endl;
+              }
+            }
+          }
+          std::cout << "=== SEND SHMEM DONE ===" << std::endl;
+        }
+        else {
+          std::cout << "=== EXEC ===" << std::endl;
+          if (req_counts.size() > 0) {
+            std::cout << "=== NEED RECV SHMEM ===" << std::endl;
+            for (int i = 0; i < sycl_kernel_cg->kernel_cg->MRequirements.size(); i++) {
+              int daemon_req_count = i + 1;
+              Requirement *Req = sycl_kernel_cg->kernel_cg->MRequirements[i];
+              std::cout << "=== handler === Process " << getpid() << " === daemon_req_count: " << daemon_req_count << " Req: " << Req << std::endl;
+
+              if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic)) {
+                Requirement *hostReq = new Requirement(*Req);
+                EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+                hostEvent->wait(hostEvent);
+                delete hostReq;
+                std::cout << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
+
+                using DATA_TYPE = std::byte;
+                size_t elem_size = Req->MElemSize;
+                size_t buff_size = Req->MMemoryRange.size();
+                std::cout << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+
+                SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+                SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+                void *UserPtr = BufferObj->getUserPtr();
+                DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+
+                std::vector<DATA_TYPE> host_data(elem_size * buff_size);
+                SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
+                readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
+                std::cout << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
+                cleanupSharedMemory(handle, elem_size * buff_size);
+                std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
+
+                std::cout << getpid() << " === handler === mem copy" << std::endl;
+              }
+            }
+            std::cout << "=== RECV SHMEM DONE ===" << std::endl;
+          }
+        }
+      }
+      
+      // **注意** MQueue在此才rebind 之前有暂未出现过的逻辑使用MQueue
+      // 此时有刚启动的daemon
+      if (kernel_exec_info.exec) {
+        std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
+        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(kernel_exec_info.device_index);
+        detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
+        std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        kernel_queue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), kernel_queue->getAsyncHandler(), kernel_queue->getPropertyList()));
+        std::cout << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
+
+        // resubmit
+        event last_event = resubmit(*sycl_kernel_cg);
+        std::cout << getpid() << " === handler === resubmitted kernel: " << kernel_count << std::endl;
+        if (exec_num == kernel_exec_infos.size() - 1) {
+          std::cout << "=== handler === Process " << getpid() << " === resubmit last kernel: " << kernel_count << std::endl;
+          return last_event;
+        }
+      }
+      else {
+        std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
+        if (exec_num == kernel_exec_infos.size() - 1) {
+          event empty;
+          return empty;
+        }
+      }
+    }
+  }
+}
+
+
+
+#endif
+// 【END】=======================================================
+
+
 
 void handler::addReduction(const std::shared_ptr<const void> &ReduObj) {
   MImpl->MAuxiliaryResources.push_back(ReduObj);
