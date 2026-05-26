@@ -332,7 +332,18 @@ struct DAGNode { // 一个kernel的依赖关系
   std::vector<DAGNode *> depend_on;
   std::vector<DAGNode *> depend_by;
 
-  int exec_rank = -1;
+  std::map<DAGNode *, std::set<SyclReqData>> depend_on_mem; // 依赖的前序kernel及其依赖的mem
+  std::map<DAGNode *, std::set<SyclReqData>> depend_by_mem; // 被后续kernel依赖的mem
+
+  std::map<SyclReqData, DAGNode *> depend_on_node; // 依赖的mem在哪个node上
+
+  double total_elem = 0; // 本节点所有要计算的req的数据量
+  std::map<DAGNode *, double> comm_elem; // 本节点从不同前序需要通信的数据量(从depend_on_mem计算)
+  double rank_u = 0; // 本节点计算出的rank_u
+  double finish_time = 0; // 在HEFT中记录
+
+  int exec_rank = -1; // 选择的rank
+  int exec_proc = -1; // 选择的proc
   // bool executed = false; // online无法获取 --offline用于区别kernel是否已被调度 暂时用不上--
 
   DAGNode(int count, const std::vector<SyclReqData> &reqs) : kernel_count(count), req_data(reqs) {}

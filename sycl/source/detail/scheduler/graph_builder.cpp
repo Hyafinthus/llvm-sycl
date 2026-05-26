@@ -20,6 +20,9 @@
 #include <sycl/access/access.hpp>
 #include <sycl/exception.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
+#include <detail/program_manager/program_manager.hpp>
+#include <detail/daemon/define.hpp>
+
 // #define PRINT_TRACE 1
 // #define PRINT_DAG 1
 
@@ -43,12 +46,25 @@ namespace detail {
 /// work on different parts of the memory object in parallel is legal.
 // TODO merge with LeavesCollection's version of doOverlap (see
 // leaves_collection.cpp).
+#ifdef SNMD_OFFLINE
+// 实际上没有用到 实际Kernel拆分不由此函数决定
+static bool doOverlap(const Requirement *LHS, const Requirement *RHS) {
+  size_t ls = LHS->MOffsetInBytes;
+  size_t le = ls + LHS->MAccessRange.size() * LHS->MElemSize;
+  size_t rs = RHS->MOffsetInBytes;
+  size_t re = rs + RHS->MAccessRange.size() * RHS->MElemSize;
+  bool result = (ls < re) && (rs < le);
+  // std::cout << "doOverlap LHS(" << LHS << "->" << LHS->MSYCLMemObj << ")[" << ls << ", " << le << ") RHS(" << RHS << "->" << RHS->MSYCLMemObj << ")[" << rs << ", " << re << ") = " << result << std::endl;
+  return result;
+}
+#else
 static bool doOverlap(const Requirement *LHS, const Requirement *RHS) {
   return (LHS->MOffsetInBytes + LHS->MAccessRange.size() * LHS->MElemSize >=
           RHS->MOffsetInBytes) ||
          (RHS->MOffsetInBytes + RHS->MAccessRange.size() * RHS->MElemSize >=
           LHS->MOffsetInBytes);
 }
+#endif
 
 bool sameCtx(const ContextImplPtr &LHS, const ContextImplPtr &RHS) {
   // Consider two different host contexts to be the same to avoid additional
@@ -218,8 +234,16 @@ MemObjRecord *Scheduler::GraphBuilder::getOrInsertMemObjRecord(
   SYCLMemObjI *MemObject = Req->MSYCLMemObj;
   MemObjRecord *Record = getMemObjRecord(MemObject);
 
-  if (nullptr != Record)
+  if (nullptr != Record) {
+#if PRINT_TRACE
+    std::cout << "===graph_builder.cpp=== getOrInsertMemObjRecord: record already exists for mem object " << MemObject << std::endl;
+#endif
     return Record;
+  }
+
+#if PRINT_TRACE
+  std::cout << "===graph_builder.cpp=== getOrInsertMemObjRecord: WARNING === create record " << MemObject << std::endl;
+#endif
 
   const size_t LeafLimit = 8;
   LeavesCollection::AllocateDependencyF AllocateDependency =
@@ -304,6 +328,9 @@ UpdateHostRequirementCommand *Scheduler::GraphBuilder::insertUpdateHostReqCmd(
     std::vector<Command *> &ToEnqueue) {
   AllocaCommandBase *AllocaCmd =
       findAllocaForReq(Record, Req, Queue->getContextImplPtr());
+#if PRINT_TRACE
+  std::cout << "===graph_builder.cpp=== insertUpdateHostReqCmd: Record : " << Record << " AllocaCmd: " << AllocaCmd << std::endl;
+#endif
   assert(AllocaCmd && "There must be alloca for requirement!");
   UpdateHostRequirementCommand *UpdateCommand =
       new UpdateHostRequirementCommand(Queue, *Req, AllocaCmd, &Req->MData);
@@ -320,6 +347,9 @@ UpdateHostRequirementCommand *Scheduler::GraphBuilder::insertUpdateHostReqCmd(
     if (ConnCmd)
       ToEnqueue.push_back(ConnCmd);
   }
+#if PRINT_TRACE
+  std::cout << "===graph_builder.cpp=== insertUpdateHostReqCmd: before leaves"<< std::endl;
+#endif
   updateLeaves(Deps, Record, Req->MAccessMode, ToCleanUp);
   addNodeToLeaves(Record, UpdateCommand, Req->MAccessMode, ToEnqueue);
   for (Command *Cmd : ToCleanUp)
@@ -421,6 +451,7 @@ Command *Scheduler::GraphBuilder::insertMemoryMove(
       Record->MCurContext = Queue->getContextImplPtr();
       return nullptr;
     } else {
+      // 这里固定全量拷贝
       // Full copy of buffer is needed to avoid loss of data that may be caused
       // by copying specific range from host to device and backwards.
       NewCmd =
@@ -443,6 +474,98 @@ Command *Scheduler::GraphBuilder::insertMemoryMove(
   Record->MCurContext = Queue->getContextImplPtr();
   return NewCmd;
 }
+
+#ifdef SNMD_OFFLINE
+Command *Scheduler::GraphBuilder::insertMemoryMove(
+    MemObjRecord *Record, Requirement *Req, const QueueImplPtr &DstQueue,
+    const ContextImplPtr &SrcCtx, // NEW: 解决Record->MCurContext不唯一的问题
+    std::vector<Command *> &ToEnqueue) {
+
+  std::vector<Command *> V1{Record->MWriteLeaves.toVector()};
+  std::cout << "===graph_builder.cpp=== findDepsForReq: MWriteLeaves size1: " << V1.size() << std::endl;
+
+  AllocaCommandBase *AllocaCmdDst = getOrCreateAllocaForSplitReq(Record, Req, DstQueue, ToEnqueue);
+
+  // CHECKED 应该去掉寻找DepCmd 因已经手动确定需要依赖的
+  // std::set<Command *> Deps = findDepsForReq(Record, Req, DstQueue->getContextImplPtr());
+  // Deps.insert(AllocaCmdDst);
+  // if (IsSuitableSubReq(Req)) {
+  //   if (AllocaCmdDst->getType() == Command::CommandType::ALLOCA_SUB_BUF)
+  //     AllocaCmdDst =
+  //         static_cast<AllocaSubBufCommand *>(AllocaCmdDst)->getParentAlloca();
+  // }
+
+  std::vector<Command *> V2{Record->MWriteLeaves.toVector()};
+  std::cout << "===graph_builder.cpp=== findDepsForReq: MWriteLeaves size2: " << V2.size() << std::endl;
+
+  // NEW: 通过SrcCtx选择源alloca 不使用原逻辑Record->MCurContext
+  AllocaCommandBase *AllocaCmdSrc = findAllocaForReq(Record, Req, SrcCtx);
+  
+  std::set<Command *> Deps; // 依赖的 需要先执行的
+  Deps.insert(AllocaCmdSrc);
+  Deps.insert(AllocaCmdDst);
+
+  // CHECKED 删除 与原逻辑一致 subbuf时找parent
+  // if (!AllocaCmdSrc && IsSuitableSubReq(Req)) {
+  //   const auto IsSuitableAlloca = [Req, SrcCtx](AllocaCommandBase *AllocaCmd) {
+  //     bool IsInSrcCtx = sameCtx(AllocaCmd->getQueue()->getContextImplPtr(), SrcCtx);
+  //     if (!IsInSrcCtx)
+  //       return false;
+  //     if (AllocaCmd->getSYCLMemObj() == Req->MSYCLMemObj)
+  //       return true;
+  //     return false;
+  //   };
+  //   const auto It =
+  //       std::find_if(Record->MAllocaCommands.begin(),
+  //                    Record->MAllocaCommands.end(), IsSuitableAlloca);
+  //   AllocaCmdSrc = (Record->MAllocaCommands.end() != It) ? *It : nullptr;
+  // }
+  // if (!AllocaCmdSrc)
+  //   throw runtime_error("Cannot find buffer allocation",
+  //                       PI_ERROR_INVALID_VALUE);
+  // if (IsSuitableSubReq(Req)) {
+  //   if (AllocaCmdSrc->getType() == Command::CommandType::ALLOCA_SUB_BUF)
+  //     AllocaCmdSrc =
+  //         static_cast<AllocaSubBufCommand *>(AllocaCmdSrc)->getParentAlloca();
+  // }
+
+  // 与原始逻辑不同 用*Req做部分拷贝
+  // *注意* 因为Req取自kernel 会继承原始kernel对Alloca的accmode
+  Command *NewCmd = new MemCpyCommand(*Req, AllocaCmdSrc,
+                                      *Req, AllocaCmdDst,
+                                      AllocaCmdSrc->getQueue(),
+                                      AllocaCmdDst->getQueue());
+
+  std::vector<Command *> ToCleanUp;
+  for (Command *Dep : Deps) {
+    Command *ConnCmd = NewCmd->addDep(
+        DepDesc{Dep, NewCmd->getRequirement(), AllocaCmdDst}, ToCleanUp);
+    if (ConnCmd)
+      ToEnqueue.push_back(ConnCmd);
+  }
+
+  // printGraphAsDot("after_insertMemoryMove");
+
+  // CHECKED 去掉更新Leaves的逻辑 因为已经手动确定了依赖关系 不需要再通过Leaves来找了
+  // 在运行时概念中 Leaves语义上是对MemObj最近的可作为依赖起点的命令集合
+  // 被依赖的肯定不是最新写的 在叶子中删除所依赖的那些
+  // updateLeaves(Deps, Record, access::mode::read_write, ToCleanUp);
+  // 新Cmd肯定是最新的写的 需要加入叶子
+  // addNodeToLeaves(Record, NewCmd, access::mode::read_write, ToEnqueue);
+
+  // CHECKED 目前不存在cleanupCmd
+  std::cout << "===graph_builder.cpp=== ToCleanUp size: " << ToCleanUp.size() << std::endl;
+  for (Command *Cmd : ToCleanUp)
+    cleanupCommand(Cmd);
+
+  // printGraphAsDot("after_updateLeaves");
+
+  // CHECKED 不再更新CurCtx
+  // Record->MCurContext = DstQueue->getContextImplPtr();
+
+  return NewCmd;
+}
+#endif
 
 Command *Scheduler::GraphBuilder::remapMemoryObject(
     MemObjRecord *Record, Requirement *Req, AllocaCommandBase *HostAllocaCmd,
@@ -579,10 +702,21 @@ Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
   AllocaCommandBase *HostAllocaCmd =
       getOrCreateAllocaForReq(Record, Req, HostQueue, ToEnqueue);
 
+#ifdef PRINT_TRACE
+  std::cout << "===graph_builder.cpp=== addHostAccessor: Record : " << Record << " HostAllocaCmd: " << HostAllocaCmd << std::endl;
+#endif
+
   if (sameCtx(HostAllocaCmd->getQueue()->getContextImplPtr(),
               Record->MCurContext)) {
-    if (!isAccessModeAllowed(Req->MAccessMode, Record->MHostAccess))
+#ifdef PRINT_TRACE
+    std::cout << "===graph_builder.cpp=== addHostAccessor sameCtx" << std::endl;
+#endif
+    if (!isAccessModeAllowed(Req->MAccessMode, Record->MHostAccess)) {
+#ifdef PRINT_TRACE
+      std::cout << "===graph_builder.cpp=== addHostAccessor: access mode Required-" << static_cast<int>(Req->MAccessMode) << " not allowed under Current-" << static_cast<int>(Record->MHostAccess) << std::endl;
+#endif
       remapMemoryObject(Record, Req, HostAllocaCmd, ToEnqueue);
+    }
   } else
     insertMemoryMove(Record, Req, HostQueue, ToEnqueue);
 
@@ -637,10 +771,16 @@ Scheduler::GraphBuilder::findDepsForReq(MemObjRecord *Record,
 
   if (!ReadOnlyReq) {
     std::vector<Command *> V{Record->MReadLeaves.toVector()};
+#ifdef PRINT_TRACE
+    std::cout << "===graph_builder.cpp=== findDepsForReq: ReadLeaves size: " << V.size() << std::endl;
+#endif
 
     ToAnalyze.insert(ToAnalyze.begin(), V.begin(), V.end());
   }
 
+#ifdef PRINT_TRACE
+  std::cout << "===graph_builder.cpp=== findDepsForReq: ToAnalyze size: " << ToAnalyze.size() << std::endl;
+#endif
   while (!ToAnalyze.empty()) {
     Command *DepCmd = ToAnalyze.back();
     ToAnalyze.pop_back();
@@ -731,6 +871,66 @@ static bool checkHostUnifiedMemory(const ContextImplPtr &Ctx) {
   return true;
 }
 
+#ifdef SNMD_OFFLINE
+// 创建一个为DataParallel维护数据的getOrCreateAllocaForReq
+// 由insertMemoryMove调用
+// 去除无用的SubReq和LinkedAllocaCmd逻辑
+AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForSplitReq(
+    MemObjRecord *Record, const Requirement *Req, const QueueImplPtr &Queue,
+    std::vector<Command *> &ToEnqueue) {
+  
+  AllocaCommandBase *AllocaCmd = findAllocaForReq(
+      Record, Req, Queue->getContextImplPtr(), /*AllowConst=*/false);
+  
+  // 需要创建一个新的AllocaCmd
+  if (!AllocaCmd) {
+    std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq NO ALLOCA: create alloca for req with offset: " << Req->MOffsetInBytes << " size: " << Req->MSYCLMemObj->getSizeInBytes() << std::endl;
+
+    std::vector<Command *> ToCleanUp;
+    const Requirement FullReq(/*Offset*/ {0, 0, 0}, Req->MMemoryRange,
+                              Req->MMemoryRange, access::mode::read_write,
+                              Req->MSYCLMemObj, Req->MDims, Req->MElemSize,
+                              0 /*ReMOffsetInBytes*/, false /*MIsSubBuffer*/);
+    const bool HostUnifiedMemory =
+        checkHostUnifiedMemory(Queue->getContextImplPtr());
+    auto *MemObj = static_cast<SYCLMemObjT *>(Req->MSYCLMemObj);
+    const bool InitFromUserData = Record->MAllocaCommands.empty() &&
+                                  (HostUnifiedMemory || MemObj->isInterop());
+    AllocaCommandBase *LinkedAllocaCmd = nullptr;
+
+    // 如果是第一次分配，且内存对象有用户数据指针，则额外创建一个主机分配命令
+    if (Record->MAllocaCommands.empty()) {
+      if (!HostUnifiedMemory &&
+          Req->MAccessMode != access::mode::discard_write &&
+          Req->MAccessMode != access::mode::discard_read_write) {
+        if (MemObj->hasUserDataPtr()) {
+          QueueImplPtr DefaultHostQueue =
+              Scheduler::getInstance().getDefaultHostQueue();
+          AllocaCommand *HostAllocaCmd = new AllocaCommand(
+              DefaultHostQueue, FullReq, true /* InitFromUserData */,
+              nullptr /* LinkedAllocaCmd */,
+              MemObj->isHostPointerReadOnly() /* IsConst */);
+          Record->MAllocaCommands.push_back(HostAllocaCmd);
+          // Record->MWriteLeaves.push_back(HostAllocaCmd, ToEnqueue);
+          // ++(HostAllocaCmd->MLeafCounter);
+          Record->MCurContext = DefaultHostQueue->getContextImplPtr();
+        }
+      }
+    }
+
+    AllocaCmd =
+        new AllocaCommand(Queue, FullReq, InitFromUserData, LinkedAllocaCmd);
+
+    Record->MAllocaCommands.push_back(AllocaCmd);
+    // Record->MWriteLeaves.push_back(AllocaCmd, ToEnqueue);
+    // ++(AllocaCmd->MLeafCounter);
+    for (Command *Cmd : ToCleanUp)
+      cleanupCommand(Cmd);
+  }
+  return AllocaCmd;
+}
+#endif
+
 // The function searches for the alloca command matching context and
 // requirement. If none exists, new allocation command is created.
 // Note, creation of new allocation command can lead to the current context
@@ -743,6 +943,9 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
       Record, Req, Queue->getContextImplPtr(), /*AllowConst=*/false);
 
   if (!AllocaCmd) {
+#ifdef PRINT_TRACE
+    std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: create alloca for req with offset: " << Req->MOffsetInBytes << " size: " << Req->MSYCLMemObj->getSizeInBytes() << std::endl;
+#endif
     std::vector<Command *> ToCleanUp;
     if (IsSuitableSubReq(Req)) {
       // Get parent requirement. It's hard to get right parents' range
@@ -789,6 +992,9 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
           // There's no need to make a host allocation if the buffer is not
           // initialized with user data.
           if (MemObj->hasUserDataPtr()) {
+#ifdef PRINT_TRACE
+            std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: create MAllocaCommands FIRST TIME" << std::endl;
+#endif
             QueueImplPtr DefaultHostQueue =
                 Scheduler::getInstance().getDefaultHostQueue();
             AllocaCommand *HostAllocaCmd = new AllocaCommand(
@@ -826,6 +1032,9 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
                 Queue->is_host() ? checkHostUnifiedMemory(Record->MCurContext)
                                  : HostUnifiedMemory;
             if (PinnedHostMemory || HostUnifiedMemoryOnNonHostDevice) {
+#ifdef PRINT_TRACE
+              std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: find LINKED AVOID MEMCPY" << std::endl;
+#endif
               AllocaCommandBase *LinkedAllocaCmdCand = findAllocaForReq(
                   Record, Req, Record->MCurContext, /*AllowConst=*/false);
 
@@ -843,6 +1052,9 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
 
       // Update linked command
       if (LinkedAllocaCmd) {
+#ifdef PRINT_TRACE
+        std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: LinkedAllocaCmd" << std::endl;
+#endif
         Command *ConnCmd = AllocaCmd->addDep(
             DepDesc{LinkedAllocaCmd, AllocaCmd->getRequirement(),
                     LinkedAllocaCmd},
@@ -988,20 +1200,135 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
   // using Requirement = AccessorImplHost;
   std::vector<Requirement *> &Reqs = CommandGroup->MRequirements;
 
+  // Event通常用于异步表示Command完成状态
+  // 这里代表这个CG需要等待的所有前置Event 在现有bench的kernel上看都是空的
+  std::vector<detail::EventImplPtr> &Events = CommandGroup->MEvents;
+
   #ifdef PRINT_TRACE
   std::cout << "======graph_build.cpp===addCG" << std::endl;
   std::cout << "======graph_build.cpp === MEvents: " << CommandGroup->MEvents.size() << std::endl;
   #endif
 
-  // Event通常用于异步表示Command完成状态
-  // 这里代表这个CG需要等待的所有前置Event 在现有bench的kernel上看都是空的
-  std::vector<detail::EventImplPtr> &Events = CommandGroup->MEvents;
+#ifdef SNMD_OFFLINE
+  //【TEST】处理Slice
+  if (CommandGroup->getType() == CG::Kernel) {
+    auto &PM = detail::ProgramManager::getInstance();
+    auto *TemplateEK = static_cast<CGExecKernel *>(CommandGroup.get());
+    if (PM.NumParts > 1) {
+      std::cout << "=== graph_builder.cpp === addCG: SPLIT for NumParts: " << PM.NumParts << "\n";
+      size_t &NumParts = PM.NumParts;
+      if (NumParts == 0) throw runtime_error("NumParts == 0", PI_ERROR_INVALID_VALUE);
+      if (NumParts != PM.SplitQueues_Write.size()) throw runtime_error("SplitQueues_Write != NumParts", PI_ERROR_INVALID_VALUE);
+
+      const NDRDescT &OldNDR = TemplateEK->MNDRDesc;
+      const size_t dim0 = OldNDR.GlobalSize[0];
+      const size_t chunk = dim0 / NumParts;
+
+      // CHECKED 更新逻辑
+      // detail::QueueImplPtr Q0 = PM.SplitQueues_Write[0];
+      // detail::QueueImplPtr Q1 = PM.SplitQueues_Write[1];
+      // std::vector<Requirem ent*> Reqs0;
+      // std::vector<Requirement*> Reqs1;
+      // Reqs0.reserve(PM.SplitReqs_Read.size() + PM.SplitReqs_Write[0].size());
+      // Reqs1.reserve(PM.SplitReqs_Read.size() + PM.SplitReqs_Write[1].size());
+      // // E F
+      // Reqs0.insert(Reqs0.end(), PM.SplitReqs_Read.begin(), PM.SplitReqs_Read.end());
+      // Reqs1.insert(Reqs1.end(), PM.SplitReqs_Read.begin(), PM.SplitReqs_Read.end());
+      // // G_0 G_1
+      // Reqs0.insert(Reqs0.end(), PM.SplitReqs_Write[0].begin(), PM.SplitReqs_Write[0].end());
+      // Reqs1.insert(Reqs1.end(), PM.SplitReqs_Write[1].begin(), PM.SplitReqs_Write[1].end());
+      // 处理SplitMArgs里每个ArgDesc的MPtr
+      // std::vector<ArgDesc> Args1 = TemplateEK->MArgs;
+      // for (auto &Arg : Args1) {
+      //   auto It = PM.SplitReqs_Remap.find(static_cast<AccessorImplHost*>(Arg.MPtr));
+      //   if (It != PM.SplitReqs_Remap.end()) {
+      //     std::cout << "=== graph_builder.cpp === Arg remapped: " << Arg.MPtr << " to " << It->second << std::endl;
+      //     Arg.MPtr = It->second;
+      //   } else {
+      //     std::cout << "=== graph_builder.cpp === Arg not found in remap: " << Arg.MPtr << std::endl;
+      //   }
+      // }
+
+      std::vector<std::unique_ptr<ExecCGCommand>> SplitCmdOwners;
+      SplitCmdOwners.reserve(NumParts);
+      std::vector<ExecCGCommand *> SplitCmds;
+      SplitCmds.reserve(NumParts);
+
+      for (size_t p = 0; p < NumParts; ++p) {
+        NDRDescT NewNDR = OldNDR;
+        const size_t begin0 = p * chunk;
+        const size_t end0 = (p + 1 == NumParts) ? dim0 : (begin0 + chunk);
+        NewNDR.GlobalOffset[0] = begin0;
+        NewNDR.GlobalSize[0] = end0 - begin0;
+        std::cout << "=== graph_builder.cpp === Split CG " << p << ": begin0: " << begin0 << " end0: " << end0 << "\n";
+
+        std::unique_ptr<CGExecKernel> SplitCG = TemplateEK->cloneForSplit(NewNDR);
+        auto SplitCmd = std::make_unique<ExecCGCommand>(std::move(SplitCG), PM.SplitQueues_Write[p]);
+        ExecCGCommand *SplitCmdRaw = SplitCmd.get();
+
+        std::vector<Requirement *> &R = SplitCmdRaw->getCG().MRequirements;
+        std::vector<detail::EventImplPtr> &E = SplitCmdRaw->getCG().MEvents;
+
+        const ContextImplPtr &SplitCtx =
+            PM.SplitQueues_Write[p]->getContextImplPtr();
+        const bool NewSplit = std::none_of(
+            R.begin(), R.end(), [&SplitCtx](Requirement *Req) {
+              MemObjRecord *Record =
+                  Scheduler::getInstance().getMemObjRecord(Req);
+              return Record && sameCtx(Record->MCurContext, SplitCtx);
+            });
+        std::cout << "=== graph_builder.cpp === Split CG " << p << ": NewSplit: " << NewSplit << "\n";
+        createGraphForSplitCommand(SplitCmdRaw, SplitCmdRaw->getCG(),
+                                   isInteropHostTask(SplitCmdRaw), R, E,
+                                   PM.SplitQueues_Write[p], ToEnqueue, NewSplit);
+
+        std::cout << "=== graph_builder.cpp === Split after graph part " << p
+                  << "\n";
+        SplitCmds.push_back(SplitCmdRaw);
+        SplitCmdOwners.push_back(std::move(SplitCmd));
+      }
+
+      // 4. 创建joinCmd 不能用addEmptyCmd 会设锁
+      auto Join = std::make_unique<EmptyCommand>(Scheduler::getInstance().getDefaultHostQueue());
+      if (!Join) throw runtime_error("Out of host memory", PI_ERROR_OUT_OF_HOST_MEMORY);
+
+      EmptyCommand *JoinRaw = Join.get();
+      std::vector<Command *> JoinToCleanUp;
+
+      // 同时依赖所有分片ExecCGCmd
+      for (ExecCGCommand *SplitCmd : SplitCmds) {
+        if (Command *Conn = JoinRaw->addDep(SplitCmd->getEvent(), JoinToCleanUp))
+          ToEnqueue.push_back(Conn);
+      }
+
+      for (Command *C : JoinToCleanUp)
+        cleanupCommand(C);
+
+      std::cout << "=== graph_builder.cpp === Split after join\n";
+
+      // CHECKED createGraphForSplitCommand已经加入图 不用再加入ToEnqueue
+      // ToEnqueue.push_back(Cmd0Raw);
+      // ToEnqueue.push_back(Cmd1Raw);
+
+      // 5. 转移所有权并返回JoinEvent给scheduler和handler
+      for (auto &Cmd : SplitCmdOwners)
+        Cmd.release();
+      auto JoinEvent = JoinRaw->getEvent();
+      return {Join.release(), JoinEvent, true};
+    }
+
+    PM.NumParts = 1;
+    PM.SplitQueues_Write.clear();
+    std::cout << "=== graph_builder.cpp === addCG: RESET NumParts & SplitQueues_Write\n";
+  }
+#endif
 
   // 返回NewCmd代表整个CG的执行
   auto NewCmd = std::make_unique<ExecCGCommand>(std::move(CommandGroup), Queue);
   if (!NewCmd)
     throw runtime_error("Out of host memory", PI_ERROR_OUT_OF_HOST_MEMORY);
 
+  // **注意** KernelFusion一般不会走
   // Host tasks cannot participate in fusion. They take the regular route. If
   // they create any requirement or event dependency on any of the kernels in
   // the fusion list, this will lead to cancellation of the fusion in the
@@ -1070,6 +1397,110 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
   return {NewCmd.release(), Event, true};
 }
 
+#ifdef SNMD_OFFLINE
+// CHECKED 删除 不需要尝试updateTempLeavesForSplitCommand 直接修改Deps
+// DONE addMemoryMove->insertMemoryMove中，去掉所有split相关memobj的更新leaves逻辑
+// DONE insertMemoryMove->getOrCreateAllocaForSplitReq中，去掉创建AllocaCmd时增加leaves逻辑
+// NEED createGraphForSplitCommand->findDepsForReq中，完全通过leaves寻找DepCmd建立依赖
+// NEED 需要在之前去掉影响的leaves 增加建图需要的leaves
+
+void Scheduler::GraphBuilder::createGraphForSplitCommand(
+    Command *NewCmd, CG &CG, bool isInteropTask,
+    std::vector<Requirement *> &Reqs,
+    const std::vector<detail::EventImplPtr> &Events, QueueImplPtr Queue,
+    std::vector<Command *> &ToEnqueue, bool NewSplit) {
+  if (MPrintOptionsArray[BeforeAddCG])
+    printGraphAsDot("before_addCG");
+  std::vector<Command *> ToCleanUp;
+  
+  for (Requirement *Req : Reqs) {
+    MemObjRecord *Record = nullptr;
+    AllocaCommandBase *AllocaCmd = nullptr;
+    // 此时应该已经完成了所有前置拷贝到splitqueue的操作
+    // 应保证需要的都在同一个ctx 并不会出现系统内判断需要额外拷贝
+    {
+      const QueueImplPtr &QueueForAlloca = Queue;
+      Record = getOrInsertMemObjRecord(QueueForAlloca, Req, ToEnqueue);
+      markModifiedIfWrite(Record, Req);
+      AllocaCmd = getOrCreateAllocaForReq(Record, Req, QueueForAlloca, ToEnqueue);
+      std::cout << "===graph_builder.cpp=== createGraphForSplitCommand Req: " << Req << " MemObj: " << Req->MSYCLMemObj << " Record: " << Record << " AllocaCmd: " << AllocaCmd << std::endl;
+
+      // CHECKED 删除 bool isSameCtx = sameCtx(QueueForAlloca->getContextImplPtr(), Record->MCurContext);
+      // 此处跳过sameCtx判断 即不再出现insertMemMove 或各类保证正确的内存移动
+      // 但因需要为Record增加额外逻辑补上Leaves 因DepDesc完全通过findDepsForReq遍历所有Leaves
+      // 尝试新函数 updateTempLeavesForSplitCommand 成本有点高 Leaves逻辑有点复杂
+    }
+
+    // NewCmd加入DAG是通过寻找DepCmd和增加DepDesc来保证的
+    std::set<Command *> Deps = findDepsForReq(Record, Req, Queue->getContextImplPtr());
+    std::cout << "===graph_builder.cpp=== createGraphForSplitCommand->findDepsForReq Deps size: " << Deps.size() << std::endl;
+
+    // 完全新Split设备 完全由handler控制了Alloca
+    // findDepsForReq找到的都是原始(指的是所涉及所有MemObj的Record的)设备上的DepCmd
+    //   因其会更新MemObj 导致更新Record的CurCtx和Leaves
+    if (NewSplit) {
+      Deps.clear();
+      Deps.insert(AllocaCmd);
+    }
+    // 非Split设备 是某个Req的原始设备
+    //   可能是EF这种有kernel作为DepsCmd修改的 Record的Curctx就在此设备上
+    //   也可能是G这种从host完全新拷贝到此设备 删去更新CurCtx和Leaves的
+    else {
+      // G这种之前完全没有Record记录 完全从host新拷贝到此设备
+      if (Deps.empty()) {
+        Deps.insert(AllocaCmd);
+      }
+      // EF这种MemObj之前在其他设备上被更新 也先拷到host再拷到此设备 找到的Deps会是其他设备
+      else if (Record->MCurContext != Queue->getContextImplPtr()) {
+        Deps.clear();
+        Deps.insert(AllocaCmd);
+      }
+    }
+
+    // 为图增加边 即A->B CmdA.Dep=CmdB CmdB.User=CmdA
+    // Dep在这里都是以AllocaCmd为基准
+    for (Command *Dep : Deps) {
+      if (Dep != NewCmd) {
+        Command *ConnCmd =
+            NewCmd->addDep(DepDesc{Dep, Req, AllocaCmd}, ToCleanUp);
+        if (ConnCmd)
+          ToEnqueue.push_back(ConnCmd);
+      }
+    }
+  }
+
+  // 在DAG中 root是后执行的(Exec) leaf是先执行的(Alloca) 叶子是能立即执行的命令 因为没有任何依赖
+  // 这个NewCmd代表整CG执行 是最后执行的 它的Deps就是其所有依赖的Cmd 即是往下的子节点
+  std::vector<DepDesc> Deps = NewCmd->MDeps;
+
+  // 更新Leaves
+  for (DepDesc &Dep : Deps) {
+    const Requirement *Req = Dep.MDepRequirement;
+    MemObjRecord *Record = getMemObjRecord(Req->MSYCLMemObj);
+    std::cout << "===graph_builder.cpp=== DepCmd: " << Dep.MDepCommand << " Req: " << Req << " Record: " << Record << std::endl;
+    updateLeaves({Dep.MDepCommand}, Record, Req->MAccessMode, ToCleanUp);
+    addNodeToLeaves(Record, NewCmd, Req->MAccessMode, ToEnqueue);
+  }
+
+  // 不是用户显式制定的依赖 是这个CG的所有前置Event
+  // Register all the events as dependencies
+  for (detail::EventImplPtr e : Events) {
+    if (e->getCommand() && e->getCommand() == NewCmd) {
+      continue;
+    }
+    if (Command *ConnCmd = NewCmd->addDep(e, ToCleanUp))
+      ToEnqueue.push_back(ConnCmd);
+  }
+
+  if (MPrintOptionsArray[AfterAddCG])
+    printGraphAsDot("after_addCG");
+
+  for (Command *Cmd : ToCleanUp) {
+    cleanupCommand(Cmd);
+  }
+}
+#endif
+
 void Scheduler::GraphBuilder::createGraphForCommand(
     Command *NewCmd, CG &CG, bool isInteropTask,
     std::vector<Requirement *> &Reqs,
@@ -1102,19 +1533,32 @@ void Scheduler::GraphBuilder::createGraphForCommand(
 
     bool isSameCtx = false;
 
+    // 从MeObj获取Record 并找到AllocaCmd
     {
       // 互操作主机任务 指的是直接调用其他API的任务 一般不需考虑
       const QueueImplPtr &QueueForAlloca =
           isInteropTask ? static_cast<detail::CGHostTask &>(CG).MQueue : Queue;
 
       Record = getOrInsertMemObjRecord(QueueForAlloca, Req, ToEnqueue);
+#ifdef PRINT_TRACE
+      // std::cout << "===graph_builder.cpp=== Record->MWriteLeaves size: " << Record->MWriteLeaves.toVector().size() << std::endl;
+#endif
       markModifiedIfWrite(Record, Req);
 
+#ifdef PRINT_TRACE
+      std::cout << "===graph_builder.cpp=== before getOrCreateAllocaForReq" << std::endl;
+#endif
       AllocaCmd =
           getOrCreateAllocaForReq(Record, Req, QueueForAlloca, ToEnqueue);
+#ifdef PRINT_TRACE
+      std::cout << "===graph_builder.cpp=== after getOrCreateAllocaForReq" << std::endl;
+#endif
 
       isSameCtx =
           sameCtx(QueueForAlloca->getContextImplPtr(), Record->MCurContext);
+#ifdef PRINT_TRACE
+      std::cout << "===graph_builder.cpp=== isSameCtx: " << isSameCtx << std::endl;
+#endif
     }
 
     #ifdef PRINT_DAG
@@ -1153,12 +1597,23 @@ void Scheduler::GraphBuilder::createGraphForCommand(
         }
       } else if (!Queue->is_host() && !Record->MCurContext->is_host())
         NeedMemMoveToHost = true;
+        // 要执行的不在host上 且最新的在另一个不是host的地方 需要先拷回host
+#ifdef PRINT_TRACE
+      std::cout << "===graph_builder.cpp=== before host queue" << std::endl;
+#endif
 
-      if (NeedMemMoveToHost)
+      if (NeedMemMoveToHost) {
         insertMemoryMove(Record, Req,
                          Scheduler::getInstance().getDefaultHostQueue(),
                          ToEnqueue);
+#ifdef PRINT_TRACE
+        std::cout << "===graph_builder.cpp=== NeedMemMoveToHost" << std::endl;
+#endif
+      }
       insertMemoryMove(Record, Req, MemMoveTargetQueue, ToEnqueue);
+#ifdef PRINT_TRACE
+      std::cout << "===graph_builder.cpp=== after target queue" << std::endl;
+#endif
     }
 
     #ifdef PRINT_DAG
@@ -1169,8 +1624,14 @@ void Scheduler::GraphBuilder::createGraphForCommand(
 
     // 下面是更新图的边 节点就是一个个Cmd 以Deps和Users作为遍历的边
     // 一个Cmd Users是依赖于此Cmd的 Deps是此Cmd依赖的 见commands.hpp
+#ifdef PRINT_TRACE
+    std::cout << "===graph_builder.cpp=== before createGraphForCommand->findDepsForReq" << std::endl;
+#endif
     std::set<Command *> Deps =
         findDepsForReq(Record, Req, Queue->getContextImplPtr());
+#ifdef PRINT_TRACE
+    std::cout << "===graph_builder.cpp=== Deps for Req size: " << Deps.size() << std::endl;
+#endif
 
     #ifdef PRINT_DAG
     std::cout << "Deps Size: " << Deps.size() << std::endl;

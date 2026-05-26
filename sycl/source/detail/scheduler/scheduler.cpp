@@ -15,6 +15,7 @@
 #include <sycl/detail/iostream_proxy.hpp>
 // #include <mpi.h>
 // #define PRINT_TRACE 1
+#include <detail/daemon/define.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -425,6 +426,50 @@ EventImplPtr Scheduler::addHostAccessor(Requirement *Req) {
   cleanupCommands(ToCleanUp);
   return NewCmdEvent;
 }
+
+#ifdef SNMD_OFFLINE
+EventImplPtr Scheduler::addMemoryMove(Requirement *Req,
+                                      const QueueImplPtr &DstQueue,
+                                      const QueueImplPtr &SrcQueue) {
+  std::vector<Command *> AuxiliaryCmds;
+  EventImplPtr NewCmdEvent = nullptr;
+
+  {
+    WriteLockT Lock = acquireWriteLock();
+
+    // Record对于每个MemObj唯一
+    MemObjRecord *Record = MGraphBuilder.getOrInsertMemObjRecord(DstQueue, Req, AuxiliaryCmds);
+
+    Command *NewCmd = MGraphBuilder.insertMemoryMove(Record, Req, DstQueue,
+                                                    SrcQueue->getContextImplPtr(), // NEW
+                                                    AuxiliaryCmds);
+    NewCmdEvent = NewCmd->getEvent();
+  }
+
+  std::cout << "===scheduler.cpp=== after insertMemoryMove" << std::endl;
+
+  std::vector<Command *> ToCleanUp;
+  {
+    ReadLockT Lock = acquireReadLock();
+    EnqueueResultT Res;
+    bool Enqueued;
+
+    for (Command *Cmd : AuxiliaryCmds) {
+      Enqueued = GraphProcessor::enqueueCommand(Cmd, Lock, Res, ToCleanUp, Cmd);
+      std::cout << "===scheduler.cpp=== enqueueCommand for AuxiliaryCmds: " << Cmd << std::endl;
+    }
+
+    if (Command *NewCmd = static_cast<Command *>(NewCmdEvent->getCommand())) {
+      Enqueued = GraphProcessor::enqueueCommand(NewCmd, Lock, Res, ToCleanUp, NewCmd);
+    }
+  }
+
+  std::cout << "===scheduler.cpp=== after enqueueCommand" << std::endl;
+
+  cleanupCommands(ToCleanUp);
+  return NewCmdEvent;
+}
+#endif
 
 void Scheduler::releaseHostAccessor(Requirement *Req) {
   Command *const BlockedCmd = Req->MBlockedCmd;

@@ -10,7 +10,8 @@
 #include <detail/device_binary_image.hpp>
 #include <detail/device_global_map_entry.hpp>
 #include <detail/spec_constant_impl.hpp>
-// #include <detail/accessor_impl.hpp>
+#include <detail/accessor_impl.hpp>
+#include <detail/event_impl.hpp>
 #include <sycl/detail/common.hpp>
 #include <sycl/detail/device_global_map.hpp>
 #include <sycl/detail/export.hpp>
@@ -81,7 +82,8 @@ enum class DeviceLibExt : std::uint32_t {
   cl_intel_devicelib_bfloat16,
 };
 
-#ifdef SCHEDULE_OFFLINE
+// #ifdef SCHEDULE_OFFLINE
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
 // 暂时不用存储整个handler 看后面运行情况
 struct SyclKernelCg {
   int kernel_count;
@@ -314,6 +316,20 @@ public:
   std::vector<S2DKernelReqData> kernel_reqs;
   std::vector<SyclKernelCg *> kernel_cgs;
   std::vector<D2SKernelExecInfo> kernel_scale_exec_infos; // scale_count
+#endif
+
+#ifdef SNMD_OFFLINE
+  int wait_count = 0;
+  std::vector<SyclKernelCg *> kernel_cgs;
+
+  size_t NumParts = 1; // 默认值 由hanlder修改 在addCG中读取并重置
+  std::vector<detail::QueueImplPtr> SplitQueues_Write; // Q_G0 Q_G1
+  // CHECKED 已更新逻辑 WriteReq不需要clone 直接使用完整OriReq 导致所有的Req都不用存
+  // std::vector<Requirement*> SplitReqs_onlyRead; // E F
+  // std::vector<Requirement*> SplitReqs_hasWrite; // G
+  // std::array<std::vector<Requirement*>, 2> SplitReqs_Write; // G_0 G_1
+  // 在Command::SetKernelParamsAndLaunch中 ArgDesc.MPtr强转为Req* 在CGExecKernel::clone中转换为新的Req
+  // std::unordered_map<Requirement*, Requirement*> SplitReqs_Remap;
 #endif
 
 private:

@@ -24,6 +24,8 @@
 #include <xpti/xpti_trace_framework.hpp>
 #endif
 
+#include <detail/daemon/define.hpp>
+
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 namespace detail {
@@ -613,6 +615,21 @@ void copyD2H(SYCLMemObjI *SYCLMemObj, RT::PiMem SrcMem, QueueImplPtr SrcQueue,
   }
 }
 
+#ifdef SNMD_OFFLINE
+void copyD2D(SYCLMemObjI *SYCLMemObj, RT::PiMem SrcMem, QueueImplPtr SrcQueue,
+             unsigned int DimSrc, sycl::range<3> SrcSize,
+             sycl::range<3> SrcAccessRange, sycl::id<3> SrcOffset,
+             unsigned int SrcElemSize, RT::PiMem DstMem, QueueImplPtr DstQueue,
+             unsigned int DimDst, sycl::range<3> DstSize, sycl::range<3>,
+             sycl::id<3> DstOffset, unsigned int DstElemSize,
+             std::vector<RT::PiEvent> DepEvents, RT::PiEvent &OutEvent) {
+  assert(SYCLMemObj && "The SYCLMemObj is nullptr");
+  assert(DstQueue && "The DstQueue is nullptr");
+  (void)SrcQueue;
+
+  const RT::PiQueue Queue = DstQueue->getHandleRef();
+  const detail::plugin &Plugin = DstQueue->getPlugin();
+#else
 void copyD2D(SYCLMemObjI *SYCLMemObj, RT::PiMem SrcMem, QueueImplPtr SrcQueue,
              unsigned int DimSrc, sycl::range<3> SrcSize,
              sycl::range<3> SrcAccessRange, sycl::id<3> SrcOffset,
@@ -624,6 +641,7 @@ void copyD2D(SYCLMemObjI *SYCLMemObj, RT::PiMem SrcMem, QueueImplPtr SrcQueue,
 
   const RT::PiQueue Queue = SrcQueue->getHandleRef();
   const detail::plugin &Plugin = SrcQueue->getPlugin();
+#endif
 
   detail::SYCLMemObjI::MemObjType MemType = SYCLMemObj->getType();
   TermPositions SrcPos, DstPos;

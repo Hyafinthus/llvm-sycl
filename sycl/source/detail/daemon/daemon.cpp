@@ -39,6 +39,11 @@ std::map<int, int> index_nvml_sycl;
 std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
 std::vector<int> ranks_idle;
 
+// ====【Algorithm】
+// 暂时先不考虑CPU 如果要放CPU算要额外考虑CPU和GPU的性能差
+std::vector<std::vector<double>> gpu_capability; // 不同rank的gpu算力 monitor初始化写成表
+std::vector<std::vector<double>> gpu_available_time; // 不同gpu的可用时间 monitor查看空闲？不空闲怎么做
+
 // ====【MPI】
 int mpi_rank, mpi_size; // main
 MPI_Comm comm_submit; // SystemSchedulerSubmit
@@ -371,15 +376,16 @@ void generateDAGs(std::vector<DAGNode *> &kernel_dag_nodes, std::vector<DAGNode 
         for (auto it = kernel_dag_nodes.rbegin(); it != kernel_dag_nodes.rend(); ++it) {
           DAGNode *prev_node = *it;
           for (SyclReqData &prev_req : prev_node->req_data) {
-            if (prev_req.mem_pointer == req.mem_pointer) {
-              if (prev_req.req_accmode != acc_mode::read) {
-                node->depend_on.push_back(prev_node);
-                prev_node->depend_by.push_back(node);
-                node->depth = std::max(node->depth, prev_node->depth + 1);
-                found_write = true;
-                // 所有的req_ranks都由调度结束确定exec_rank后生成
-                // kernel间通信代价 即DAG边的权重由算法预估
-              }
+            if (prev_req.req_accmode != acc_mode::read && prev_req.mem_pointer == req.mem_pointer) {
+              node->depend_on.push_back(prev_node);
+              node->depend_on_mem[prev_node].insert(req);
+              node->depend_on_node[req] = prev_node;
+              prev_node->depend_by.push_back(node);
+              prev_node->depend_by_mem[node].insert(req);
+              node->depth = std::max(node->depth, prev_node->depth + 1);
+              found_write = true;
+              // 所有的req_ranks都由调度结束确定exec_rank后生成
+              // kernel间通信代价 即DAG边的权重由算法预估
             }
           }
           if (found_write) {
@@ -390,6 +396,152 @@ void generateDAGs(std::vector<DAGNode *> &kernel_dag_nodes, std::vector<DAGNode 
     }
     kernel_dag_nodes.push_back(node);
   }
+}
+
+// nodes: 这批要调度的所有kernel
+void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
+  // TODO 需要gpu的结束时间 / 空闲的gpu
+  // 需要整个DAG来计算数据传输代价
+  // 需要用capability结合DAG得nodes在不同gpu上的传输代价
+
+  // TEST 不同rank的device算力
+  // 以算力最低（3090节点cpu）为1
+  gpu_capability = {
+    {1, 11.2, 11.2, 11.2, 11.2, 11.2, 11.2, 11.2, 11.2},
+    {4.4, 33.2, 33.2}
+  };
+  // comm_capability 同节点100 跨节点1
+
+  // TEST device的上一个空闲时间 TODO 可共享的怎么算？
+  gpu_available_time = {
+    {0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {0, 0, 0}
+  };
+
+  // 1.根据(规模+monitor)生成执行时间表 对于每个任务t_i计算w(i) 以及任务在不同proc上时各个pre的传输代价
+  for (DAGNode *node : nodes) {
+    // 1.1. 计算每个任务的平均计算时间
+    double total_elem = 0;
+    for (const SyclReqData &req : node->req_data) {
+      total_elem += req.buff_size; // buff_size就是总数据量 不需要除以elem_size
+    }
+    node->total_elem = total_elem / 1000; // TODO 归一化
+    std::cout << "algorithmHEFT: Kernel " << node->kernel_count << " total_elem: " << total_elem << std::endl;
+
+    // 1.2. 计算每个任务需要从各个前序接收多少数据
+    for (std::pair<DAGNode *, std::set<SyclReqData>> dep_pair : node->depend_on_mem) {
+      DAGNode *pre_node = dep_pair.first;
+      int pre_comm_elem = 0;
+      for (const SyclReqData &req : dep_pair.second) {
+        pre_comm_elem += req.buff_size;
+      }
+      node->comm_elem[pre_node] = pre_comm_elem / 1000;
+      std::cout << "algorithmHEFT: Kernel " << node->kernel_count << " depends on Kernel " << pre_node->kernel_count << " pre_comm_elem: " << pre_comm_elem << std::endl;
+    }
+  }
+
+  // 2.从后向前 对于每个任务u->v 计算rank(u)=w_mean(u)+max_v[c(u,v)+rank(v)] 并从大到小排序
+  // 最后一个都是无依赖的
+  std::vector<DAGNode *> exit_nodes;
+  for (DAGNode *node : nodes) {
+    if (node->depend_by.empty()) {
+      node->rank_u = node->total_elem;
+      std::cout << "algorithmHEFT: Kernel " << node->kernel_count << " is exit node rank_u: " << node->rank_u << std::endl;
+      exit_nodes.push_back(node);
+    }
+  }
+  // 广度优先逆序遍历所有exit节点的前驱
+  // 即算一个节点时 它的所有后继必须被计算过
+  std::vector<DAGNode *> visited;
+  std::queue<DAGNode *> q;
+  for (DAGNode *exit_node : exit_nodes) {
+    q.push(exit_node);
+    visited.push_back(exit_node);
+  }
+  while (!q.empty()) {
+    DAGNode *current = q.front();
+    q.pop();
+    for (DAGNode *pre_node : current->depend_on) {
+      if (std::find(visited.begin(), visited.end(), pre_node) == visited.end()) {
+        q.push(pre_node);
+        visited.push_back(pre_node);
+      }
+    }
+  }
+  // 从后向前计算rank_u 要算的是自己给后继多少
+  for (DAGNode *node : visited) {
+    int max_succ = 0;
+    for (DAGNode *succ_node : node->depend_by) {
+      // 依赖一定存在
+      if (succ_node->comm_elem[node] + succ_node->rank_u > max_succ) {
+        max_succ = succ_node->comm_elem[node] + succ_node->rank_u;
+      }
+    }
+    node->rank_u = node->total_elem + max_succ; // 简单估计
+  }
+  // 以rank_u从大到小排序
+  std::sort(visited.begin(), visited.end(), [](DAGNode *a, DAGNode *b) {
+    return a->rank_u > b->rank_u;
+  });
+
+  // 3.每个任务计算 对于每个proc 计算start_v(p)=max_[last_finish(p),finish(u_1)+comm(u_1,v),...]
+  // 和finish_v(p)=start_v(p)+w(v,p)
+  // 选取earliest_finish_p(v)=min[finish_v(p)] 更新各个变量
+  for (int order = 0; order < visited.size(); order++) {
+    DAGNode *node = visited[order];
+    int earliest_finish = INT_MAX;
+    int rank_chosen = -1;
+    int proc_chosen = -1;
+    // 遍历所有proc
+    for (int rank = 0; rank < gpu_available_time.size(); rank++) {
+      auto &time_vec = gpu_available_time[rank];
+      for (int proc = 0; proc < time_vec.size(); proc++) {
+        int last_finish = time_vec[proc];
+        int start_time = last_finish;
+        // 找到最早能开始时间 即所有数据都传输完的最大时间
+        for (DAGNode *pre_node : node->depend_on) {
+          int pre_comm_time = 0;
+          // 判断是否同一rank甚至同一proc 通信代价不同
+          if (pre_node->exec_rank != rank) {
+            pre_comm_time = node->comm_elem[pre_node] / 1;
+          } else if (pre_node->exec_proc != proc) {
+            pre_comm_time = node->comm_elem[pre_node] / 100;
+          } else {
+            pre_comm_time = 0;
+          }
+          if (start_time < pre_node->finish_time + pre_comm_time) {
+            start_time = pre_node->finish_time + pre_comm_time;
+          }
+        }
+        int finish_time = start_time + node->total_elem / gpu_capability[rank][proc];
+        if (finish_time < earliest_finish) {
+          earliest_finish = finish_time;
+          rank_chosen = rank;
+          proc_chosen = proc;
+        }
+      }
+    }
+    node->exec_rank = rank_chosen;
+    node->exec_proc = proc_chosen;
+    node->finish_time = earliest_finish;
+    gpu_available_time[rank_chosen][proc_chosen] = earliest_finish;
+
+    D2DKernelSchedInfo kernel_sched_info;
+    kernel_sched_info.kernel_count = node->kernel_count;
+    kernel_sched_info.exec_order = order + 1;
+    kernel_sched_info.exec_rank = node->exec_rank;
+    kernel_sched_info.exec_device = node->exec_proc;
+    for (const SyclReqData &req : node->req_data) {
+      kernel_sched_info.req_rank[req] = node->exec_rank;
+    }
+    kernel_sched_order_infos.push_back(kernel_sched_info);
+
+    std::cout << "algorithmHEFT: Kernel " << node->kernel_count << " assigned to Rank " << node->exec_rank << " Proc " << node->exec_proc << " finish_time: " << node->finish_time << std::endl;
+  }
+
+  // TODO 最合适用几个节点去跑
+  // 通信代价和贪心避免了扩张代价大于运行代价
+
 }
 
 // ========【Offline End】
@@ -1192,8 +1344,8 @@ void *SystemSchedulerDaemonOffline(void *arg) {
   // std::map<int, int> exec_kernel_device; // kernel_count -> device_index in monitor_info
 
   //【scale】此daemon由master扩容来
-  // TODO 完全没写扩容判断逻辑
   {
+    // master中存在初始化为0的syclapp_count 非master存在scalecount的syclapp_count
     if (globalcount_to_scalecount.find(syclapp_count) == globalcount_to_scalecount.end()) {
       std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) + " globalcount_to_scalecount not found";
       perror(errorMsg.c_str());
@@ -1213,6 +1365,8 @@ void *SystemSchedulerDaemonOffline(void *arg) {
     }
     std::cout << "SystemSchedulerDaemonOffline: Rank " << daemon_rank << " for PID " << local_pid << " opened mq_id_program: " << MESSAGE_QUEUE_PROGRAM_NAME << std::endl;
 
+    // 因可能会在第一个scalecount扩容导致必须在syclapp最开始同步
+    // TODO 在这里同步初始化代价
     std::string serialized_data = std::to_string(scale_count);
     size_t message_size = serialized_data.size();
     int ret = mq_send(mq_id_program, serialized_data.c_str(), message_size, 0);
@@ -1222,6 +1376,7 @@ void *SystemSchedulerDaemonOffline(void *arg) {
     // mq_getattr(mq_id_program, &check_attr);
     // std::cout << "[DM Debug] mq_curmsgs = " << check_attr.mq_curmsgs << ", mq_msgsize = " << check_attr.mq_msgsize << std::endl;
 
+    // 用scalecount是否为默认值0区分master和非master扩容
     if (scale_count > 0) {
       //【与online不同】等待master传递D2D信息
       // 解释: online记录scalecount 扩容的daemon必定要执行
@@ -1247,6 +1402,7 @@ void *SystemSchedulerDaemonOffline(void *arg) {
   while (1) {
     // DONE ====【接收program通信】
     std::vector<S2DKernelReqData> kernel_req_datas;
+    int daemon_wait_count;
     {
       std::cout << "SystemSchedulerDaemonOffline: Rank " << daemon_rank << ": waiting reqs from handler" << std::endl;
       char buffer[MAX_MSG_DAEMON_SIZE];
@@ -1262,6 +1418,9 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         std::istringstream stream(received_data);
         std::string line;
 
+        // **注意** 在最前面加上daemon_wait_count
+        std::getline(stream, line);
+        daemon_wait_count = std::stoi(line);
         while (std::getline(stream, line)) {
           std::string obj_data = line + "\n";  // pid line
           std::getline(stream, line);
@@ -1302,27 +1461,23 @@ void *SystemSchedulerDaemonOffline(void *arg) {
       }
     }
 
-    // 找出所有空闲rank供算法选择
-    std::vector<int> idle_ranks;
+    // DELE 找出所有空闲rank供算法选择
+    // std::vector<int> idle_ranks;
     std::set<int> &onrun_ranks = globalcount_to_onrun[syclapp_count];
-    for (int i = 0; i < ranks_idle.size(); i++) {
-      if (ranks_idle[i] && onrun_ranks.find(i) == onrun_ranks.end()) {
-        idle_ranks.push_back(i);
-      }
-    }
+    // for (int i = 0; i < ranks_idle.size(); i++) {
+    //   if (ranks_idle[i] && onrun_ranks.find(i) == onrun_ranks.end()) {
+    //     idle_ranks.push_back(i);
+    //   }
+    // }
     int onrun_size = onrun_ranks.size();
 
     // ====【调度决策并发给其他rank】
-    // int scale_num = 0; // 需要scale的数量
-    std::vector<int> scale_ranks;
-    int scale_size = 0;
     std::vector<D2DKernelSchedInfo> kernel_sched_order_infos;
-    // std::vector<D2DKernelSchedInfo> kernel_sched_infos;
-    // std::vector<D2DKernelSchedInfo> kernel_sched_order_infos = kernel_sched_infos;
+    std::vector<int> scale_ranks;
     {
-      // TODO 算法计算适合的rank数 以及每个kernel的执行顺序和device 需要同时考虑每个rank的device空闲
+      // 算法计算适合的rank数 以及每个kernel的执行顺序和device 需要同时考虑每个rank的device空闲
       if (daemon_rank == master_rank) {
-        // 构建DAG 确定依赖
+        // 1. 构建DAG 确定依赖
         std::vector<DAGNode *> nodes; // 所有kernel对应的DAG
         for (S2DKernelReqData & kernel_req_data : kernel_req_datas) {
           DAGNode *node = new DAGNode(kernel_req_data.kernel_count, kernel_req_data.reqs);
@@ -1330,100 +1485,112 @@ void *SystemSchedulerDaemonOffline(void *arg) {
           nodes.push_back(node);
         }
         generateDAGs(kernel_dag_nodes, nodes);
-        
+
+        // 2. 调度算法 更新node和sched_info
+        algorithmHEFT(nodes, kernel_sched_order_infos);
+        std::cout << "Rank " << daemon_rank << " TEST kernel_sched_order_infos size: " << kernel_sched_order_infos.size() << std::endl;
+
         // TEST-START ===【固定测试】
         // globalDevices只取掉了加速器 0号是CPU
-        D2DKernelSchedInfo kernel_1;
-        kernel_1.kernel_count = 1;
-        kernel_1.exec_order = 1;
-        kernel_1.exec_rank = 1;
-        kernel_1.exec_device = 1;
-        kernel_sched_order_infos.push_back(kernel_1);
-
-        D2DKernelSchedInfo kernel_2;
-        kernel_2.kernel_count = 2;
-        kernel_2.exec_order = 2;
-        kernel_2.exec_rank = 1; // 从idle_ranks中选择 存到scale_ranks
-        kernel_2.exec_device = 1;
-        kernel_sched_order_infos.push_back(kernel_2);
-        
-        D2DKernelSchedInfo kernel_3;
-        kernel_3.kernel_count = 3;
-        kernel_3.exec_order = 3;
-        kernel_3.exec_rank = 1;
-        kernel_3.exec_device = 1;
-        kernel_sched_order_infos.push_back(kernel_3);
-
-        D2DKernelSchedInfo kernel_4;
-        kernel_4.kernel_count = 4;
-        kernel_4.exec_order = 4;
-        kernel_4.exec_rank = 0;
-        kernel_4.exec_device = 1;
-        kernel_sched_order_infos.push_back(kernel_4);
-
-        // TODO 这里知道要扩容了 开始扩容
-        std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
-        pid_to_scalecount_queue[local_pid]->push(std::make_pair(1, 0)); // (scale_count, rank) 这里不是kerne_count 是wait_count了
-        // TODO 第一个就不在master上执行如何解决 先不考虑后起的需要满足以来
-        pid_to_scalecount_cv[local_pid]->notify_one();
-
-        std::cout << "Rank " << daemon_rank << " TEST kernel_sched_order_infos size: " << kernel_sched_order_infos.size() << std::endl;
+        // D2DKernelSchedInfo kernel_1;
+        // kernel_1.kernel_count = 1;
+        // kernel_1.exec_order = 1;
+        // kernel_1.exec_rank = 1;
+        // kernel_1.exec_device = 1;
+        // kernel_sched_order_infos.push_back(kernel_1);
+        // D2DKernelSchedInfo kernel_2;
+        // kernel_2.kernel_count = 2;
+        // kernel_2.exec_order = 2;
+        // kernel_2.exec_rank = 1; // 从idle_ranks中选择 存到scale_ranks
+        // kernel_2.exec_device = 1;
+        // kernel_sched_order_infos.push_back(kernel_2);
+        // D2DKernelSchedInfo kernel_3;
+        // kernel_3.kernel_count = 3;
+        // kernel_3.exec_order = 3;
+        // kernel_3.exec_rank = 1;
+        // kernel_3.exec_device = 1;
+        // kernel_sched_order_infos.push_back(kernel_3);
+        // D2DKernelSchedInfo kernel_4;
+        // kernel_4.kernel_count = 4;
+        // kernel_4.exec_order = 4;
+        // kernel_4.exec_rank = 0;
+        // kernel_4.exec_device = 1;
+        // kernel_sched_order_infos.push_back(kernel_4);
         // TEST-END ===【固定测试】
 
-        // 1. 填充node的exec_rank 紧接req_rank要用
-        for (DAGNode *node : nodes) {
-          // 在kernel_sched_order_infos中找到对应的kernel_sched_info
-          auto it = std::find_if(kernel_sched_order_infos.begin(), kernel_sched_order_infos.end(),
-            [node](const D2DKernelSchedInfo &info) { return info.kernel_count == node->kernel_count; });
-          if (it != kernel_sched_order_infos.end()) {
-            D2DKernelSchedInfo &kernel_sched_info = *it;
-            
-            node->exec_rank = kernel_sched_info.exec_rank;
-          } else {
-            std::cerr << "Error: Kernel " << node->kernel_count << " not found in kernel_sched_order_infos." << std::endl;
-          }
+        // 3. 处理扩容 从sched_info获取
+        // TODO 扩容代价可以加入gpu_available_time
+        // 需要通过实验确定规模初始化与时间的关系
+        std::set<int> sched_ranks;
+        for (D2DKernelSchedInfo &kernel_sched_info : kernel_sched_order_infos) {
+          sched_ranks.insert(kernel_sched_info.exec_rank);
+        }
+        // scale_ranks是sched_ranks减去onrun_ranks
+        std::set_difference(sched_ranks.begin(), sched_ranks.end(),
+                            onrun_ranks.begin(), onrun_ranks.end(),
+                            std::back_inserter(scale_ranks));
+        std::cout << "Rank " << daemon_rank << " scale_ranks: " << scale_ranks.size() << std::endl;
+
+        for (int scale_rank : scale_ranks) {
+          std::cout << "Rank " << daemon_rank << " NEED SCALE rank: " << scale_rank << std::endl;
+          // **注意** 在扩容逻辑中 一个scale_count可以扩容多个rank 目前没看到
+          std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
+          pid_to_scalecount_queue[local_pid]->push(std::make_pair(daemon_wait_count, scale_rank)); // (scale_count, rank) 这里不是kerne_count 是wait_count了
+          pid_to_scalecount_cv[local_pid]->notify_one();
+          // **注意** 整个syclapp的第一个kernel一定会在master上执行 因其他rank会有初始化代价 前提是master不由其他syclapp占用
         }
 
-        // 2. 填充每个kernel的req_rank
-        // online中 一个req只找一个最近写作为依赖 但一个kernel可能不同req导致依赖多个前置kernel
-        // OPTI 先不做online的优化 只找依赖中的最近写 直接得出req_rank
-        for (DAGNode *node : nodes) {
-          std::map<SyclReqData, int> req_rank;
-          auto it = std::find_if(kernel_sched_order_infos.begin(), kernel_sched_order_infos.end(),
-            [node](const D2DKernelSchedInfo &info) { return info.kernel_count == node->kernel_count; });
-          if (it != kernel_sched_order_infos.end()) {
-            D2DKernelSchedInfo &kernel_sched_info = *it;
-
-            // OPTI 又跑了一遍generateDAGs的逻辑 太重复
-            for (SyclReqData &req : node->req_data) {
-              if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
-                bool found = false;
-                for (DAGNode *prev_node : node->depend_on) {
-                  for (SyclReqData &prev_req : prev_node->req_data) {
-                    if (prev_req.req_accmode != acc_mode::read && prev_req.mem_pointer == req.mem_pointer) {
-                      req_rank[req] = prev_node->exec_rank;
-                      found = true;
-                      break;
-                    }
-                  }
-                  if (found) {
-                    break;
-                  }
-                }
-              }
-            }
-            kernel_sched_info.req_rank = req_rank;
-          } else {
-            std::cerr << "Error: Kernel " << node->kernel_count << " not found in kernel_sched_order_infos." << std::endl;
-          }
-        }
-
-        std::sort(kernel_sched_order_infos.begin(), kernel_sched_order_infos.end());
+        // DELE ==== 算法中已填充node.exec_rank和kernel_sched_info.req_rank
+        // // 1. 填充node的exec_rank 紧接req_rank要用
+        // for (DAGNode *node : nodes) {
+        //   // 在kernel_sched_order_infos中找到对应的kernel_sched_info
+        //   auto it = std::find_if(kernel_sched_order_infos.begin(), kernel_sched_order_infos.end(),
+        //     [node](const D2DKernelSchedInfo &info) { return info.kernel_count == node->kernel_count; });
+        //   if (it != kernel_sched_order_infos.end()) {
+        //     D2DKernelSchedInfo &kernel_sched_info = *it;
+        //     node->exec_rank = kernel_sched_info.exec_rank;
+        //   } else {
+        //     std::cerr << "Error: Kernel " << node->kernel_count << " not found in kernel_sched_order_infos." << std::endl;
+        //   }
+        // }
+        // // 2. 填充每个kernel的req_rank
+        // // online中 一个req只找一个最近写作为依赖 但一个kernel可能不同req导致依赖多个前置kernel
+        // // OPTI 先不做online的优化 只找依赖中的最近写 直接得出req_rank
+        // for (DAGNode *node : nodes) {
+        //   std::map<SyclReqData, int> req_rank;
+        //   auto it = std::find_if(kernel_sched_order_infos.begin(), kernel_sched_order_infos.end(),
+        //     [node](const D2DKernelSchedInfo &info) { return info.kernel_count == node->kernel_count; });
+        //   if (it != kernel_sched_order_infos.end()) {
+        //     D2DKernelSchedInfo &kernel_sched_info = *it;
+        //     // OPTI 又跑了一遍generateDAGs的逻辑 太重复
+        //     for (SyclReqData &req : node->req_data) {
+        //       if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
+        //         bool found = false;
+        //         for (DAGNode *prev_node : node->depend_on) {
+        //           for (SyclReqData &prev_req : prev_node->req_data) {
+        //             if (prev_req.req_accmode != acc_mode::read && prev_req.mem_pointer == req.mem_pointer) {
+        //               req_rank[req] = prev_node->exec_rank;
+        //               found = true;
+        //               break;
+        //             }
+        //           }
+        //           if (found) {
+        //             break;
+        //           }
+        //         }
+        //       }
+        //     }
+        //     kernel_sched_info.req_rank = req_rank;
+        //   } else {
+        //     std::cerr << "Error: Kernel " << node->kernel_count << " not found in kernel_sched_order_infos." << std::endl;
+        //   }
+        // }
+        // std::sort(kernel_sched_order_infos.begin(), kernel_sched_order_infos.end());
       }
-      scale_ranks.push_back(0);
-      scale_size = scale_ranks.size();
 
-      // TODO 这里写错了 scale_ranks填充逻辑没写
+      // DELE 这里写错了 scale_ranks填充逻辑没写
+      // scale_ranks.push_back(0);
+      int scale_size = scale_ranks.size();
       // ====【扩容需要的rank数】
       // 选不在onrun中最空闲的
       // OPTI 优化空间 根据可能的空闲时间来安排rank
@@ -1483,6 +1650,7 @@ void *SystemSchedulerScale(void *arg) {
     // master记录目前参与计算的rank
     std::set<int> onrun_ranks = {master_rank};
     globalcount_to_onrun.insert(std::pair<int, std::set<int>>(syclapp_count, onrun_ranks));
+    // **注意** 这边0和1是初始化一个不会出现的数字
     // online里扩容必然不是从1开始 而offline中可以 且要考虑扩容多rank
     // globalcount_to_scalecount.insert(std::pair<int, int>(syclapp_count, 1));
     globalcount_to_scalecount.insert(std::pair<int, int>(syclapp_count, 0)); // offline用
@@ -1555,6 +1723,7 @@ void *SystemSchedulerScale(void *arg) {
       MPI_Recv(&scale_count, 1, MPI_INT, master_rank, 0, comm_syclapp, MPI_STATUS_IGNORE);
       std::cout << "SystemSchedulerScale: SYCLAPP_Rank " << syclapp_rank << " scale_count: " << scale_count << " received from rank " << master_rank << std::endl;
 
+      // 非master从master通信接受scalecount 写入daemon全局可见数组中
       globalcount_to_scalecount.insert(std::pair<int, int>(syclapp_count, scale_count));
       
       ProgramInfo program_info;

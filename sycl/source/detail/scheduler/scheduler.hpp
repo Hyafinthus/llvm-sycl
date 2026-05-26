@@ -430,6 +430,12 @@ public:
   /// and host accessor is ready for use.
   EventImplPtr addHostAccessor(Requirement *Req);
 
+#ifdef SNMD_OFFLINE
+  EventImplPtr addMemoryMove(Requirement *Req,
+                             const QueueImplPtr &DstQueue,
+                             const QueueImplPtr &SrcQueue);
+#endif
+
   /// Unblocks operations with the memory object.
   ///
   /// \param Req is a requirement that points to the memory object being
@@ -634,11 +640,25 @@ protected:
 
     std::vector<SYCLMemObjI *> MMemObjs;
 
+#ifdef SNMD_OFFLINE
+    AllocaCommandBase *getOrCreateAllocaForSplitReq(MemObjRecord *Record, const Requirement *Req,
+                                               const QueueImplPtr &Queue,
+                                               std::vector<Command *> &ToEnqueue);
+#endif
+
     AllocaCommandBase *getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
                                                const QueueImplPtr &Queue,
                                                std::vector<Command *> &ToEnqueue);
 
     void markModifiedIfWrite(MemObjRecord *Record, Requirement *Req);
+
+#ifdef SNMD_OFFLINE
+    // std::vector<std::unique_ptr<Command>> MSplitOwnedCmds;
+
+    Command *insertMemoryMove(MemObjRecord *Record, Requirement *Req,
+                              const QueueImplPtr &DstQueue, const ContextImplPtr &SrcCtx,
+                              std::vector<Command *> &ToEnqueue);
+#endif
 
   private:
     /// Inserts the command required to update the memory object state in the
@@ -676,6 +696,14 @@ protected:
                               Command::BlockReason Reason,
                               std::vector<Command *> &ToEnqueue,
                               const bool AddDepsToLeaves = true);
+
+#ifdef SNMD_OFFLINE
+    void createGraphForSplitCommand(Command *NewCmd, CG &CG, bool isInteropTask,
+                               std::vector<Requirement *> &Reqs,
+                               const std::vector<detail::EventImplPtr> &Events,
+                               QueueImplPtr Queue,
+                               std::vector<Command *> &ToEnqueue, bool NewSplit);
+#endif
 
     void createGraphForCommand(Command *NewCmd, CG &CG, bool isInteropTask,
                                std::vector<Requirement *> &Reqs,

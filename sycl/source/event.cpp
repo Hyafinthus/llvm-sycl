@@ -49,7 +49,7 @@ bool event::is_host() const {
   return IsHost;
 }
 
-// #ifdef SCHEDULE_OFFLINE
+// 不需要 #ifdef SCHEDULE_OFFLINE
 //   event resubmit(detail::SyclKernelCg &sycl_kernel_cg); // 应该不用
 //   event scheduleOffline();
 // #endif
@@ -74,7 +74,8 @@ void event::wait() {
 //   last_event.impl->wait(last_event.impl);
 // #endif
 
-#ifdef SCHEDULE_OFFLINE
+// #ifdef SCHEDULE_OFFLINE
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
   event last_event = getHandler()->scheduleOffline();
   std::cout << "===event.cpp=== scheduleOffline last_event" << std::endl;
   last_event.impl->wait(last_event.impl);

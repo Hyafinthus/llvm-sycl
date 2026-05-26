@@ -106,7 +106,7 @@ public:
 
   virtual ~CG() = default;
 
-private:
+protected:
   CGTYPE MType;
   // The following storages are needed to ensure that arguments won't die while
   // we are using them.
@@ -173,6 +173,65 @@ public:
     assert((getType() == RunOnHostIntel || getType() == Kernel) &&
            "Wrong type of exec kernel CG.");
   }
+
+#define SNMD_OFFLINE
+#ifdef SNMD_OFFLINE
+  std::unique_ptr<CGExecKernel> cloneForSplit(const NDRDescT &NewNDR) const {
+    // CG基类里有 MArgsStorage MAccStorage MSharedPtrStorage MRequirements MEvents
+    // 复制 保证新CG生命周期独立
+    auto ArgsStorageCopy = MArgsStorage; // vector<vector<char>>
+    auto AccStorageCopy = MAccStorage; // vector<AccessorImplPtr>
+    auto SharedPtrStorageCopy = MSharedPtrStorage;
+    auto EventsCopy = MEvents;
+
+    auto ReqsCopy = MRequirements; // vector<AccessorImplHost *>
+    auto ArgsCopy = MArgs; // vector<ArgDesc>
+
+    return std::make_unique<CGExecKernel>(
+        NewNDR,
+        nullptr, // unique_ptr HostKernel
+        MSyclKernel, // shared_ptr
+        MKernelBundle, // shared_ptr
+        std::move(ArgsStorageCopy),
+        std::move(AccStorageCopy),
+        std::move(SharedPtrStorageCopy),
+        std::move(ReqsCopy),
+        std::move(EventsCopy),
+        std::move(ArgsCopy), // MArgs.MPtr直接作为Req*
+        MKernelName,
+        MOSModuleHandle,
+        MStreams, // vector<shared_ptr<...>> 值拷贝 共享资源
+        MAuxiliaryResources, // vector<shared_ptr<const void>> 共享资源
+        MType,
+        MKernelCacheConfig);
+  }
+
+  // CHECKED 已更新逻辑
+  // std::unique_ptr<CGExecKernel> cloneForSplit(const NDRDescT &NewNDR, std::vector<AccessorImplHost *> NewReqs, std::vector<ArgDesc> NewArgs) const {
+  //   // CG基类里有 MArgsStorage MAccStorage MSharedPtrStorage MRequirements MEvents
+  //   auto ArgsStorageCopy = MArgsStorage; // vector<vector<char>>
+  //   auto AccStorageCopy = MAccStorage; // vector<AccessorImplPtr>
+  //   auto SharedPtrStorageCopy = MSharedPtrStorage;
+  //   auto EventsCopy = MEvents;
+  //   return std::make_unique<CGExecKernel>(
+  //       NewNDR, // 子NDRange
+  //       nullptr, // HostKernel
+  //       MSyclKernel, // shared_ptr
+  //       MKernelBundle, // shared_ptr
+  //       std::move(ArgsStorageCopy),
+  //       std::move(AccStorageCopy),
+  //       std::move(SharedPtrStorageCopy),
+  //       std::move(NewReqs), // 子Req
+  //       std::move(EventsCopy),
+  //       std::move(NewArgs), // MArgs.MPtr直接作为Req*
+  //       MKernelName,
+  //       MOSModuleHandle,
+  //       MStreams,
+  //       MAuxiliaryResources,
+  //       MType,
+  //       MKernelCacheConfig);
+  // }
+#endif
 
   std::vector<ArgDesc> getArguments() const { return MArgs; }
   std::string getKernelName() const { return MKernelName; }

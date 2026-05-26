@@ -4381,6 +4381,34 @@ pi_result cuda_piEnqueueMemBufferWriteRect(
   return retErr;
 }
 
+#define SNMD_OFFLINE
+#ifdef SNMD_OFFLINE
+static bool canAccessPeerAndEnable(pi_context dstCtx, pi_context srcCtx) {
+  if (!dstCtx || !srcCtx)
+    return false;
+  if (dstCtx == srcCtx)
+    return true;
+
+  int canAccess = 0;
+  PI_CHECK_ERROR(cuDeviceCanAccessPeer(
+      &canAccess, dstCtx->get_device()->get(), srcCtx->get_device()->get()));
+
+  if (!canAccess) {
+    std::cout << "P2P access between contexts is not available.\n";
+    return false;
+  }
+
+  ScopedContext active(dstCtx);
+  CUresult r = cuCtxEnablePeerAccess(srcCtx->get(), 0);
+  if (r != CUDA_SUCCESS && r != CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED) {
+    PI_CHECK_ERROR(r);
+  }
+
+  std::cout << "P2P access between contexts is enabled.\n";
+  return true;
+}
+#endif
+
 pi_result cuda_piEnqueueMemBufferCopy(pi_queue command_queue, pi_mem src_buffer,
                                       pi_mem dst_buffer, size_t src_offset,
                                       size_t dst_offset, size_t size,
@@ -4407,10 +4435,33 @@ pi_result cuda_piEnqueueMemBufferCopy(pi_queue command_queue, pi_mem src_buffer,
       result = retImplEv->start();
     }
 
+#ifdef SNMD_OFFLINE
+    CUdeviceptr src = src_buffer->mem_.buffer_mem_.get() + src_offset;
+    CUdeviceptr dst = dst_buffer->mem_.buffer_mem_.get() + dst_offset;
+
+    pi_context srcCtx = src_buffer->get_context();
+    pi_context dstCtx = dst_buffer->get_context();
+
+    // 跨ctx 优先走P2P
+    bool usedPeer = false;
+    if (srcCtx != dstCtx && command_queue->get_context() == dstCtx) {
+      if (canAccessPeerAndEnable(dstCtx, srcCtx)) {
+        result = PI_CHECK_ERROR(
+            cuMemcpyPeerAsync(dst, dstCtx->get(), src, srcCtx->get(), size, stream));
+        usedPeer = true;
+      }
+    }
+
+    // 同ctx 或不满足peer条件 走原路径
+    if (!usedPeer) {
+      result = PI_CHECK_ERROR(cuMemcpyDtoDAsync(dst, src, size, stream));
+    }
+#else
     auto src = src_buffer->mem_.buffer_mem_.get() + src_offset;
     auto dst = dst_buffer->mem_.buffer_mem_.get() + dst_offset;
 
     result = PI_CHECK_ERROR(cuMemcpyDtoDAsync(dst, src, size, stream));
+#endif
 
     if (event) {
       result = retImplEv->record();
@@ -4443,7 +4494,13 @@ pi_result cuda_piEnqueueMemBufferCopyRect(
   std::unique_ptr<_pi_event> retImplEv{nullptr};
 
   try {
+#ifdef SNMD_OFFLINE
+    pi_context queueCtx = command_queue->get_context();
+    ScopedContext active(queueCtx);
+#else
     ScopedContext active(command_queue->get_context());
+#endif
+
     CUstream cuStream = command_queue->get_next_transfer_stream();
     retErr = enqueueEventsWait(command_queue, cuStream, num_events_in_wait_list,
                                event_wait_list);
@@ -4454,10 +4511,92 @@ pi_result cuda_piEnqueueMemBufferCopyRect(
       retImplEv->start();
     }
 
+#ifdef SNMD_OFFLINE
+    pi_context srcCtx = src_buffer->get_context();
+    pi_context dstCtx = dst_buffer->get_context();
+
+    bool usedPeer = false;
+
+    // Only attempt peer path when queue is on destination context.
+    if (srcCtx != dstCtx && queueCtx == dstCtx &&
+        canAccessPeerAndEnable(dstCtx, srcCtx)) {
+
+      const size_t sRow =
+          src_row_pitch ? src_row_pitch : (src_origin->x_bytes + region->width_bytes);
+      const size_t dRow =
+          dst_row_pitch ? dst_row_pitch : (dst_origin->x_bytes + region->width_bytes);
+
+      const size_t sSlice =
+          src_slice_pitch ? src_slice_pitch
+                          : ((src_origin->y_scalar + region->height_scalar) * sRow);
+      const size_t dSlice =
+          dst_slice_pitch ? dst_slice_pitch
+                          : ((dst_origin->y_scalar + region->height_scalar) * dRow);
+
+      // Basic validation before calling cuMemcpy3DPeerAsync.
+      bool valid = true;
+      valid &= (region->width_bytes > 0);
+      valid &= (region->height_scalar > 0);
+      valid &= (region->depth_scalar > 0);
+
+      valid &= (sRow >= src_origin->x_bytes + region->width_bytes);
+      valid &= (dRow >= dst_origin->x_bytes + region->width_bytes);
+
+      valid &= (sSlice >= (src_origin->y_scalar + region->height_scalar) * sRow);
+      valid &= (dSlice >= (dst_origin->y_scalar + region->height_scalar) * dRow);
+
+      valid &= (sRow != 0 && dRow != 0);
+      valid &= (sSlice != 0 && dSlice != 0);
+
+      valid &= (sSlice % sRow == 0);
+      valid &= (dSlice % dRow == 0);
+
+      if (valid) {
+        CUDA_MEMCPY3D_PEER p{};
+        p.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        p.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+
+        p.srcContext = srcCtx->get();
+        p.srcDevice = srcPtr;
+        p.srcXInBytes = src_origin->x_bytes;
+        p.srcY = src_origin->y_scalar;
+        p.srcZ = src_origin->z_scalar;
+        p.srcPitch = sRow;
+        p.srcHeight = sSlice / sRow;
+
+        p.dstContext = dstCtx->get();
+        p.dstDevice = dstPtr;
+        p.dstXInBytes = dst_origin->x_bytes;
+        p.dstY = dst_origin->y_scalar;
+        p.dstZ = dst_origin->z_scalar;
+        p.dstPitch = dRow;
+        p.dstHeight = dSlice / dRow;
+
+        p.WidthInBytes = region->width_bytes;
+        p.Height = region->height_scalar;
+        p.Depth = region->depth_scalar;
+
+        retErr = PI_CHECK_ERROR(cuMemcpy3DPeerAsync(&p, cuStream));
+        usedPeer = true;
+        std::cout << "Used P2P copy retErr: " << retErr << ", usedPeer: " << usedPeer << "\n";
+      } else {
+        std::cout << "P2P rect params invalid, fallback to common path.\n";
+      }
+    }
+
+    if (!usedPeer) {
+      std::cout << "Used common copy rect path.\n";
+      retErr = commonEnqueueMemBufferCopyRect(
+          cuStream, region, &srcPtr, CU_MEMORYTYPE_DEVICE, src_origin,
+          src_row_pitch, src_slice_pitch, &dstPtr, CU_MEMORYTYPE_DEVICE,
+          dst_origin, dst_row_pitch, dst_slice_pitch);
+    }
+#else
     retErr = commonEnqueueMemBufferCopyRect(
         cuStream, region, &srcPtr, CU_MEMORYTYPE_DEVICE, src_origin,
         src_row_pitch, src_slice_pitch, &dstPtr, CU_MEMORYTYPE_DEVICE,
         dst_origin, dst_row_pitch, dst_slice_pitch);
+#endif
 
     if (event) {
       retImplEv->record();

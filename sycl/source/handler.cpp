@@ -620,38 +620,649 @@ event handler::finalize() {
 #endif
 #endif
 
+// 开REBIND测试单进程运行时 必须同时开TEST_WITH_CLEAN 即手动处理REBIND设备和kernel_count
+// #define TEST_WITH_CLEAN
 #ifdef TEST_WITH_CLEAN
   using namespace sycl::detail;
   const auto &cmdType = getType();
   if (cmdType == detail::CG::Kernel) {
-    detail::ProgramManager::getInstance().kernel_count++;
-    std::cout << "=== handler === kernel_count: " << detail::ProgramManager::getInstance().kernel_count << std::endl;
+    auto &PM = detail::ProgramManager::getInstance();
+    PM.kernel_count++;
+    std::cout << "=== handler === kernel_count: " << PM.kernel_count << std::endl;
     detail::combineAccessModesOfReqs(MRequirements);
 
-    // ===【获取Req实际数据指针】
-    for (Requirement *Req : MRequirements) {
-      SYCLMemObjI *MemObj = Req->MSYCLMemObj;
-      SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
-
-      size_t elemSize = Req->MElemSize;
-      std::cout << getpid() << " === handler === test_mem ==== elemSize: " << elemSize << std::endl;
-
-      range<3> memoryRange = Req->MMemoryRange;
-      // size_t totalSize = memoryRange[0] * memoryRange[1] * memoryRange[2];
-      size_t totalSize = memoryRange.size();
-      std::cout << getpid() << " === handler === test_mem ==== totalSize: " << totalSize << std::endl;
-      using DATA_TYPE = std::byte;
-      std::vector<DATA_TYPE> host_data(elemSize * totalSize);
-
-      void *UserPtr = BufferObj->getUserPtr();
-      DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
-    }
+    // CHECKED 测试完毕 ===【获取Req实际数据指针】
+    // for (Requirement *Req : MRequirements) {
+    //   SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+    //   SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+    //   size_t elemSize = Req->MElemSize;
+    //   std::cout << getpid() << " === handler === test_mem ==== elemSize: " << elemSize << std::endl;
+    //   range<3> memoryRange = Req->MMemoryRange;
+    //   // size_t totalSize = memoryRange[0] * memoryRange[1] * memoryRange[2];
+    //   size_t totalSize = memoryRange.size();
+    //   std::cout << getpid() << " === handler === test_mem ==== totalSize: " << totalSize << std::endl;
+    //   using DATA_TYPE = std::byte;
+    //   std::vector<DATA_TYPE> host_data(elemSize * totalSize);
+    //   void *UserPtr = BufferObj->getUserPtr();
+    //   DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+    // }
 
     // ===【REBIND】
-    device d = detail::select_device(gpu_selector_v, true);
+    device d = PM.globalDevices.at(1);
     detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
     std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
     MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
+
+    // ===【SPLIT】
+    if (PM.kernel_count == 4) {
+      // CHECKED 删除 1. 将需要的Req从最新device拷回host 使用hostacc
+      // for (Requirement *Req : MRequirements) {
+      //   if (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic) {
+      //     size_t elem_size = Req->MElemSize;
+      //     size_t buff_size = Req->MMemoryRange.size();
+      //     std::cout << getpid() << " === handler === test_mem ==== Split elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+      //     Requirement *hostReq = new Requirement(*Req);
+      //     EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
+      //     hostEvent->wait(hostEvent);
+      //     delete hostReq;
+      //     std::cout << getpid() << " === handler === test_mem ==== Split add host acc" << std::endl;
+      //   }
+      // }
+      // 2. 把需要的Req从host拷到另一个调度计算的device上
+      //   2.1. 构造device
+      //   2.2. 构造Mqueue
+      //   2.3. 构造完整的SYCLMemObj 以及MemObjRecord 与device有关还是无关
+      //   2.4. 由运行时控制数据拷贝
+      //   2.5. 划分Req及附属数据结构的Range
+
+      // 1. 构造Split相关数据结构 Device/Queue
+      size_t &NumParts = PM.NumParts;
+
+      std::vector<detail::QueueImplPtr> &SplitQueues_Write = PM.SplitQueues_Write;
+      for (int i = 1; i <= NumParts; i++) {
+        device SplitDevice = PM.globalDevices.at(i);
+        detail::DeviceImplPtr SplitDP = detail::getSyclObjImpl(SplitDevice);
+        std::shared_ptr<detail::queue_impl> SplitQueue = std::make_shared<detail::queue_impl>(SplitDP, detail::queue_impl::getDefaultOrNew(SplitDP), MQueue->getAsyncHandler(), MQueue->getPropertyList());
+        SplitQueues_Write.push_back(SplitQueue);
+      }
+
+      detail::QueueImplPtr hostQ = Scheduler::getInstance().getDefaultHostQueue();
+      auto hostCtx = hostQ->getContextImplPtr();
+
+      // 2. 构造SplitReq和PM中存储相关数据结构
+      // 被写Req在提交给不同SplitKernel时必须保持完整 由NDR控制计算区间
+      std::vector<Requirement *> SplitReqs_onlyRead; // 只读 EF
+      std::vector<Requirement *> SplitReqs_hasWrite; // 存在写 G
+      std::vector<std::vector<Requirement*>> SplitReqs_Copy; // 存在写 构造拷回Req
+      SplitReqs_Copy.resize(NumParts);
+      // std::unordered_map<Requirement *, Requirement *> &SplitReqs_Remap = PM.SplitReqs_Remap;
+
+      // CHECKED 已更新逻辑 CurCtx在不在host的逻辑通用化
+      //   3.1. CurCtx不在host
+      //        (只要有读)只读/读写 尝试D2DCpy 如果不可行回退从CurCtx->host->SplitDevice
+      //        只写 说明不需要拷回 应维持host的CurCtx和Leaves 直接在Device上创建Alloca
+      //   3.2. CurCtx在host
+      //        (只要有读)只读/读写 直接从host拷到SplitDevice
+      //        只写 直接在SplitDevice上创建Alloca
+
+      // 3. 手动控制每个相关Req的数据移动 构造CopyReq
+      for (Requirement *Req : MRequirements) {
+        auto Mode = Req->MAccessMode;
+        const bool onlyRead = (Mode == access::mode::read);
+        const bool hasRead = (Mode == access::mode::read) ||
+                             (Mode == access::mode::read_write) ||
+                             (Mode == access::mode::atomic);
+        const bool onlyWrite = (Mode == access::mode::write) ||
+                               (Mode == access::mode::discard_write) ||
+                               (Mode == access::mode::discard_read_write);
+        const bool hasWrite = (Mode == access::mode::write) ||
+                             (Mode == access::mode::discard_write) ||
+                             (Mode == access::mode::discard_read_write) ||
+                             (Mode == access::mode::read_write) ||
+                             (Mode == access::mode::atomic);
+
+        // 可能Req还没建立Record 如此时只有host的G
+        bool isRecorded = detail::Scheduler::getInstance().getMemObjRecord(Req) != nullptr;
+        MemObjRecord *ReqRecord = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req) : nullptr;
+        ContextImplPtr ReqCurCtx = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req)->MCurContext : hostCtx;
+        if (ReqCurCtx != hostCtx) {
+          std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx not host\n";
+        } else {
+          std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx is host\n";
+        }
+
+        // 3.1【有读/只写 只用来处理 数据移动】
+        // 有读 SrcDevice->SplitDevice
+        if (hasRead) {
+          QueueImplPtr SrcQueue = hostQ;
+          if (ReqCurCtx != hostCtx && ReqRecord != nullptr) {
+            SrcQueue = nullptr;
+            for (AllocaCommandBase *AllocaCmd : ReqRecord->MAllocaCommands) {
+              if (AllocaCmd->getQueue() != nullptr && AllocaCmd->getQueue()->getContextImplPtr() == ReqCurCtx) {
+                SrcQueue = AllocaCmd->getQueue();
+                break;
+              }
+            }
+            std::cout << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
+          }
+
+          for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+            if (ReqCurCtx != hostCtx && SplitQueue->getContextImplPtr() == ReqCurCtx) {
+              std::cout << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
+              continue;
+            }
+
+            bool moved_by_p2p = false;
+            if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
+              try {
+                EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, SrcQueue);
+                ev_p2p->wait(ev_p2p);
+                moved_by_p2p = true;
+                std::cout << "=== handler === Split step3 direct D2D success\n";
+              } catch (const std::exception &e) {
+                std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+              } catch (...) {
+                std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
+              }
+            }
+
+            if (!moved_by_p2p) {
+              if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
+                EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SrcQueue);
+                ev_host->wait(ev_host);
+                std::cout << "=== handler === Split step3 copy back host\n";
+              }
+
+              EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+              ev_split->wait(ev_split);
+              std::cout << "=== handler === Split step3 copy to split device\n";
+            }
+          }
+        }
+        // 只写 直接在SplitDevice上创建Alloca
+        else {
+          std::vector<Command *> ToEnqueue;
+          MemObjRecord *SplitRecord = ReqRecord;
+          if (SplitRecord == nullptr)
+            SplitRecord = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(hostQ, Req, ToEnqueue);
+
+          for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+            detail::Scheduler::getInstance().MGraphBuilder.getOrCreateAllocaForSplitReq(SplitRecord, Req, SplitQueue, ToEnqueue);
+          }
+        }
+
+        // 3.2【只读/有写 只用来处理 写回逻辑】
+        // 只读 无需额外逻辑
+        if (onlyRead) {
+          SplitReqs_onlyRead.push_back(Req);
+        }
+        // 有写 计算完后数据需要写回CurCtx
+        else {
+          SplitReqs_hasWrite.push_back(Req);
+          range<3> FullRange = Req->MMemoryRange;
+          size_t dim0 = FullRange[0];
+          size_t chunk = dim0 / NumParts;
+          for (size_t p = 0; p < NumParts; p++) {
+            size_t begin0 = p * chunk;
+            size_t end0 = (p + 1 == NumParts) ? (dim0) : (begin0 + chunk);
+            size_t part0 = end0 - begin0;
+            std::cout << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
+
+            Requirement *CopyReq = new Requirement(*Req);
+            CopyReq->MOffset = id<3>(begin0, 0, 0);
+            CopyReq->MAccessRange = range<3>(part0, FullRange[1], FullRange[2]);
+            CopyReq->MMemoryRange = FullRange;
+            CopyReq->MOffsetInBytes = begin0 * FullRange[1] * FullRange[2] * Req->MElemSize;
+            SplitReqs_Copy[p].push_back(CopyReq);
+          }
+        }
+
+        // CHECKED 已更新逻辑 不以ReqCurCtx是否为host作外层区分
+        // if (ReqCurCtx != hostCtx) {
+        //   std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " ReqCurCtx not host\n";
+        //   if (hasRead) { // 有读 拷到SplitDevice
+        //     QueueImplPtr SrcQueue = nullptr;
+        //     // 通过ReqCurCtx获取所在Queue
+        //     for (AllocaCommandBase *AllocaCmd : ReqRecord->MAllocaCommands) {
+        //       if (AllocaCmd->getQueue() != nullptr && AllocaCmd->getQueue()->getContextImplPtr() == ReqCurCtx) {
+        //         SrcQueue = AllocaCmd->getQueue();
+        //         break;
+        //       }
+        //     }
+        //     std::cout << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
+        //     //【注意】SplitQueue是被构造出来的 不能通过Queue判断同一个设备
+        //     for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+        //       if (SplitQueue->getContextImplPtr() == ReqCurCtx) {
+        //         std::cout << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
+        //         continue;
+        //       }
+        //       // std::cout << "=== handler === Split step3 Try SplitQueue: " << SplitQueue << std::endl;
+        //       // if (SplitQueue == SrcQueue) continue;
+        //       bool moved_by_p2p = false;
+        //       try {
+        //         EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, SrcQueue);
+        //         ev_p2p->wait(ev_p2p);
+        //         moved_by_p2p = true;
+        //         std::cout << "=== handler === Split step3 direct D2D success\n";
+        //       } catch (const std::exception &e) {
+        //         std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+        //       } catch (...) {
+        //         std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
+        //       }
+        //       if (!moved_by_p2p) {
+        //         // 从CurCtx拷回host
+        //         EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SrcQueue);
+        //         ev_host->wait(ev_host);
+        //         std::cout << "=== handler === Split step3 copy back host\n";
+        //         // 从host拷到SplitDevice
+        //         EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+        //         ev_split->wait(ev_split);
+        //         std::cout << "=== handler === Split step3 copy to split device\n";
+        //       }
+        //     }
+        //     // CHECKED 通用化 直接进行D->D的数据拷贝 如果不行会退回D->H->D
+        //     // bool moved_by_p2p = false;
+        //     // try {
+        //     //   EventImplPtr ev_p2p =
+        //     //       detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, MQueue);
+        //     //   ev_p2p->wait(ev_p2p);
+        //     //   moved_by_p2p = true;
+        //     //   std::cout << "=== handler === Split step3 direct D2D success\n";
+        //     // } catch (const std::exception &e) {
+        //     //   std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+        //     // } catch (...) {
+        //     //   std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
+        //     // }
+        //     // if (!moved_by_p2p) {
+        //     //   // 从CurCtx拷回host
+        //     //   EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, MQueue);
+        //     //   ev_host->wait(ev_host);
+        //     //   std::cout << "=== handler === Split step3 copy back host\n";
+        //     //   // 从host拷到SplitDevice
+        //     //   EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+        //     //   ev_split->wait(ev_split);
+        //     //   std::cout << "=== handler === Split step3 copy to split device\n";
+        //     // }
+        //   } else { // 只写 需要在SplitDevice上创建Alloca 不需要拷贝
+        //     // TODO
+        //   }
+        //   if (onlyRead) { // 只读 无额外逻辑
+        //     SplitReqs_onlyRead.push_back(Req);
+        //   } else { // 有写 算完后CurCtx放哪？
+        //     SplitReqs_hasWrite.push_back(Req);
+        //     // TODO 如G=E*F后 G=G+1
+        //     // 数据需要拷回原定CurCtx
+        //     // **注意** 所以这两段也应该通用化
+        //   }
+        // } else { // ReqCurCtx == hostCtx
+        //   std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " ReqCurCtx is host\n";
+        //   if (hasRead) { // 有读 从host拷到SplitDevice
+        //     for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+        //       EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+        //       ev_split->wait(ev_split);
+        //       std::cout << "=== handler === Split step3 copy to split device\n";
+        //     }
+        //     // CHECKED 通用化
+        //     // EventImplPtr ev_mqueue = detail::Scheduler::getInstance().addMemoryMove(Req, MQueue, hostQ);
+        //     // ev_mqueue->wait(ev_mqueue);
+        //     // std::cout << "=== handler === Split step3 copy to mqueue\n";
+        //     // EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+        //     // ev_split->wait(ev_split);
+        //     // std::cout << "=== handler === Split step3 copy to split device\n";
+        //   } else { // 只写 需要在SplitDevice上创建Alloca 不需要拷贝
+        //     // TODO 
+        //   }
+        //   if (onlyRead) { // 只读
+        //     SplitReqs_onlyRead.push_back(Req);
+        //   } else { // 有写
+        //     SplitReqs_hasWrite.push_back(Req);
+        //     range<3> FullRange = Req->MMemoryRange;
+        //     size_t dim0 = FullRange[0];
+        //     size_t chunk = dim0 / NumParts;
+        //     for (size_t p = 0; p < NumParts; p++) {
+        //       size_t begin0 = p * chunk;
+        //       size_t end0 = (p + 1 == NumParts) ? (dim0) : (begin0 + chunk);
+        //       size_t part0 = end0 - begin0;
+        //       std::cout << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
+        //       Requirement *CopyReq = new Requirement(*Req);
+        //       CopyReq->MOffset = id<3>(begin0, 0, 0);
+        //       CopyReq->MAccessRange = range<3>(part0, FullRange[1], FullRange[2]);
+        //       CopyReq->MMemoryRange = FullRange;
+        //       CopyReq->MOffsetInBytes = begin0 * FullRange[1] * FullRange[2] * Req->MElemSize;
+        //       SplitReqs_Copy[p].push_back(CopyReq);
+        //     }
+        //   }
+        // }
+      }
+
+      // CHECKED 已更新逻辑 变为有读/只写和只读/有写
+      // for (Requirement *Req : MRequirements) {
+      //   auto Mode = Req->MAccessMode;
+      //   const bool isRead = (Mode == access::mode::read);
+      //   const bool isWrite = (Mode == access::mode::write) ||
+      //                        (Mode == access::mode::discard_write) ||
+      //                        (Mode == access::mode::discard_read_write) ||
+      //                        (Mode == access::mode::read_write) ||
+      //                        (Mode == access::mode::atomic);
+      //   const bool isReadWrite = (Mode == access::mode::read_write) || (Mode == access::mode::atomic);
+      //   if (!isRead && !isWrite) continue;        
+      //   size_t elem_size = Req->MElemSize;
+      //   size_t buff_size = Req->MMemoryRange.size();
+      //   std::cout << getpid() << " === handler === test_mem ==== Split step2 elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+      //   // E F 都在GPU上 先拷回host 再拷到split上
+      //   if (isRead) {
+      //     // CHECKED 删除 这里不应该用hostacc 直接addmemmove就可以
+      //     // EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(Req);
+      //     // hostEvent->wait(hostEvent);
+      //     EventImplPtr host_ev = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, MQueue);
+      //     host_ev->wait(host_ev);
+      //     std::cout << "=== handler === Split step2 EF copy host\n";
+      //     // CHECKED 测试完毕 在这里通过获取真实MemObj的方法验证E的第二行前10个值是否正确
+      //     // {
+      //     //   using DATA_TYPE = float; // 3mm_3kernel.cpp 里是 float
+      //     //   SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+      //     //   SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+      //     //   void *UserPtr = BufferObj->getUserPtr();
+      //     //   DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+      //     //   const range<3> &R = Req->MMemoryRange;
+      //     //   const size_t rows = R[0];
+      //     //   const size_t cols = R[1] * R[2]; // 对 2D buffer 通常等价于列数
+      //     //   const size_t row = 1;             // 第二行（0-based）
+      //     //   const size_t n = std::min<size_t>(10, cols);
+      //     //   std::cout << "=== handler === verify Req " << Req
+      //     //             << " MemObj " << MemObj
+      //     //             << " row1 first " << n << " values: ";
+      //     //   if (DataPtr && rows > row && cols > 0) {
+      //     //     const size_t base = row * cols;
+      //     //     for (size_t j = 0; j < n; ++j) {
+      //     //       std::cout << DataPtr[base + j] << (j + 1 == n ? '\n' : ' ');
+      //     //     }
+      //     //   } else {
+      //     //     std::cout << "[invalid ptr or shape] rows=" << rows
+      //     //               << " cols=" << cols << '\n';
+      //     //   }
+      //     // }
+      //     EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+      //     ev_split->wait(ev_split);
+      //     std::cout << "=== handler === Split step2 EF copy gpu2\n";
+      //   }
+      //   // G 还没有alloca 拷到两个GPU上 第一次自动创建hostalloca
+      //   if (isReadWrite) {
+      //     EventImplPtr ev = detail::Scheduler::getInstance().addMemoryMove(Req, MQueue, hostQ);
+      //     ev->wait(ev);
+      //     std::cout << "=== handler === Split step2 G copy gpu1\n";
+      //     EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+      //     ev_split->wait(ev_split);
+      //     std::cout << "=== handler === Split step2 G copy gpu2\n";
+      //   }
+      //   // CHECKED 删除 这里ReadWrite好像有错 needInit不能保证已经在host上
+      //   // 提前拷贝不能等待第三步 第三步直接建图
+      //   // const bool needInit = (Mode != access::mode::write) &&
+      //   //                       (Mode != access::mode::discard_write) &&
+      //   //                       (Mode != access::mode::discard_read_write);
+      //   // if (needInit) {
+      //   //   std::cout << "=== handler === Split step2 need init\n";
+      //   //   // CHECK 就是从MQueue->host的 暂且不用重复拷贝的逻辑
+      //   //   // EventImplPtr ev = detail::Scheduler::getInstance().addMemoryMove(Req, MQueue, hostQ);
+      //   //   // ev->wait(ev);
+      //   //   // std::cout << "=== handler === Split step2 copy gpu1\n";
+      //   //   EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+      //   //   ev_split->wait(ev_split);
+      //   //   std::cout << "=== handler === Split step2 copy gpu2\n";
+      //   // }
+      //   // EF
+      //   if (isRead) {
+      //     std::cout << "=== handler === Split step2 Read Req: " << Req << "->" << Req->MSYCLMemObj << "\n";
+      //     SplitReqs_Read.push_back(Req);
+      //     // CHECKED 删除 已经提前拷贝完了这里不应该继续
+      //     // EventImplPtr ev = detail::Scheduler::getInstance().addMemoryMove(Req, MQueue, hostQ);
+      //     // ev->wait(ev);
+      //     // auto *SplitReq = new Requirement(*Req);
+      //     // SplitReqs_Read.push_back(SplitReq);
+      //     // EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(SplitReq, SplitQueue, hostQ);
+      //     // ev_split->wait(ev_split);
+      //   }
+      //   // G
+      //   else {
+      //     std::cout << "=== handler === Split step2 Write Req: " << Req << "->" << Req->MSYCLMemObj << "\n";
+      //     range<3> FullRange = Req->MMemoryRange;
+      //     size_t dim0 = FullRange[0];
+      //     size_t chunk = dim0 / NumParts;
+      //     // auto *SplitReq = new Requirement(*Req);
+      //     for (size_t p = 0; p < NumParts; p++) {
+      //       size_t begin0 = p * chunk;
+      //       size_t end0 = (p + 1 == NumParts) ? (dim0) : (begin0 + chunk);
+      //       size_t part0 = end0 - begin0;
+      //       std::cout << "=== handler === Split step2 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
+      //       // 第一个分片用原Req
+      //       if (p == 0) {
+      //         SplitReqs_Write[0].push_back(Req);
+      //         SplitQueues_Write[0] = MQueue;
+      //         Requirement *CopyReq = new Requirement(*Req);
+      //         CopyReq->MOffset = id<3>(begin0, 0, 0);
+      //         CopyReq->MAccessRange = range<3>(part0, FullRange[1], FullRange[2]);
+      //         CopyReq->MMemoryRange = FullRange;
+      //         CopyReq->MOffsetInBytes = begin0 * FullRange[1] * FullRange[2] * Req->MElemSize;
+      //         SplitReqs_Copy[0].push_back(CopyReq);
+      //       }
+      //       else {
+      //         SplitReqs_Write[1].push_back(Req);
+      //         SplitQueues_Write[1] = SplitQueue;
+      //         // SplitReqs_Remap[Req] = SplitReq;
+      //         std::cout << "=== handler === Split step2 Write Split Req: " << Req << "->" << Req->MSYCLMemObj << "\n";
+      //         Requirement *CopyReq = new Requirement(*Req);
+      //         CopyReq->MOffset = id<3>(begin0, 0, 0);
+      //         CopyReq->MAccessRange = range<3>(part0, FullRange[1], FullRange[2]);
+      //         CopyReq->MMemoryRange = FullRange;
+      //         CopyReq->MOffsetInBytes = begin0 * FullRange[1] * FullRange[2] * Req->MElemSize;
+      //         SplitReqs_Copy[1].push_back(CopyReq);
+      //       }
+      //     }
+      //   }
+      // }
+
+      // 4. 避开CommandGroup 在GraphBuilder::addCG中 克隆CGExecKernel 创建ExecCGCommand
+      std::unique_ptr<detail::CG> CommandGroup;
+      CommandGroup.reset(new detail::CGExecKernel(
+          std::move(MNDRDesc), std::move(MHostKernel), std::move(MKernel),
+          std::move(MImpl->MKernelBundle), std::move(MArgsStorage),
+          std::move(MAccStorage), std::move(MSharedPtrStorage),
+          std::move(MRequirements), std::move(MEvents), std::move(MArgs),
+          MKernelName, MOSModuleHandle, std::move(MStreamStorage),
+          std::move(MImpl->MAuxiliaryResources), MCGType,
+          MImpl->MKernelCacheConfig, MCodeLoc));
+
+      detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
+          std::move(CommandGroup), MQueue);
+
+      std::cout << "=== handler === Split before wait\n";
+      Event->wait(Event);
+      std::cout << "=== handler === Split after wait\n";
+
+      // CHECKED 测试完毕 在addMemMove前验证G的host是否都为初始化的0值
+      // for (size_t p = 0; p < NumParts; ++p) {
+      //   for (Requirement *PartReq : SplitReqs_Write[p]) {
+      //     {
+      //       using DATA_TYPE = float; // 3mm_3kernel.cpp 里是 float
+      //       SYCLMemObjI *MemObj = PartReq->MSYCLMemObj;
+      //       SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+      //       void *UserPtr = BufferObj->getUserPtr();
+      //       DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+      //       const range<3> &R = PartReq->MMemoryRange;
+      //       const size_t rows = R[0];
+      //       const size_t cols = R[1] * R[2]; // 对 2D buffer 通常等价于列数
+      //       const size_t row1 = 1;
+      //       const size_t row = 128;
+      //       const size_t n = std::min<size_t>(10, cols);
+      //       std::cout << "=== handler === verify PartReq G before addMemMove " << PartReq
+      //                 << " MemObj " << MemObj
+      //                 << " row1 first " << n << " values: ";
+      //       if (DataPtr && rows > row && cols > 0) {
+      //         const size_t base1 = row1 * cols;
+      //         for (size_t j = 0; j < n; ++j) {
+      //           std::cout << DataPtr[base1 + j] << (j + 1 == n ? '\n' : ' ');
+      //         }
+      //         const size_t base = row * cols;
+      //         for (size_t j = 0; j < n; ++j) {
+      //           std::cout << DataPtr[base + j] << (j + 1 == n ? '\n' : ' ');
+      //         }
+      //       } else {
+      //         std::cout << "[invalid ptr or shape] rows=" << rows
+      //                   << " cols=" << cols << '\n';
+      //       }
+      //     }
+      //   }
+      // }
+
+      // 5. 把Kernel更新后的【有写】Req的对应计算分片从各SplitDevice拷回SrcCtx 一定是Record的CurCtx
+      // 如果SrcCtx是Device 就有D2D和回退D2H2D 如果SrcCtx是host 就直接D2H
+      for (size_t p = 0; p < NumParts; ++p) {
+        for (int i = 0; i < SplitReqs_Copy[p].size(); ++i) {
+          Requirement *CopyReq = SplitReqs_Copy[p][i];
+          MemObjRecord *Rec = detail::Scheduler::getInstance().getMemObjRecord(CopyReq);
+          ContextImplPtr SrcCtx = Rec->MCurContext;
+          QueueImplPtr SrcQueue = hostQ;
+          if (SrcCtx != hostCtx) {
+            SrcQueue = nullptr;
+            for (AllocaCommandBase *AllocaCmd : Rec->MAllocaCommands) {
+              if (AllocaCmd->getQueue()->getContextImplPtr() == SrcCtx) {
+                SrcQueue = AllocaCmd->getQueue();
+                break;
+              }
+            }
+          }
+          std::cout << "=== handler === Split step5 PartReq " << CopyReq << " Record: " << Rec << " SrcCtx: " << SrcCtx << " SrcQueue: " << SrcQueue << " is host: " << (SrcCtx == hostCtx ? "true" : "false") << "\n";
+
+          bool moved_by_p2p = false;
+          if (SrcCtx != hostCtx) {
+            if (SplitQueues_Write[p]->getContextImplPtr() == SrcCtx) {
+              std::cout << "=== handler === Split step5 SplitQueue is SrcQueue, continue\n";
+              continue;
+            }
+            
+            try {
+              EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, SplitQueues_Write[p]);
+              ev_p2p->wait(ev_p2p);
+              moved_by_p2p = true;
+              std::cout << "=== handler === Split step5 direct D2D success\n";
+            } catch (const std::exception &e) {
+              std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+            } catch (...) {
+              std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D\n";
+            }
+          }
+
+          if (!moved_by_p2p) {
+            EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(CopyReq, hostQ, SplitQueues_Write[p]);
+            ev_host->wait(ev_host);
+            std::cout << "=== handler === Split step5 copy back host\n";
+
+            if (SrcCtx != hostCtx) {
+              EventImplPtr ev_src = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, hostQ);
+              ev_src->wait(ev_src);
+              std::cout << "=== handler === Split step5 copy to src device\n";
+            }
+          }
+
+          // CHECKED 已更新逻辑 对比输出Req对应Record的MCurContext和hostQ的ContextImplPtr是否一致
+          // const QueueImplPtr &HostQueue = detail::Scheduler::getInstance().getDefaultHostQueue();
+          // MemObjRecord *Rec = detail::Scheduler::getInstance().getMemObjRecord(SplitReqs_Copy[p][i]);
+          // std::cout << "=== handler === Split step5 PartReq " << SplitReqs_Copy[p][i] << " Record: " << Rec << " MCurContext: " << (Rec ? Rec->MCurContext : nullptr) << " HostQueue Context: " << (HostQueue ? HostQueue->getContextImplPtr() : nullptr) << "\n";
+          // // 进行host写回的PartReq要从完整的Req区分开 kernel所需Req要是完整的 不然计算偏移会导致错误
+          // Requirement *CopyReq = SplitReqs_Copy[p][i];
+          // EventImplPtr ev = detail::Scheduler::getInstance().addMemoryMove(CopyReq, hostQ, SplitQueues_Write[p]);
+          // ev->wait(ev);
+
+          // CHECKED 测试完毕 在这里通过获取真实MemObj的方法验证G的第二行前10个值是否正确
+          // Requirement *OrigReq = SplitReqs_hasWrite[i];
+          // {
+          //   using DATA_TYPE = float; // 3mm_3kernel.cpp 里是 float
+          //   SYCLMemObjI *MemObj = OrigReq->MSYCLMemObj;
+          //   SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
+          //   void *UserPtr = BufferObj->getUserPtr();
+          //   DATA_TYPE *DataPtr = static_cast<DATA_TYPE *>(UserPtr);
+          //   const range<3> &R = OrigReq->MMemoryRange;
+          //   const size_t rows = R[0];
+          //   const size_t cols = R[1] * R[2]; // 对 2D buffer 通常等价于列数
+          //   const size_t row1 = 1;
+          //   const size_t row = 128;             // 第二行（0-based）
+          //   const size_t n = std::min<size_t>(10, cols);
+          //   std::cout << "=== handler === verify OrigReq G " << OrigReq
+          //             << " MemObj " << MemObj
+          //             << " row1 first " << n << " values: ";
+          //   if (DataPtr && rows > row && cols > 0) {
+          //     const size_t base1 = row1 * cols;
+          //     for (size_t j = 0; j < n; ++j) {
+          //       std::cout << DataPtr[base1 + j] << (j + 1 == n ? '\n' : ' ');
+          //     }
+          //     const size_t base = row * cols;
+          //     for (size_t j = 0; j < n; ++j) {
+          //       std::cout << DataPtr[base + j] << (j + 1 == n ? '\n' : ' ');
+          //     }
+          //   } else {
+          //     std::cout << "[invalid ptr or shape] rows=" << rows
+          //               << " cols=" << cols << '\n';
+          //   }
+          // }
+        }
+        // CHECKED 删除 G在创建Record时由hostQueue生成 而手动控制拷贝SplitDevice和写回都不改变CurCtx 自然保持host的SameCtx
+        // 每次最后一个Part结束后更新此Req对应Record的MCurContext
+        // if (MemObjRecord *Rec = detail::Scheduler::getInstance().getMemObjRecord(SplitReqs_Write[p][0])) {
+        //   Rec->MCurContext = hostQ->getContextImplPtr();
+        // }
+        // CHECKED 删除 错误的对原始Req的拷回
+        // for (Requirement *Req : SplitReqs_Write[p]) {
+        //   EventImplPtr ev = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SplitQueues_Write[p]);
+        //   ev->wait(ev);
+        //   if (MemObjRecord *Rec = detail::Scheduler::getInstance().getMemObjRecord(Req)) {
+        //     Rec->MCurContext = hostQ->getContextImplPtr();
+        //   }
+        // }
+      }
+
+      MLastEvent = detail::createSyclObjFromImpl<event>(Event);
+      return MLastEvent; 
+    }
+
+    //【TEST kernel切分计算】===【对第3个kernel 修改NDRange：只跑前一半行】===
+    #ifdef TEST_NDR_SPLIT
+    if (detail::ProgramManager::getInstance().kernel_count == 3) {
+      auto &NDR = MNDRDesc;
+
+      std::cout << "=== handler === [K3] before split: Dims = "
+                << NDR.Dims
+                << " GlobalSize = {"
+                << NDR.GlobalSize[0] << ", "
+                << NDR.GlobalSize[1] << ", "
+                << NDR.GlobalSize[2] << "}, "
+                << "Offset = {"
+                << NDR.GlobalOffset[0] << ", "
+                << NDR.GlobalOffset[1] << ", "
+                << NDR.GlobalOffset[2] << "}\n";
+
+      if (NDR.Dims >= 1 && NDR.GlobalSize[0] > 1) {
+        size_t N = NDR.GlobalSize[0];
+
+        size_t Parts   = 4;   // 总共切 4 段
+        size_t PartIdx = 2;   // 要第 3 段
+
+        size_t base_chunk = N / Parts;
+        size_t rem        = N % Parts;
+
+        size_t begin = PartIdx * base_chunk;
+        size_t end   = (PartIdx == Parts - 1) ? (N) : (begin + base_chunk);
+        size_t len   = end - begin;
+
+        NDR.GlobalSize[0]   = len;
+        NDR.GlobalOffset[0] = NDR.GlobalOffset[0] + begin;  // 原来是 0 就等于 begin
+
+        std::cout << "=== handler === [K3] after split: "
+                  << "rows [" << begin << ", " << end << ") of original range\n"
+                  << "New GlobalSize[0] = " << NDR.GlobalSize[0]
+                  << " New Offset[0] = " << NDR.GlobalOffset[0] << "\n";
+      }
+    }
+    #endif
   }
 #endif
 // 【END】=======================================================
@@ -952,6 +1563,12 @@ event handler::finalize() {
   SyclKernelCg *sycl_kernel_cg = new SyclKernelCg(detail::ProgramManager::getInstance().kernel_count, std::move(CommandGroup), MQueue);
   detail::ProgramManager::getInstance().kernel_cgs.push_back(sycl_kernel_cg);
   return MLastEvent;
+#elif defined(SNMD_OFFLINE)
+  auto &PM = detail::ProgramManager::getInstance();
+  PM.kernel_count++;
+  SyclKernelCg *sycl_kernel_cg = new SyclKernelCg(detail::ProgramManager::getInstance().kernel_count, std::move(CommandGroup), MQueue);
+  detail::ProgramManager::getInstance().kernel_cgs.push_back(sycl_kernel_cg);
+  return MLastEvent;
 #else
   detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
       std::move(CommandGroup), std::move(MQueue));
@@ -967,6 +1584,254 @@ event handler::finalize() {
 // 【END】=======================================================
 }
 
+#ifdef SNMD_OFFLINE
+event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
+  using namespace sycl::detail;
+  auto &PM = detail::ProgramManager::getInstance();
+
+  if (!sycl_kernel_cg.kernel_cg || !sycl_kernel_cg.kernel_queue) {
+    throw sycl::runtime_error(
+        "Internal Error. Offline kernel CG or queue is null.",
+        PI_ERROR_INVALID_OPERATION);
+  }
+
+  auto *ExecCG = dynamic_cast<detail::CGExecKernel *>(sycl_kernel_cg.kernel_cg.get());
+  if (!ExecCG) {
+    throw sycl::runtime_error(
+        "Internal Error. Expected CGExecKernel for offline resubmit.",
+        PI_ERROR_INVALID_OPERATION);
+  }
+
+  detail::QueueImplPtr KernelQueue = sycl_kernel_cg.kernel_queue;
+  std::vector<Requirement *> &KernelReqs = ExecCG->MRequirements;
+  size_t &NumParts = PM.NumParts;
+
+  // SPLIT
+  if (sycl_kernel_cg.kernel_count == 4) {
+    NumParts = 4;
+    std::cout << "=== handler === Split NumParts: " << NumParts << std::endl;
+
+    // 1
+    std::vector<detail::QueueImplPtr> &SplitQueues_Write = PM.SplitQueues_Write;
+    for (int i = 1; i <= NumParts; i++) {
+      device SplitDevice = PM.globalDevices.at(i);
+      detail::DeviceImplPtr SplitDP = detail::getSyclObjImpl(SplitDevice);
+      std::shared_ptr<detail::queue_impl> SplitQueue = std::make_shared<detail::queue_impl>(
+          SplitDP, detail::queue_impl::getDefaultOrNew(SplitDP),
+          KernelQueue->getAsyncHandler(), KernelQueue->getPropertyList());
+      SplitQueues_Write.push_back(SplitQueue);
+    }
+    detail::QueueImplPtr hostQ = Scheduler::getInstance().getDefaultHostQueue();
+    auto hostCtx = hostQ->getContextImplPtr();
+    std::cout << "=== handler === Split step1 hostQ: " << hostQ << " hostCtx: " << hostCtx << std::endl;
+
+    // 2
+    std::vector<Requirement *> SplitReqs_onlyRead;
+    std::vector<Requirement *> SplitReqs_hasWrite;
+    std::vector<std::vector<Requirement*>> SplitReqs_Copy;
+    SplitReqs_Copy.resize(NumParts);
+    std::cout << "=== handler === Split step2 SplitReqs_Copy resized to NumParts: " << NumParts << std::endl;
+
+    // 3
+    for (Requirement *Req : KernelReqs) {
+      auto Mode = Req->MAccessMode;
+      const bool onlyRead = (Mode == access::mode::read);
+      const bool hasRead = (Mode == access::mode::read) ||
+                            (Mode == access::mode::read_write) ||
+                            (Mode == access::mode::atomic);
+      const bool onlyWrite = (Mode == access::mode::write) ||
+                              (Mode == access::mode::discard_write) ||
+                              (Mode == access::mode::discard_read_write);
+      const bool hasWrite = (Mode == access::mode::write) ||
+                            (Mode == access::mode::discard_write) ||
+                            (Mode == access::mode::discard_read_write) ||
+                            (Mode == access::mode::read_write) ||
+                            (Mode == access::mode::atomic);
+
+      bool isRecorded = detail::Scheduler::getInstance().getMemObjRecord(Req) != nullptr;
+      MemObjRecord *ReqRecord = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req) : nullptr;
+      ContextImplPtr ReqCurCtx = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req)->MCurContext : hostCtx;
+      if (ReqCurCtx != hostCtx) {
+        std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx not host\n";
+      } else {
+        std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx is host\n";
+      }
+
+      // 3.1
+      if (hasRead) {
+        QueueImplPtr SrcQueue = hostQ;
+        if (ReqCurCtx != hostCtx && ReqRecord != nullptr) {
+          SrcQueue = nullptr;
+          for (AllocaCommandBase *AllocaCmd : ReqRecord->MAllocaCommands) {
+            if (AllocaCmd->getQueue() != nullptr && AllocaCmd->getQueue()->getContextImplPtr() == ReqCurCtx) {
+              SrcQueue = AllocaCmd->getQueue();
+              break;
+            }
+          }
+          std::cout << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
+        }
+
+        for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+          if (ReqCurCtx != hostCtx && SplitQueue->getContextImplPtr() == ReqCurCtx) {
+            std::cout << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
+            continue;
+          }
+
+          bool moved_by_p2p = false;
+          if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
+            try {
+              EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, SrcQueue);
+              // ev_p2p->wait(ev_p2p);
+              moved_by_p2p = true;
+              std::cout << "=== handler === Split step3 direct D2D success\n";
+            } catch (const std::exception &e) {
+              std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+            } catch (...) {
+              std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
+            }
+          }
+
+          if (!moved_by_p2p) {
+            if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
+              EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SrcQueue);
+              // ev_host->wait(ev_host);
+              std::cout << "=== handler === Split step3 copy back host\n";
+            }
+
+            EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+            // ev_split->wait(ev_split);
+            std::cout << "=== handler === Split step3 copy to split device\n";
+          }
+        }
+      } else {
+        std::vector<Command *> ToEnqueue;
+        MemObjRecord *SplitRecord = ReqRecord;
+        if (SplitRecord == nullptr)
+          SplitRecord = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(hostQ, Req, ToEnqueue);
+
+        for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+          detail::Scheduler::getInstance().MGraphBuilder.getOrCreateAllocaForSplitReq(SplitRecord, Req, SplitQueue, ToEnqueue);
+        }
+      }
+
+      // 3.2
+      if (onlyRead) {
+        SplitReqs_onlyRead.push_back(Req);
+      } else {
+        SplitReqs_hasWrite.push_back(Req);
+        range<3> FullRange = Req->MMemoryRange;
+        size_t dim0 = FullRange[0];
+        size_t chunk = dim0 / NumParts;
+        for (size_t p = 0; p < NumParts; p++) {
+          size_t begin0 = p * chunk;
+          size_t end0 = (p + 1 == NumParts) ? (dim0) : (begin0 + chunk);
+          size_t part0 = end0 - begin0;
+          std::cout << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
+
+          Requirement *CopyReq = new Requirement(*Req);
+          CopyReq->MOffset = id<3>(begin0, 0, 0);
+          CopyReq->MAccessRange = range<3>(part0, FullRange[1], FullRange[2]);
+          CopyReq->MMemoryRange = FullRange;
+          CopyReq->MOffsetInBytes = begin0 * FullRange[1] * FullRange[2] * Req->MElemSize;
+          SplitReqs_Copy[p].push_back(CopyReq);
+        }
+      }
+    }
+    std::cout << "=== handler === Split step3 onlyRead: " << SplitReqs_onlyRead.size() << " hasWrite: " << SplitReqs_hasWrite.size() << std::endl;
+
+    // 4
+    detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(std::move(sycl_kernel_cg.kernel_cg), std::move(KernelQueue));
+    std::cout << "=== handler === Split before wait\n";
+    Event->wait(Event);
+    std::cout << "=== handler === Split after wait\n";
+
+    // 5
+    for (size_t p = 0; p < NumParts; ++p) {
+      for (int i = 0; i < SplitReqs_Copy[p].size(); ++i) {
+        Requirement *CopyReq = SplitReqs_Copy[p][i];
+        MemObjRecord *Rec = detail::Scheduler::getInstance().getMemObjRecord(CopyReq);
+        ContextImplPtr SrcCtx = Rec->MCurContext;
+        QueueImplPtr SrcQueue = hostQ;
+        if (SrcCtx != hostCtx) {
+          SrcQueue = nullptr;
+          for (AllocaCommandBase *AllocaCmd : Rec->MAllocaCommands) {
+            if (AllocaCmd->getQueue()->getContextImplPtr() == SrcCtx) {
+              SrcQueue = AllocaCmd->getQueue();
+              break;
+            }
+          }
+        }
+        std::cout << "=== handler === Split step5 PartReq " << CopyReq << " Record: " << Rec << " SrcCtx: " << SrcCtx << " SrcQueue: " << SrcQueue << " is host: " << (SrcCtx == hostCtx ? "true" : "false") << "\n";
+
+        bool moved_by_p2p = false;
+        if (SrcCtx != hostCtx) {
+          if (SplitQueues_Write[p]->getContextImplPtr() == SrcCtx) {
+            std::cout << "=== handler === Split step5 SplitQueue is SrcQueue, continue\n";
+            continue;
+          }
+          
+          try {
+            EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, SplitQueues_Write[p]);
+            // ev_p2p->wait(ev_p2p);
+            moved_by_p2p = true;
+            std::cout << "=== handler === Split step5 direct D2D success\n";
+          } catch (const std::exception &e) {
+            std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+          } catch (...) {
+            std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D\n";
+          }
+        }
+
+        if (!moved_by_p2p) {
+          EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(CopyReq, hostQ, SplitQueues_Write[p]);
+          // ev_host->wait(ev_host);
+          std::cout << "=== handler === Split step5 copy back host\n";
+
+          if (SrcCtx != hostCtx) {
+            EventImplPtr ev_src = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, hostQ);
+            // ev_src->wait(ev_src);
+            std::cout << "=== handler === Split step5 copy to src device\n";
+          }
+        }
+      }
+    }
+
+    std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
+    event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
+    return MLastEvent;
+  }
+  else {
+    NumParts = 1;
+    std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
+    
+    std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg.kernel_queue;
+    device exec_device = PM.globalDevices.at(1);
+    detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
+    std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+    kernel_queue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), kernel_queue->getAsyncHandler(), kernel_queue->getPropertyList()));
+    std::cout << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
+
+    detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(std::move(sycl_kernel_cg.kernel_cg), std::move(sycl_kernel_cg.kernel_queue));
+    event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
+    return MLastEvent;
+  }
+}
+
+// 测试DataParallel与OfflineKernel存储机制结合
+// event::wait()调用此函数
+event handler::scheduleOffline() {
+  std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
+  std::cout << "=== handler === Process " << getpid() << " scheduleOffline kernel_cgs.size: " << kernel_cgs.size() << std::endl;
+  for (int i = 0; i < kernel_cgs.size(); ++i) {
+    detail::SyclKernelCg *sycl_kernel_cg = kernel_cgs.at(i);
+    event last_event = resubmit(*sycl_kernel_cg);
+    if (i == kernel_cgs.size() - 1) {
+      return last_event;
+    }
+  }
+  kernel_cgs.clear();
+}
+#endif
 
 
 // 【START】=======================================================
@@ -1193,7 +2058,8 @@ event handler::scheduleOffline() {
     // }
     int kernel_nums = kernel_req_datas.size();
     {
-      std::string serialized_data;
+      // **注意** 在最前面加上daemon_wait_count
+      std::string serialized_data = std::to_string(daemon_wait_count) + "\n";
       for (const auto &kernel_req_data : kernel_req_datas) {
         serialized_data += kernel_req_data.serialize();
       }
