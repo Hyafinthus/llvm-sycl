@@ -8,6 +8,12 @@
 #include <mpi.h>
 #include <mutex>
 #include <condition_variable>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <tuple>
+#include <unordered_set>
 #include <cuda_runtime_api.h>
 #include <nvml.h>
 
@@ -34,15 +40,37 @@ std::unordered_map<pid_t, std::shared_ptr<std::mutex>> pid_to_scalecount_mutex; 
 std::unordered_map<pid_t, std::shared_ptr<std::condition_variable>> pid_to_scalecount_cv; // pid_扩容kernelcount_cv
 
 // ====【Monitor】
+static constexpr int MAX_MONITOR_DEVICES = 16;
 std::map<int, int> index_sycl_nvml; // 根据busid确定sycl::device到gpu映射
 std::map<int, int> index_nvml_sycl;
 std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
+std::vector<std::vector<MonitorInfo>> cluster_monitor_info;
 std::vector<int> ranks_idle;
 
 // ====【Algorithm】
 // 暂时先不考虑CPU 如果要放CPU算要额外考虑CPU和GPU的性能差
 std::vector<std::vector<double>> gpu_capability; // 不同rank的gpu算力 monitor初始化写成表
 std::vector<std::vector<double>> gpu_available_time; // 不同gpu的可用时间 monitor查看空闲？不空闲怎么做
+
+struct ProfileCostKey {
+  std::string kernel_key;
+  int rank = 0;
+  int device = 0;
+  int num_parts = 1;
+
+  bool operator<(const ProfileCostKey &other) const {
+    return std::tie(kernel_key, rank, device, num_parts) <
+           std::tie(other.kernel_key, other.rank, other.device,
+                    other.num_parts);
+  }
+};
+
+struct ProfileCostEntry {
+  double ewma_cost = 0.0;
+  int samples = 0;
+};
+
+std::map<ProfileCostKey, ProfileCostEntry> profile_cost_table;
 
 // ====【MPI】
 int mpi_rank, mpi_size; // main
@@ -181,6 +209,8 @@ void SendD2DKernelSchedInfos(MPI_Comm comm_daemon, int master_rank, int daemon_r
       obj_data += line + "\n";  // exec_rank
       std::getline(stream, line);
       obj_data += line + "\n";  // exec_device
+      std::getline(stream, line);
+      obj_data += line + "\n";  // num_parts
       std::getline(stream, line);
       obj_data += line + "\n";  // req_rank.size()
       int map_size = std::stoi(line);
@@ -363,39 +393,550 @@ std::map<SyclReqData, int> chooseReqRank(std::map<SyclReqData, std::set<int>> &r
 
 // ========【Offline Start】
 
+static bool isReadAccess(acc_mode mode) {
+  return mode == acc_mode::read || mode == acc_mode::read_write ||
+         mode == acc_mode::atomic;
+}
+
+static bool isWriteAccess(acc_mode mode) {
+  return mode == acc_mode::write || mode == acc_mode::read_write ||
+         mode == acc_mode::discard_write ||
+         mode == acc_mode::discard_read_write ||
+         mode == acc_mode::atomic;
+}
+
+static bool containsNode(const std::vector<DAGNode *> &nodes, DAGNode *target) {
+  return std::find(nodes.begin(), nodes.end(), target) != nodes.end();
+}
+
+static void addDAGDependency(DAGNode *pre_node, DAGNode *node,
+                             const SyclReqData &req, bool data_dependency) {
+  if (!containsNode(node->depend_on, pre_node)) {
+    node->depend_on.push_back(pre_node);
+  }
+  if (!containsNode(pre_node->depend_by, node)) {
+    pre_node->depend_by.push_back(node);
+  }
+
+  node->depth = std::max(node->depth, pre_node->depth + 1);
+
+  // Only RAW-like edges move data. WAR/WAW edges are ordering constraints and
+  // should not become communication or req_rank dependencies.
+  if (data_dependency) {
+    node->depend_on_mem[pre_node].insert(req);
+    node->depend_on_node[req] = pre_node;
+    pre_node->depend_by_mem[node].insert(req);
+  }
+}
+
+static double getCommElem(DAGNode *node, DAGNode *pre_node) {
+  auto it = node->comm_elem.find(pre_node);
+  return it == node->comm_elem.end() ? 0.0 : it->second;
+}
+
+static std::vector<DAGNode *> reverseTopologicalOrder(
+    const std::vector<DAGNode *> &nodes) {
+  std::unordered_set<DAGNode *> current_nodes(nodes.begin(), nodes.end());
+  std::map<DAGNode *, int> indegree;
+  for (DAGNode *node : nodes) {
+    indegree[node] = 0;
+  }
+
+  for (DAGNode *node : nodes) {
+    for (DAGNode *pre_node : node->depend_on) {
+      if (current_nodes.count(pre_node)) {
+        indegree[node]++;
+      }
+    }
+  }
+
+  std::queue<DAGNode *> ready;
+  for (DAGNode *node : nodes) {
+    if (indegree[node] == 0) {
+      ready.push(node);
+    }
+  }
+
+  std::vector<DAGNode *> topo;
+  while (!ready.empty()) {
+    DAGNode *node = ready.front();
+    ready.pop();
+    topo.push_back(node);
+
+    for (DAGNode *succ_node : node->depend_by) {
+      if (!current_nodes.count(succ_node)) {
+        continue;
+      }
+      indegree[succ_node]--;
+      if (indegree[succ_node] == 0) {
+        ready.push(succ_node);
+      }
+    }
+  }
+
+  if (topo.size() != nodes.size()) {
+    std::cerr << "algorithmHEFT: DAG cycle detected or incomplete topo order, "
+              << "fallback to input order" << std::endl;
+    topo = nodes;
+  }
+
+  return std::vector<DAGNode *>(topo.rbegin(), topo.rend());
+}
+
+static void regenerateReqRanksAfterHEFT(
+    const std::vector<DAGNode *> &nodes,
+    std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
+  std::map<int, D2DKernelSchedInfo *> kernel_to_sched;
+  for (D2DKernelSchedInfo &sched_info : kernel_sched_order_infos) {
+    sched_info.req_rank.clear();
+    kernel_to_sched[sched_info.kernel_count] = &sched_info;
+  }
+
+  for (DAGNode *node : nodes) {
+    auto sched_it = kernel_to_sched.find(node->kernel_count);
+    if (sched_it == kernel_to_sched.end()) {
+      std::cerr << "regenerateReqRanksAfterHEFT: missing sched_info for kernel "
+                << node->kernel_count << std::endl;
+      continue;
+    }
+
+    D2DKernelSchedInfo *sched_info = sched_it->second;
+    for (const SyclReqData &req : node->req_data) {
+      if (!isReadAccess(req.req_accmode)) {
+        continue;
+      }
+
+      auto producer_it = node->depend_on_node.find(req);
+      if (producer_it == node->depend_on_node.end()) {
+        continue;
+      }
+
+      DAGNode *producer = producer_it->second;
+      sched_info->req_rank[req] = producer->exec_rank;
+      std::cout << "regenerateReqRanksAfterHEFT: Kernel "
+                << node->kernel_count << " req " << req.req_count
+                << " source rank " << producer->exec_rank
+                << " from Kernel " << producer->kernel_count << std::endl;
+    }
+  }
+}
+
 // INPUT: 已有的kernel组成的DAG 新的一组wait中所有的kernel
 // 仅通过req的mem依赖建立DAG 不涉及req_rank和exec_rank
 // 分析见NOTION
 void generateDAGs(std::vector<DAGNode *> &kernel_dag_nodes, std::vector<DAGNode *> &nodes) {
   for (DAGNode *node : nodes) {
     for (SyclReqData &req : node->req_data) {
-      // 依赖前序kernel相同mem的写 read | read_write | atomic
-      if (req.req_accmode == acc_mode::read || req.req_accmode == acc_mode::read_write || req.req_accmode == acc_mode::atomic) {
-        // 由后向前遍历kernel 找到相同mem最近的写作为依赖 // 只找最近的写是合理的
-        bool found_write = false;
-        for (auto it = kernel_dag_nodes.rbegin(); it != kernel_dag_nodes.rend(); ++it) {
-          DAGNode *prev_node = *it;
-          for (SyclReqData &prev_req : prev_node->req_data) {
-            if (prev_req.req_accmode != acc_mode::read && prev_req.mem_pointer == req.mem_pointer) {
-              node->depend_on.push_back(prev_node);
-              node->depend_on_mem[prev_node].insert(req);
-              node->depend_on_node[req] = prev_node;
-              prev_node->depend_by.push_back(node);
-              prev_node->depend_by_mem[node].insert(req);
-              node->depth = std::max(node->depth, prev_node->depth + 1);
-              found_write = true;
-              // 所有的req_ranks都由调度结束确定exec_rank后生成
-              // kernel间通信代价 即DAG边的权重由算法预估
-            }
+      const bool current_reads = isReadAccess(req.req_accmode);
+      const bool current_writes = isWriteAccess(req.req_accmode);
+      if (!current_reads && !current_writes) {
+        continue;
+      }
+
+      // 向后查找同一mem的最近冲突访问：
+      // RAW: 当前读依赖最近前序写，是真数据依赖。
+      // WAR: 当前写需等待最近前序写之后的所有读，是顺序依赖。
+      // WAW: 当前写需等待最近前序写，是顺序依赖。
+      bool found_prev_writer = false;
+      for (auto it = kernel_dag_nodes.rbegin(); it != kernel_dag_nodes.rend(); ++it) {
+        DAGNode *prev_node = *it;
+        bool prev_node_has_writer = false;
+        bool prev_node_added = false;
+
+        for (SyclReqData &prev_req : prev_node->req_data) {
+          if (prev_req.mem_pointer != req.mem_pointer) {
+            continue;
           }
-          if (found_write) {
-            break;
+
+          const bool prev_reads = isReadAccess(prev_req.req_accmode);
+          const bool prev_writes = isWriteAccess(prev_req.req_accmode);
+
+          if (current_reads && prev_writes) {
+            addDAGDependency(prev_node, node, req, /*data_dependency=*/true);
+            prev_node_added = true;
+            prev_node_has_writer = true;
           }
+
+          if (current_writes && prev_reads && !found_prev_writer) {
+            addDAGDependency(prev_node, node, req, /*data_dependency=*/false);
+            prev_node_added = true;
+          }
+
+          if (current_writes && prev_writes) {
+            addDAGDependency(prev_node, node, req, /*data_dependency=*/false);
+            prev_node_added = true;
+            prev_node_has_writer = true;
+          }
+        }
+
+        if (prev_node_added) {
+          std::cout << "generateDAGs: Kernel " << node->kernel_count
+                    << " depends on Kernel " << prev_node->kernel_count
+                    << " for req " << req.req_count << std::endl;
+        }
+
+        if (prev_node_has_writer) {
+          found_prev_writer = true;
+          break;
         }
       }
     }
     kernel_dag_nodes.push_back(node);
   }
+}
+
+static constexpr double PROFILE_NS_TO_COST = 10000.0;
+static constexpr double SAME_RANK_BANDWIDTH = 100.0;
+static constexpr double CROSS_RANK_BANDWIDTH = 1.0;
+static constexpr double SPLIT_EFFICIENCY = 0.85;
+static constexpr double SPLIT_MIN_ELEMS = 65536.0;
+
+struct TaskCandidate {
+  int rank = -1;
+  int proc = -1;
+  int num_parts = 1;
+  double start_time = 0.0;
+  double finish_time = std::numeric_limits<double>::infinity();
+  double exec_cost = std::numeric_limits<double>::infinity();
+  std::vector<int> occupied_procs;
+};
+
+static std::string profileKeyForNode(const DAGNode *node) {
+  return buildKernelProfileKey(node->req_data);
+}
+
+static double reqBytes(const SyclReqData &req) {
+  return static_cast<double>(req.elem_size) * static_cast<double>(req.buff_size);
+}
+
+static double totalReqElems(const DAGNode *node) {
+  double elems = 0.0;
+  for (const SyclReqData &req : node->req_data) {
+    elems += req.buff_size;
+  }
+  return elems;
+}
+
+static double totalReqBytes(const DAGNode *node) {
+  double bytes = 0.0;
+  for (const SyclReqData &req : node->req_data) {
+    bytes += reqBytes(req);
+  }
+  return bytes;
+}
+
+static double totalReadElems(const DAGNode *node) {
+  double elems = 0.0;
+  for (const SyclReqData &req : node->req_data) {
+    if (isReadAccess(req.req_accmode)) {
+      elems += req.buff_size;
+    }
+  }
+  return elems;
+}
+
+static double totalWriteElems(const DAGNode *node) {
+  double elems = 0.0;
+  for (const SyclReqData &req : node->req_data) {
+    if (isWriteAccess(req.req_accmode)) {
+      elems += req.buff_size;
+    }
+  }
+  return elems;
+}
+
+static void updateProfileCostTable(const S2DKernelProfileData &profile,
+                                   int sample_rank) {
+  if (profile.duration_ns == 0 || profile.kernel_key.empty()) {
+    return;
+  }
+
+  ProfileCostKey key{profile.kernel_key, sample_rank, profile.device_index,
+                     std::max(1, profile.num_parts)};
+  const double sample_cost =
+      static_cast<double>(profile.duration_ns) / PROFILE_NS_TO_COST;
+  ProfileCostEntry &entry = profile_cost_table[key];
+  if (entry.samples == 0) {
+    entry.ewma_cost = sample_cost;
+  } else {
+    entry.ewma_cost = entry.ewma_cost * 0.7 + sample_cost * 0.3;
+  }
+  entry.samples++;
+
+  std::cout << "ProfileCostTable: key " << profile.kernel_key
+            << " rank " << sample_rank << " device " << profile.device_index
+            << " parts " << std::max(1, profile.num_parts)
+            << " sample_cost " << sample_cost
+            << " ewma_cost " << entry.ewma_cost
+            << " samples " << entry.samples << std::endl;
+}
+
+static bool lookupProfileCost(const std::string &kernel_key, int rank,
+                              int device, int num_parts, double &cost) {
+  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts)};
+  auto exact_it = profile_cost_table.find(exact);
+  if (exact_it != profile_cost_table.end()) {
+    cost = exact_it->second.ewma_cost;
+    return true;
+  }
+
+  double sum = 0.0;
+  int samples = 0;
+  for (const auto &entry : profile_cost_table) {
+    if (entry.first.kernel_key == kernel_key &&
+        entry.first.num_parts == std::max(1, num_parts)) {
+      sum += entry.second.ewma_cost * entry.second.samples;
+      samples += entry.second.samples;
+    }
+  }
+  if (samples > 0) {
+    cost = sum / samples;
+    return true;
+  }
+
+  return false;
+}
+
+static void ensureOfflineDeviceModel() {
+  size_t rank_count = std::max(gpu_capability.size(), cluster_monitor_info.size());
+  if (rank_count == 0) {
+    rank_count = 1;
+  }
+
+  gpu_capability.resize(rank_count);
+  gpu_available_time.resize(rank_count);
+
+  for (size_t rank = 0; rank < rank_count; ++rank) {
+    const bool has_monitor_device_count =
+        rank < cluster_monitor_info.size() && !cluster_monitor_info[rank].empty();
+    size_t device_count = gpu_capability[rank].size();
+    if (has_monitor_device_count) {
+      device_count = cluster_monitor_info[rank].size();
+    }
+    if (device_count == 0) {
+      device_count = 1;
+    }
+
+    if (gpu_capability[rank].empty()) {
+      gpu_capability[rank].resize(device_count, 1.0);
+      for (size_t proc = 1; proc < device_count; ++proc) {
+        gpu_capability[rank][proc] = 10.0;
+      }
+    } else if (gpu_capability[rank].size() < device_count) {
+      size_t old_size = gpu_capability[rank].size();
+      gpu_capability[rank].resize(device_count, 10.0);
+      if (old_size == 0) {
+        gpu_capability[rank][0] = 1.0;
+      }
+    } else if (has_monitor_device_count &&
+               gpu_capability[rank].size() > device_count) {
+      gpu_capability[rank].resize(device_count);
+    }
+
+    gpu_available_time[rank].assign(gpu_capability[rank].size(), 0.0);
+  }
+}
+
+static double deviceCapability(int rank, int proc) {
+  if (rank >= 0 && rank < static_cast<int>(gpu_capability.size()) &&
+      proc >= 0 && proc < static_cast<int>(gpu_capability[rank].size()) &&
+      gpu_capability[rank][proc] > 0.0) {
+    return gpu_capability[rank][proc];
+  }
+  return proc == 0 ? 1.0 : 10.0;
+}
+
+static const MonitorInfo *monitorInfoForDevice(int rank, int proc) {
+  if (rank >= 0 && rank < static_cast<int>(cluster_monitor_info.size()) &&
+      proc >= 0 && proc < static_cast<int>(cluster_monitor_info[rank].size())) {
+    return &cluster_monitor_info[rank][proc];
+  }
+  if (rank == monitor_rank && proc >= 0 &&
+      proc < static_cast<int>(device_monitor_info.size())) {
+    return &device_monitor_info[proc];
+  }
+  return nullptr;
+}
+
+static double monitorPenalty(int rank, int proc) {
+  const MonitorInfo *info = monitorInfoForDevice(rank, proc);
+  if (info == nullptr) {
+    return 1.0;
+  }
+  const double util = std::max(0.0, std::min(100.0, info->util_used));
+  return 1.0 + util / 100.0;
+}
+
+static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
+                              int num_parts) {
+  const MonitorInfo *info = monitorInfoForDevice(rank, proc);
+  if (info == nullptr || info->mem_available == 0) {
+    return true;
+  }
+
+  double required_bytes = totalReqBytes(node);
+  if (num_parts > 1 && !node->req_data.empty()) {
+    required_bytes =
+        (totalReadElems(node) + totalWriteElems(node) / num_parts) *
+        node->req_data.front().elem_size;
+  }
+  const double available_bytes = static_cast<double>(info->mem_available) * 1024.0;
+  return required_bytes < available_bytes * 0.85;
+}
+
+static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
+  double profile_cost = 0.0;
+  const std::string key = profileKeyForNode(node);
+  if (lookupProfileCost(key, rank, proc, 1, profile_cost)) {
+    return std::max(0.001, profile_cost) * monitorPenalty(rank, proc);
+  }
+
+  const double cold_cost = std::max(1.0, node->total_elem) /
+                           std::max(0.1, deviceCapability(rank, proc));
+  return cold_cost * monitorPenalty(rank, proc);
+}
+
+static double estimateCommCost(DAGNode *node, DAGNode *pre_node, int rank,
+                               int proc, int num_parts) {
+  if (pre_node->exec_rank < 0) {
+    return 0.0;
+  }
+
+  const double comm_elem = getCommElem(node, pre_node);
+  if (comm_elem == 0.0) {
+    return 0.0;
+  }
+
+  if (pre_node->exec_rank != rank) {
+    return comm_elem / CROSS_RANK_BANDWIDTH;
+  }
+
+  if (pre_node->num_parts > 1 || num_parts > 1 || pre_node->exec_proc != proc) {
+    return comm_elem / SAME_RANK_BANDWIDTH;
+  }
+
+  return 0.0;
+}
+
+static double dependencyReadyTime(DAGNode *node, int rank, int proc,
+                                  int num_parts) {
+  double ready_time = 0.0;
+  for (DAGNode *pre_node : node->depend_on) {
+    ready_time = std::max(
+        ready_time,
+        pre_node->finish_time +
+            estimateCommCost(node, pre_node, rank, proc, num_parts));
+  }
+  return ready_time;
+}
+
+static bool worthConsideringSplit(DAGNode *node, int num_parts) {
+  if (num_parts <= 1) {
+    return false;
+  }
+  if (totalWriteElems(node) == 0.0) {
+    return false;
+  }
+  if (totalReqElems(node) < SPLIT_MIN_ELEMS) {
+    return false;
+  }
+  return true;
+}
+
+static double estimateSplitExecCost(DAGNode *node, int rank, int num_parts) {
+  double profile_cost = 0.0;
+  const std::string key = profileKeyForNode(node);
+  if (lookupProfileCost(key, rank, 1, num_parts, profile_cost)) {
+    double penalty = 1.0;
+    for (int proc = 1; proc <= num_parts; ++proc) {
+      penalty = std::max(penalty, monitorPenalty(rank, proc));
+    }
+    return std::max(0.001, profile_cost) * penalty;
+  }
+
+  double best_single = std::numeric_limits<double>::infinity();
+  for (int proc = 1; proc <= num_parts; ++proc) {
+    best_single = std::min(best_single, estimateSingleExecCost(node, rank, proc));
+  }
+
+  if (!std::isfinite(best_single)) {
+    best_single = estimateSingleExecCost(node, rank, 1);
+  }
+
+  const double copy_overhead =
+      (totalReadElems(node) * (num_parts - 1) + totalWriteElems(node)) /
+      1000.0 / SAME_RANK_BANDWIDTH;
+  const double launch_overhead = 0.2 * num_parts;
+  return best_single / (num_parts * SPLIT_EFFICIENCY) + copy_overhead +
+         launch_overhead;
+}
+
+static TaskCandidate makeSingleCandidate(DAGNode *node, int rank, int proc) {
+  TaskCandidate candidate;
+  candidate.rank = rank;
+  candidate.proc = proc;
+  candidate.num_parts = 1;
+  candidate.occupied_procs.push_back(proc);
+
+  if (!monitorMemoryFits(node, rank, proc, 1)) {
+    return candidate;
+  }
+
+  const double device_ready = gpu_available_time[rank][proc];
+  const double dep_ready = dependencyReadyTime(node, rank, proc, 1);
+  candidate.start_time = std::max(device_ready, dep_ready);
+  candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
+  candidate.finish_time = candidate.start_time + candidate.exec_cost;
+  return candidate;
+}
+
+static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
+                                        int num_parts) {
+  TaskCandidate candidate;
+  candidate.rank = rank;
+  candidate.proc = 1;
+  candidate.num_parts = num_parts;
+
+  if (!worthConsideringSplit(node, num_parts)) {
+    return candidate;
+  }
+  if (rank < 0 || rank >= static_cast<int>(gpu_available_time.size()) ||
+      static_cast<int>(gpu_available_time[rank].size()) <= num_parts) {
+    return candidate;
+  }
+
+  double device_ready = 0.0;
+  for (int proc = 1; proc <= num_parts; ++proc) {
+    if (!monitorMemoryFits(node, rank, proc, num_parts)) {
+      return candidate;
+    }
+    candidate.occupied_procs.push_back(proc);
+    device_ready = std::max(device_ready, gpu_available_time[rank][proc]);
+  }
+
+  const double dep_ready = dependencyReadyTime(node, rank, 1, num_parts);
+  candidate.start_time = std::max(device_ready, dep_ready);
+  candidate.exec_cost = estimateSplitExecCost(node, rank, num_parts);
+  candidate.finish_time = candidate.start_time + candidate.exec_cost;
+  return candidate;
+}
+
+static double estimateAverageRankCost(DAGNode *node) {
+  double sum = 0.0;
+  int count = 0;
+  for (int rank = 0; rank < static_cast<int>(gpu_available_time.size()); ++rank) {
+    for (int proc = 0; proc < static_cast<int>(gpu_available_time[rank].size());
+         ++proc) {
+      if (monitorMemoryFits(node, rank, proc, 1)) {
+        sum += estimateSingleExecCost(node, rank, proc);
+        count++;
+      }
+    }
+  }
+  if (count == 0) {
+    return std::max(1.0, node->total_elem);
+  }
+  return sum / count;
 }
 
 // nodes: 这批要调度的所有kernel
@@ -417,6 +958,7 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
     {0, 0, 0, 0, 0, 0, 0, 0, 0},
     {0, 0, 0}
   };
+  ensureOfflineDeviceModel();
 
   // 1.根据(规模+monitor)生成执行时间表 对于每个任务t_i计算w(i) 以及任务在不同proc上时各个pre的传输代价
   for (DAGNode *node : nodes) {
@@ -441,43 +983,25 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
   }
 
   // 2.从后向前 对于每个任务u->v 计算rank(u)=w_mean(u)+max_v[c(u,v)+rank(v)] 并从大到小排序
-  // 最后一个都是无依赖的
-  std::vector<DAGNode *> exit_nodes;
-  for (DAGNode *node : nodes) {
-    if (node->depend_by.empty()) {
-      node->rank_u = node->total_elem;
-      std::cout << "algorithmHEFT: Kernel " << node->kernel_count << " is exit node rank_u: " << node->rank_u << std::endl;
-      exit_nodes.push_back(node);
-    }
-  }
-  // 广度优先逆序遍历所有exit节点的前驱
-  // 即算一个节点时 它的所有后继必须被计算过
-  std::vector<DAGNode *> visited;
-  std::queue<DAGNode *> q;
-  for (DAGNode *exit_node : exit_nodes) {
-    q.push(exit_node);
-    visited.push_back(exit_node);
-  }
-  while (!q.empty()) {
-    DAGNode *current = q.front();
-    q.pop();
-    for (DAGNode *pre_node : current->depend_on) {
-      if (std::find(visited.begin(), visited.end(), pre_node) == visited.end()) {
-        q.push(pre_node);
-        visited.push_back(pre_node);
-      }
-    }
-  }
-  // 从后向前计算rank_u 要算的是自己给后继多少
+  // 必须使用逆拓扑序，保证计算一个节点时同批次所有后继已经计算过rank_u。
+  std::unordered_set<DAGNode *> current_nodes(nodes.begin(), nodes.end());
+  std::vector<DAGNode *> visited = reverseTopologicalOrder(nodes);
   for (DAGNode *node : visited) {
-    int max_succ = 0;
+    double max_succ = 0;
     for (DAGNode *succ_node : node->depend_by) {
-      // 依赖一定存在
-      if (succ_node->comm_elem[node] + succ_node->rank_u > max_succ) {
-        max_succ = succ_node->comm_elem[node] + succ_node->rank_u;
+      if (!current_nodes.count(succ_node)) {
+        continue;
+      }
+      const double succ_cost = getCommElem(succ_node, node) + succ_node->rank_u;
+      if (succ_cost > max_succ) {
+        max_succ = succ_cost;
       }
     }
-    node->rank_u = node->total_elem + max_succ; // 简单估计
+    node->rank_u = estimateAverageRankCost(node) + max_succ;
+    if (max_succ == 0) {
+      std::cout << "algorithmHEFT: Kernel " << node->kernel_count
+                << " is exit node rank_u: " << node->rank_u << std::endl;
+    }
   }
   // 以rank_u从大到小排序
   std::sort(visited.begin(), visited.end(), [](DAGNode *a, DAGNode *b) {
@@ -486,58 +1010,59 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
 
   // 3.每个任务计算 对于每个proc 计算start_v(p)=max_[last_finish(p),finish(u_1)+comm(u_1,v),...]
   // 和finish_v(p)=start_v(p)+w(v,p)
-  // 选取earliest_finish_p(v)=min[finish_v(p)] 更新各个变量
+  // 同时把SNMD split作为候选放置方式，选择earliest_finish_p(v)最小者。
   for (int order = 0; order < visited.size(); order++) {
     DAGNode *node = visited[order];
-    int earliest_finish = INT_MAX;
-    int rank_chosen = -1;
-    int proc_chosen = -1;
-    // 遍历所有proc
+    TaskCandidate best_candidate;
+
     for (int rank = 0; rank < gpu_available_time.size(); rank++) {
-      auto &time_vec = gpu_available_time[rank];
-      for (int proc = 0; proc < time_vec.size(); proc++) {
-        int last_finish = time_vec[proc];
-        int start_time = last_finish;
-        // 找到最早能开始时间 即所有数据都传输完的最大时间
-        for (DAGNode *pre_node : node->depend_on) {
-          int pre_comm_time = 0;
-          // 判断是否同一rank甚至同一proc 通信代价不同
-          if (pre_node->exec_rank != rank) {
-            pre_comm_time = node->comm_elem[pre_node] / 1;
-          } else if (pre_node->exec_proc != proc) {
-            pre_comm_time = node->comm_elem[pre_node] / 100;
-          } else {
-            pre_comm_time = 0;
-          }
-          if (start_time < pre_node->finish_time + pre_comm_time) {
-            start_time = pre_node->finish_time + pre_comm_time;
-          }
+      for (int proc = 0; proc < gpu_available_time[rank].size(); proc++) {
+        TaskCandidate candidate = makeSingleCandidate(node, rank, proc);
+        if (candidate.finish_time < best_candidate.finish_time) {
+          best_candidate = candidate;
         }
-        int finish_time = start_time + node->total_elem / gpu_capability[rank][proc];
-        if (finish_time < earliest_finish) {
-          earliest_finish = finish_time;
-          rank_chosen = rank;
-          proc_chosen = proc;
+      }
+
+      const int max_split_parts =
+          std::min<int>(4, static_cast<int>(gpu_available_time[rank].size()) - 1);
+      for (int num_parts = 2; num_parts <= max_split_parts; ++num_parts) {
+        TaskCandidate candidate = makeSplitCandidate(node, rank, num_parts);
+        if (candidate.finish_time < best_candidate.finish_time) {
+          best_candidate = candidate;
         }
       }
     }
-    node->exec_rank = rank_chosen;
-    node->exec_proc = proc_chosen;
-    node->finish_time = earliest_finish;
-    gpu_available_time[rank_chosen][proc_chosen] = earliest_finish;
+
+    if (best_candidate.rank < 0 || best_candidate.proc < 0) {
+      best_candidate = makeSingleCandidate(node, 0, 0);
+    }
+
+    node->exec_rank = best_candidate.rank;
+    node->exec_proc = best_candidate.proc;
+    node->num_parts = best_candidate.num_parts;
+    node->finish_time = best_candidate.finish_time;
+    for (int proc : best_candidate.occupied_procs) {
+      gpu_available_time[node->exec_rank][proc] = node->finish_time;
+    }
 
     D2DKernelSchedInfo kernel_sched_info;
     kernel_sched_info.kernel_count = node->kernel_count;
     kernel_sched_info.exec_order = order + 1;
     kernel_sched_info.exec_rank = node->exec_rank;
     kernel_sched_info.exec_device = node->exec_proc;
-    for (const SyclReqData &req : node->req_data) {
-      kernel_sched_info.req_rank[req] = node->exec_rank;
-    }
+    kernel_sched_info.num_parts = node->num_parts;
     kernel_sched_order_infos.push_back(kernel_sched_info);
 
-    std::cout << "algorithmHEFT: Kernel " << node->kernel_count << " assigned to Rank " << node->exec_rank << " Proc " << node->exec_proc << " finish_time: " << node->finish_time << std::endl;
+    std::cout << "algorithmHEFT: Kernel " << node->kernel_count
+              << " assigned to Rank " << node->exec_rank
+              << " Proc " << node->exec_proc
+              << " NumParts " << node->num_parts
+              << " start_time " << best_candidate.start_time
+              << " exec_cost " << best_candidate.exec_cost
+              << " finish_time " << node->finish_time << std::endl;
   }
+
+  regenerateReqRanksAfterHEFT(nodes, kernel_sched_order_infos);
 
   // TODO 最合适用几个节点去跑
   // 通信代价和贪心避免了扩张代价大于运行代价
@@ -775,6 +1300,7 @@ void *SystemSchedulerMonitor(void *arg) {
   pthread_detach(monitor_tid);
 
   ranks_idle.resize(monitor_size, false);
+  cluster_monitor_info.resize(monitor_size);
 
   // 每个rank彼此感知是否有空闲即可 无需传递所有状态？
   while (1) {
@@ -787,6 +1313,38 @@ void *SystemSchedulerMonitor(void *arg) {
     }
 
     MPI_Allgather(&is_idle, 1, MPI_INT, ranks_idle.data(), 1, MPI_INT, comm_monitor);
+
+    std::array<double, MAX_MONITOR_DEVICES * 3> local_monitor{};
+    const int local_device_count =
+        std::min<int>(device_monitor_info.size(), MAX_MONITOR_DEVICES);
+    for (int i = 0; i < local_device_count; ++i) {
+      local_monitor[i * 3 + 0] = 1.0;
+      local_monitor[i * 3 + 1] = device_monitor_info[i].util_used;
+      local_monitor[i * 3 + 2] =
+          static_cast<double>(device_monitor_info[i].mem_available);
+    }
+
+    std::vector<double> packed_monitor(
+        monitor_size * MAX_MONITOR_DEVICES * 3, 0.0);
+    MPI_Allgather(local_monitor.data(), MAX_MONITOR_DEVICES * 3, MPI_DOUBLE,
+                  packed_monitor.data(), MAX_MONITOR_DEVICES * 3, MPI_DOUBLE,
+                  comm_monitor);
+
+    for (int rank = 0; rank < monitor_size; ++rank) {
+      std::vector<MonitorInfo> rank_info;
+      for (int device = 0; device < MAX_MONITOR_DEVICES; ++device) {
+        const int offset = rank * MAX_MONITOR_DEVICES * 3 + device * 3;
+        if (packed_monitor[offset] == 0.0) {
+          continue;
+        }
+        rank_info.push_back(MonitorInfo{
+            device == 0 ? "CPU" : "GPU",
+            packed_monitor[offset + 1],
+            static_cast<size_t>(packed_monitor[offset + 2])});
+      }
+      cluster_monitor_info[rank] = std::move(rank_info);
+    }
+
     // for (int i = 0; i < monitor_size; i++) {
     //   std::cout << "SystemSchedulerMonitor: MONITOR_Rank " << monitor_rank << " ranks_idle[" << i << "]: " << ranks_idle[i] << std::endl;
     // }
@@ -1238,6 +1796,7 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
         req_for_rank = kernel_sched_info.get_req_for_exec_rank(daemon_rank);
 
         kernel_exec_info.device_index = kernel_sched_info.exec_device;
+        kernel_exec_info.num_parts = kernel_sched_info.num_parts;
       }
       else {
         req_for_rank = kernel_sched_info.get_req_for_rank(daemon_rank);
@@ -1258,7 +1817,19 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
     }
     size_t message_size = serialized_data.size();
     mq_send(mq_id_program, serialized_data.c_str(), message_size, 0);
-    std::cout << "commExecInfo === Rank " << daemon_rank << ": mq_send kernel_exec_infos size: " << kernel_exec_infos.size() << " mqsize: " << message_size  << std::endl;
+    std::cout << "commExecInfo === Rank " << daemon_rank
+              << ": mq_send kernel_exec_infos size: "
+              << kernel_exec_infos.size() << " mqsize: " << message_size
+              << std::endl;
+    for (const D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
+      std::cout << "commExecInfo === Rank " << daemon_rank
+                << ": kernel_count " << kernel_exec_info.kernel_count
+                << " exec " << kernel_exec_info.exec
+                << " device_index " << kernel_exec_info.device_index
+                << " num_parts " << kernel_exec_info.num_parts
+                << " req_counts " << kernel_exec_info.req_counts.size()
+                << std::endl;
+    }
   }
 
   // ====【为执行的rank满足依赖】
@@ -1328,6 +1899,168 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
     }
   }
   mq_close(mq_id_program);
+}
+
+static std::string
+serializeProfileSamples(const std::vector<S2DKernelProfileData> &profiles) {
+  std::ostringstream oss;
+  oss << profiles.size() << "\n";
+  for (const S2DKernelProfileData &profile : profiles) {
+    oss << profile.serialize();
+  }
+  return oss.str();
+}
+
+static std::vector<S2DKernelProfileData>
+deserializeProfileSamples(const std::string &data) {
+  std::istringstream iss(data);
+  size_t profile_count = 0;
+  iss >> profile_count;
+  iss.ignore();
+
+  std::vector<S2DKernelProfileData> profiles;
+  for (size_t i = 0; i < profile_count; ++i) {
+    profiles.push_back(S2DKernelProfileData::deserialize(iss));
+  }
+  return profiles;
+}
+
+static void exchangeOfflineProfilesWithMaster(
+    const std::vector<S2DKernelProfileData> &local_profiles,
+    MPI_Comm &comm_daemon, int daemon_rank, int master_rank,
+    const std::set<int> &onrun_ranks) {
+  static constexpr int PROFILE_LEN_TAG = 201;
+  static constexpr int PROFILE_DATA_TAG = 202;
+
+  std::string payload = serializeProfileSamples(local_profiles);
+  int payload_size = static_cast<int>(payload.size());
+
+  if (daemon_rank == master_rank) {
+    for (const S2DKernelProfileData &profile : local_profiles) {
+      updateProfileCostTable(profile, daemon_rank);
+    }
+
+    for (int rank : onrun_ranks) {
+      if (rank == master_rank) {
+        continue;
+      }
+
+      int remote_size = 0;
+      MPI_Recv(&remote_size, 1, MPI_INT, rank, PROFILE_LEN_TAG, comm_daemon,
+               MPI_STATUS_IGNORE);
+      if (remote_size <= 0) {
+        continue;
+      }
+
+      std::string remote_payload(remote_size, '\0');
+      MPI_Recv(remote_payload.data(), remote_size, MPI_CHAR, rank,
+               PROFILE_DATA_TAG, comm_daemon, MPI_STATUS_IGNORE);
+
+      std::vector<S2DKernelProfileData> remote_profiles =
+          deserializeProfileSamples(remote_payload);
+      for (const S2DKernelProfileData &profile : remote_profiles) {
+        updateProfileCostTable(profile, rank);
+      }
+    }
+  } else {
+    MPI_Send(&payload_size, 1, MPI_INT, master_rank, PROFILE_LEN_TAG,
+             comm_daemon);
+    if (payload_size > 0) {
+      MPI_Send(payload.data(), payload_size, MPI_CHAR, master_rank,
+               PROFILE_DATA_TAG, comm_daemon);
+    }
+  }
+}
+
+static void parseOfflineKernelReqBatch(
+    const std::string &received_data, int local_pid, int daemon_rank,
+    int &daemon_wait_count, std::vector<S2DKernelReqData> &kernel_req_datas) {
+  std::istringstream stream(received_data);
+  std::string line;
+
+  // **注意** 在最前面加上daemon_wait_count
+  std::getline(stream, line);
+  daemon_wait_count = std::stoi(line);
+  while (std::getline(stream, line)) {
+    if (line.empty()) {
+      continue;
+    }
+
+    std::string obj_data = line + "\n";  // pid line
+    std::getline(stream, line);
+    obj_data += line + "\n";  // kernel_count line
+    std::getline(stream, line);
+    obj_data += line + "\n";  // req_size line
+    std::getline(stream, line);
+    obj_data += line + "\n";  // req_count line
+    int req_count = std::stoi(line);
+    for (int i = 0; i < req_count * 6; ++i) {
+      std::getline(stream, line);
+      obj_data += line + "\n";
+    }
+    kernel_req_datas.push_back(S2DKernelReqData::deserialize(obj_data));
+  }
+
+  std::cout << "Rank " << daemon_rank
+            << ": mq_receive kernel_req_datas size: "
+            << kernel_req_datas.size() << std::endl;
+
+  for (const auto &kernel_req_data : kernel_req_datas) {
+    for (const auto &req : kernel_req_data.reqs) {
+      std::cout << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: "
+                << kernel_req_data.pid << " count: "
+                << kernel_req_data.kernel_count
+                << " req_count: " << req.req_count
+                << " pointer: " << req.mem_pointer << std::endl;
+      if (kernel_req_data.pid != local_pid) {
+        std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) +
+                               " kernel_req_data pid not match local_pid";
+        perror(errorMsg.c_str());
+        exit(1);
+      }
+    }
+  }
+}
+
+static bool receiveOfflineKernelReqBatch(
+    mqd_t mq_id_daemon, int local_pid, int daemon_rank, int &daemon_wait_count,
+    std::vector<S2DKernelReqData> &kernel_req_datas,
+    std::vector<S2DKernelProfileData> &local_profiles) {
+  while (true) {
+    std::cout << "SystemSchedulerDaemonOffline: Rank " << daemon_rank
+              << ": waiting reqs from handler" << std::endl;
+    char buffer[MAX_MSG_DAEMON_SIZE];
+    ssize_t bytes_received =
+        mq_receive(mq_id_daemon, buffer, MAX_MSG_DAEMON_SIZE, nullptr);
+
+    if (bytes_received <= 0) {
+      std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) +
+                             " DAEMON mq_receive failed";
+      perror(errorMsg.c_str());
+      exit(1);
+    }
+
+    std::string received_data(buffer, bytes_received);
+    if (received_data == "EXIT") {
+      std::cout << "Rank " << daemon_rank << ": SYCLAPP finish" << std::endl;
+      return false;
+    }
+
+    if (S2DProfileBatchData::isProfileBatch(received_data)) {
+      S2DProfileBatchData batch =
+          S2DProfileBatchData::deserialize(received_data);
+      local_profiles.insert(local_profiles.end(), batch.profiles.begin(),
+                            batch.profiles.end());
+      std::cout << "Rank " << daemon_rank
+                << ": mq_receive profile samples: "
+                << batch.profiles.size() << std::endl;
+      continue;
+    }
+
+    parseOfflineKernelReqBatch(received_data, local_pid, daemon_rank,
+                               daemon_wait_count, kernel_req_datas);
+    return true;
+  }
 }
 
 void *SystemSchedulerDaemonOffline(void *arg) {
@@ -1402,63 +2135,12 @@ void *SystemSchedulerDaemonOffline(void *arg) {
   while (1) {
     // DONE ====【接收program通信】
     std::vector<S2DKernelReqData> kernel_req_datas;
-    int daemon_wait_count;
-    {
-      std::cout << "SystemSchedulerDaemonOffline: Rank " << daemon_rank << ": waiting reqs from handler" << std::endl;
-      char buffer[MAX_MSG_DAEMON_SIZE];
-      ssize_t bytes_received = mq_receive(mq_id_daemon, buffer, MAX_MSG_DAEMON_SIZE, nullptr);
-
-      if (bytes_received > 0) {
-        if (std::string(buffer, bytes_received) == "EXIT") {
-          std::cout << "Rank " << daemon_rank << ": SYCLAPP finish" << std::endl;
-          break;
-        }
-
-        std::string received_data(buffer, bytes_received);
-        std::istringstream stream(received_data);
-        std::string line;
-
-        // **注意** 在最前面加上daemon_wait_count
-        std::getline(stream, line);
-        daemon_wait_count = std::stoi(line);
-        while (std::getline(stream, line)) {
-          std::string obj_data = line + "\n";  // pid line
-          std::getline(stream, line);
-          obj_data += line + "\n";  // kernel_count line
-          int kernel_count = std::stoi(line);
-          std::getline(stream, line);
-          obj_data += line + "\n";  // req_size line
-          std::getline(stream, line);
-          obj_data += line + "\n";  // req_count line
-          int req_count = std::stoi(line);
-          // read req_count * 6 lines
-          for (int i = 0; i < req_count * 6; ++i) {
-            std::getline(stream, line);
-            obj_data += line + "\n";
-          }
-          // std::cout << " one obj_data " << std::endl;
-          kernel_req_datas.push_back(S2DKernelReqData::deserialize(obj_data));
-        }
-
-        std::cout << "Rank " << daemon_rank << ": mq_receive kernel_req_datas size: " << kernel_req_datas.size() << std::endl;
-
-        for (const auto &kernel_req_data : kernel_req_datas) {
-          for (const auto &req : kernel_req_data.reqs) {
-            std::cout << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: " 
-                      << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count
-                      << " req_count: " << req.req_count << " pointer: " << req.mem_pointer << std::endl;
-            if (kernel_req_data.pid != local_pid) {
-              std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) + " kernel_req_data pid not match local_pid";
-              perror(errorMsg.c_str());
-              exit(1);
-            }
-          }
-        }
-      } else {
-        std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) + " DAEMON mq_receive failed";
-        perror(errorMsg.c_str());
-        exit(1);
-      }
+    int daemon_wait_count = 0;
+    std::vector<S2DKernelProfileData> local_profiles;
+    if (!receiveOfflineKernelReqBatch(mq_id_daemon, local_pid, daemon_rank,
+                                      daemon_wait_count, kernel_req_datas,
+                                      local_profiles)) {
+      break;
     }
 
     // DELE 找出所有空闲rank供算法选择
@@ -1470,6 +2152,9 @@ void *SystemSchedulerDaemonOffline(void *arg) {
     //   }
     // }
     int onrun_size = onrun_ranks.size();
+
+    exchangeOfflineProfilesWithMaster(local_profiles, comm_daemon, daemon_rank,
+                                      master_rank, onrun_ranks);
 
     // ====【调度决策并发给其他rank】
     std::vector<D2DKernelSchedInfo> kernel_sched_order_infos;

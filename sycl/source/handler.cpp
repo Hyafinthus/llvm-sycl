@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <chrono>
 
 #include <detail/config.hpp>
 #include <detail/global_handler.hpp>
@@ -30,6 +31,7 @@
 #include <sycl/event.hpp>
 #include <sycl/handler.hpp>
 #include <sycl/info/info_desc.hpp>
+#include <sycl/properties/queue_properties.hpp>
 #include <sycl/stream.hpp>
 #include <sycl/detail/iostream_proxy.hpp>
 #include <mqueue.h>
@@ -44,6 +46,15 @@ using sycl::detail::SyclKernelCg;
 
 extern mqd_t mq_id_daemon, mq_id_program;
 
+struct OfflineProfileEvent {
+  int KernelCount = 0;
+  int DeviceIndex = 0;
+  int NumParts = 1;
+  uint64_t HostStartNs = 0;
+  uint64_t HostEndNs = 0;
+  sycl::event Event;
+};
+
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 
@@ -57,6 +68,208 @@ handler::handler(std::shared_ptr<detail::queue_impl> Queue,
     : MImpl(std::make_shared<detail::handler_impl>(std::move(PrimaryQueue),
                                                    std::move(SecondaryQueue))),
       MQueue(std::move(Queue)), MIsHost(IsHost) {}
+
+#if defined(SCHEDULE) || defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+static property_list
+getOfflineProfilingPropertyList(const detail::QueueImplPtr &Queue) {
+  const property_list &Props = Queue->getPropertyList();
+  if (Props.has_property<property::queue::enable_profiling>()) {
+    return Props;
+  }
+
+  if (Props.has_property<property::queue::in_order>()) {
+    return property_list(property::queue::in_order{},
+                         property::queue::enable_profiling{});
+  }
+  return property_list(property::queue::enable_profiling{});
+}
+
+static detail::QueueImplPtr
+makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
+                          const detail::QueueImplPtr &OldQueue) {
+  try {
+    property_list ProfilingProps = getOfflineProfilingPropertyList(OldQueue);
+    detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(
+        Device, detail::queue_impl::getDefaultOrNew(Device),
+        OldQueue->getAsyncHandler(), ProfilingProps);
+    std::cout << "=== handler === Offline profiling queue created, profiling: "
+              << NewQueue->has_property<property::queue::enable_profiling>()
+              << " in_order: "
+              << NewQueue->has_property<property::queue::in_order>()
+              << std::endl;
+    return NewQueue;
+  } catch (const std::exception &e) {
+    std::cout << "=== handler === Offline profiling queue creation failed: "
+              << e.what() << ". Fallback to original queue properties."
+              << std::endl;
+  } catch (...) {
+    std::cout << "=== handler === Offline profiling queue creation failed. "
+              << "Fallback to original queue properties." << std::endl;
+  }
+
+  return std::make_shared<detail::queue_impl>(
+      Device, detail::queue_impl::getDefaultOrNew(Device),
+      OldQueue->getAsyncHandler(), OldQueue->getPropertyList());
+}
+
+static detail::SyclKernelCg *
+findOfflineKernelCg(std::vector<detail::SyclKernelCg *> &KernelCgs,
+                    int KernelCount) {
+  auto It = std::find_if(KernelCgs.begin(), KernelCgs.end(),
+                         [KernelCount](detail::SyclKernelCg *KernelCg) {
+                           return KernelCg &&
+                                  KernelCg->kernel_count == KernelCount;
+                         });
+  if (It == KernelCgs.end()) {
+    throw sycl::runtime_error(
+        "Internal Error. Offline kernel_count not found in this wait batch.",
+        PI_ERROR_INVALID_OPERATION);
+  }
+  return *It;
+}
+
+static int clampOfflineDeviceIndex(int RequestedDeviceIndex) {
+  const auto &Devices = detail::ProgramManager::getInstance().globalDevices;
+  if (Devices.empty()) {
+    throw sycl::runtime_error(
+        "Internal Error. Offline scheduler has no available SYCL devices.",
+        PI_ERROR_INVALID_OPERATION);
+  }
+
+  if (RequestedDeviceIndex >= 0 &&
+      RequestedDeviceIndex < static_cast<int>(Devices.size())) {
+    return RequestedDeviceIndex;
+  }
+
+  const int ClampedDeviceIndex =
+      std::min(std::max(RequestedDeviceIndex, 0),
+               static_cast<int>(Devices.size()) - 1);
+  std::cout << "=== handler === Offline device_index out of range: requested "
+            << RequestedDeviceIndex << " available " << Devices.size()
+            << ", use " << ClampedDeviceIndex << std::endl;
+  return ClampedDeviceIndex;
+}
+
+static void clearOfflineBatch() {
+  auto &PM = detail::ProgramManager::getInstance();
+  for (detail::SyclKernelCg *KernelCg : PM.kernel_cgs) {
+    delete KernelCg;
+  }
+  PM.kernel_cgs.clear();
+#ifdef SCHEDULE_OFFLINE
+  PM.kernel_reqs.clear();
+#endif
+#ifdef SNMD_OFFLINE
+  PM.NumParts = 1;
+  PM.SplitQueues_Write.clear();
+#endif
+}
+
+static std::string findOfflineKernelProfileKey(int KernelCount) {
+#ifdef SCHEDULE_OFFLINE
+  const auto &KernelReqs = detail::ProgramManager::getInstance().kernel_reqs;
+  auto It = std::find_if(KernelReqs.begin(), KernelReqs.end(),
+                         [KernelCount](const S2DKernelReqData &KernelReqData) {
+                           return KernelReqData.kernel_count == KernelCount;
+                         });
+  if (It != KernelReqs.end()) {
+    return It->profileKey();
+  }
+#endif
+  return "kernel_count=" + std::to_string(KernelCount);
+}
+
+static uint64_t offlineNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+static void fillOfflineProfileData(int WaitCount,
+                                   const OfflineProfileEvent &ProfileEvent,
+                                   uint64_t Duration,
+                                   S2DKernelProfileData &ProfileData) {
+  ProfileData.pid = getpid();
+  ProfileData.wait_count = WaitCount;
+  ProfileData.kernel_count = ProfileEvent.KernelCount;
+  ProfileData.device_index = ProfileEvent.DeviceIndex;
+  ProfileData.num_parts = std::max(1, ProfileEvent.NumParts);
+  ProfileData.duration_ns = Duration;
+  ProfileData.kernel_key = findOfflineKernelProfileKey(ProfileEvent.KernelCount);
+}
+
+static bool collectOfflineProfilingInfo(
+    int WaitCount, const OfflineProfileEvent &ProfileEvent,
+    S2DKernelProfileData &ProfileData) {
+  try {
+    uint64_t Start =
+        ProfileEvent.Event.get_profiling_info<
+            info::event_profiling::command_start>();
+    uint64_t End =
+        ProfileEvent.Event.get_profiling_info<
+            info::event_profiling::command_end>();
+    uint64_t Duration = End >= Start ? End - Start : 0;
+    std::cout << "=== handler === Offline profiling kernel_count: "
+              << ProfileEvent.KernelCount << " device_index: "
+              << ProfileEvent.DeviceIndex << " num_parts: "
+              << ProfileEvent.NumParts << " start_ns: " << Start
+              << " end_ns: " << End << " duration_ns: " << Duration
+              << std::endl;
+
+    fillOfflineProfileData(WaitCount, ProfileEvent, Duration, ProfileData);
+    return Duration > 0;
+  } catch (const std::exception &e) {
+    std::cout << "=== handler === Offline profiling unavailable for kernel_count: "
+              << ProfileEvent.KernelCount << " reason: " << e.what()
+              << std::endl;
+  } catch (...) {
+    std::cout << "=== handler === Offline profiling unavailable for kernel_count: "
+              << ProfileEvent.KernelCount << std::endl;
+  }
+
+  if (ProfileEvent.HostEndNs > ProfileEvent.HostStartNs) {
+    uint64_t Duration = ProfileEvent.HostEndNs - ProfileEvent.HostStartNs;
+    std::cout << "=== handler === Offline profiling host fallback kernel_count: "
+              << ProfileEvent.KernelCount << " device_index: "
+              << ProfileEvent.DeviceIndex << " num_parts: "
+              << ProfileEvent.NumParts << " duration_ns: " << Duration
+              << std::endl;
+    fillOfflineProfileData(WaitCount, ProfileEvent, Duration, ProfileData);
+    return Duration > 0;
+  }
+
+  return false;
+}
+
+static void processOfflineProfilingBatch(
+    int WaitCount, const std::vector<OfflineProfileEvent> &ProfileEvents) {
+  S2DProfileBatchData Batch;
+  for (const OfflineProfileEvent &ProfileEvent : ProfileEvents) {
+    S2DKernelProfileData ProfileData;
+    if (collectOfflineProfilingInfo(WaitCount, ProfileEvent, ProfileData)) {
+      Batch.profiles.push_back(ProfileData);
+    }
+  }
+
+#ifdef SCHEDULE_OFFLINE
+  if (!Batch.profiles.empty()) {
+    std::string SerializedData = Batch.serialize();
+    if (SerializedData.size() <= MAX_MSG_DAEMON_SIZE) {
+      if (mq_send(mq_id_daemon, SerializedData.c_str(), SerializedData.size(),
+                  0) == -1) {
+        perror("Error: Offline profiling mq_send failed");
+      } else {
+        std::cout << "=== handler === Offline profiling sent samples: "
+                  << Batch.profiles.size() << std::endl;
+      }
+    } else {
+      std::cout << "=== handler === Offline profiling message too large: "
+                << SerializedData.size() << std::endl;
+    }
+  }
+#endif
+}
+#endif
 
 // Sets the submission state to indicate that an explicit kernel bundle has been
 // set. Throws a sycl::exception with errc::invalid if the current state
@@ -277,7 +490,8 @@ event handler::finalize() {
         }
         if (kernel_exec_info.scale_count > 1) {
           daemon_scale_count = kernel_exec_info.scale_count;
-          detail::ProgramManager::getInstance().scale_device = kernel_exec_info.device_index;
+          detail::ProgramManager::getInstance().scale_device =
+              clampOfflineDeviceIndex(kernel_exec_info.device_index);
           std::cout << getpid() << " === handler === Process " << getpid() << " === scale_count: " << daemon_scale_count << " device_index: " << kernel_exec_info.device_index << std::endl;
           return MLastEvent;
         } else {
@@ -401,7 +615,9 @@ event handler::finalize() {
 
       // ====【执行进程rebind】
       if (kernel_exec_info.exec) {
-        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(kernel_exec_info.device_index);
+        const int ActualDeviceIndex =
+            clampOfflineDeviceIndex(kernel_exec_info.device_index);
+        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
         std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
         MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
@@ -1558,16 +1774,15 @@ event handler::finalize() {
 
 
 // 【START】=======================================================
-#ifdef SCHEDULE_OFFLINE
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
   // 只CommandGroup和MQueue是合理的 MRequirements和其他已被move进CommandGroup
-  SyclKernelCg *sycl_kernel_cg = new SyclKernelCg(detail::ProgramManager::getInstance().kernel_count, std::move(CommandGroup), MQueue);
-  detail::ProgramManager::getInstance().kernel_cgs.push_back(sycl_kernel_cg);
-  return MLastEvent;
-#elif defined(SNMD_OFFLINE)
   auto &PM = detail::ProgramManager::getInstance();
+#ifndef SCHEDULE_OFFLINE
   PM.kernel_count++;
-  SyclKernelCg *sycl_kernel_cg = new SyclKernelCg(detail::ProgramManager::getInstance().kernel_count, std::move(CommandGroup), MQueue);
-  detail::ProgramManager::getInstance().kernel_cgs.push_back(sycl_kernel_cg);
+#endif
+  SyclKernelCg *sycl_kernel_cg =
+      new SyclKernelCg(PM.kernel_count, std::move(CommandGroup), MQueue);
+  PM.kernel_cgs.push_back(sycl_kernel_cg);
   return MLastEvent;
 #else
   detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
@@ -1607,18 +1822,30 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   size_t &NumParts = PM.NumParts;
 
   // SPLIT
-  if (sycl_kernel_cg.kernel_count == 4) {
-    NumParts = 4;
+  if (NumParts > 1) {
+    size_t AvailableSplitDevices =
+        PM.globalDevices.size() > 1 ? PM.globalDevices.size() - 1 : 0;
+    if (NumParts > AvailableSplitDevices) {
+      std::cout << "=== handler === Split NumParts clamped from "
+                << NumParts << " to " << AvailableSplitDevices << std::endl;
+      NumParts = AvailableSplitDevices;
+    }
+    if (NumParts <= 1) {
+      NumParts = 1;
+    }
+  }
+
+  if (NumParts > 1) {
     std::cout << "=== handler === Split NumParts: " << NumParts << std::endl;
 
     // 1
     std::vector<detail::QueueImplPtr> &SplitQueues_Write = PM.SplitQueues_Write;
+    SplitQueues_Write.clear();
     for (int i = 1; i <= NumParts; i++) {
       device SplitDevice = PM.globalDevices.at(i);
       detail::DeviceImplPtr SplitDP = detail::getSyclObjImpl(SplitDevice);
-      std::shared_ptr<detail::queue_impl> SplitQueue = std::make_shared<detail::queue_impl>(
-          SplitDP, detail::queue_impl::getDefaultOrNew(SplitDP),
-          KernelQueue->getAsyncHandler(), KernelQueue->getPropertyList());
+      std::shared_ptr<detail::queue_impl> SplitQueue =
+          makeOfflineProfilingQueue(SplitDP, KernelQueue);
       SplitQueues_Write.push_back(SplitQueue);
     }
     detail::QueueImplPtr hostQ = Scheduler::getInstance().getDefaultHostQueue();
@@ -1637,14 +1864,6 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       auto Mode = Req->MAccessMode;
       const bool onlyRead = (Mode == access::mode::read);
       const bool hasRead = (Mode == access::mode::read) ||
-                            (Mode == access::mode::read_write) ||
-                            (Mode == access::mode::atomic);
-      const bool onlyWrite = (Mode == access::mode::write) ||
-                              (Mode == access::mode::discard_write) ||
-                              (Mode == access::mode::discard_read_write);
-      const bool hasWrite = (Mode == access::mode::write) ||
-                            (Mode == access::mode::discard_write) ||
-                            (Mode == access::mode::discard_read_write) ||
                             (Mode == access::mode::read_write) ||
                             (Mode == access::mode::atomic);
 
@@ -1804,12 +2023,14 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     NumParts = 1;
     std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
     
+#if !defined(SCHEDULE_OFFLINE)
     std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg.kernel_queue;
     device exec_device = PM.globalDevices.at(1);
     detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
     std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
-    kernel_queue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), kernel_queue->getAsyncHandler(), kernel_queue->getPropertyList()));
+    kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
     std::cout << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
+#endif
 
     detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(std::move(sycl_kernel_cg.kernel_cg), std::move(sycl_kernel_cg.kernel_queue));
     event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
@@ -1817,25 +2038,36 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   }
 }
 
+#if !defined(SCHEDULE_OFFLINE)
 // 测试DataParallel与OfflineKernel存储机制结合
 // event::wait()调用此函数
 event handler::scheduleOffline() {
   std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
   std::cout << "=== handler === Process " << getpid() << " scheduleOffline kernel_cgs.size: " << kernel_cgs.size() << std::endl;
+  std::vector<OfflineProfileEvent> profile_events;
+  event last_event;
   for (int i = 0; i < kernel_cgs.size(); ++i) {
     detail::SyclKernelCg *sycl_kernel_cg = kernel_cgs.at(i);
-    event last_event = resubmit(*sycl_kernel_cg);
-    if (i == kernel_cgs.size() - 1) {
-      return last_event;
-    }
+    uint64_t HostStart = offlineNowNs();
+    last_event = resubmit(*sycl_kernel_cg);
+    uint64_t HostEnd = offlineNowNs();
+    profile_events.push_back(
+        {sycl_kernel_cg->kernel_count, 1,
+         static_cast<int>(detail::ProgramManager::getInstance().NumParts),
+         HostStart, HostEnd, last_event});
   }
-  kernel_cgs.clear();
+  processOfflineProfilingBatch(detail::ProgramManager::getInstance().wait_count,
+                               profile_events);
+  clearOfflineBatch();
+  return last_event;
 }
+#endif
 #endif
 
 
 // 【START】=======================================================
 #ifdef SCHEDULE_OFFLINE
+#if !defined(SNMD_OFFLINE)
 event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
   detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
@@ -1843,6 +2075,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
   return MLastEvent;
 }
+#endif
 
 // **注意** 由event::wait()调用
 // 所有与daemon通信都由handler完成
@@ -1872,6 +2105,8 @@ event handler::scheduleOffline() {
   int &daemon_wait_count = detail::ProgramManager::getInstance().wait_count;
   daemon_wait_count++;
   int &daemon_scale_count = detail::ProgramManager::getInstance().scale_count;
+  std::vector<OfflineProfileEvent> profile_events;
+  event last_event;
 
   std::cout << "=== handler === Process " << getpid() << " === daemon_wait_count: " << daemon_wait_count << " daemon_scale_count: " << daemon_scale_count << std::endl;
 
@@ -1879,6 +2114,7 @@ event handler::scheduleOffline() {
   if (daemon_wait_count < daemon_scale_count) {
     std::cout << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " skip first wait" << std::endl;
     event empty;
+    clearOfflineBatch();
     return empty;
   }
   else if (daemon_wait_count == daemon_scale_count) {
@@ -1906,6 +2142,8 @@ event handler::scheduleOffline() {
           std::getline(stream, line);
           obj_data += line + "\n";             // device_index
           std::getline(stream, line);
+          obj_data += line + "\n";             // num_parts
+          std::getline(stream, line);
           obj_data += line + "\n";             // scale_count
           std::getline(stream, line);
           obj_data += line + "\n";             // req_counts.size()
@@ -1922,6 +2160,7 @@ event handler::scheduleOffline() {
                     << " === scale mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
                     << " exec: " << kernel_exec_info.exec
                     << " device_index: " << kernel_exec_info.device_index
+                    << " num_parts: " << kernel_exec_info.num_parts
                     << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       } else {
@@ -1939,7 +2178,8 @@ event handler::scheduleOffline() {
       std::cout << "=== handler === Process " << getpid() << " === scale commDepend exec_num: " << exec_num << std::endl;
       D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
       int kernel_count = kernel_exec_info.kernel_count;
-      detail::SyclKernelCg *sycl_kernel_cg = kernel_cgs.at(kernel_count - 1);
+      detail::SyclKernelCg *sycl_kernel_cg =
+          findOfflineKernelCg(kernel_cgs, kernel_count);
 
       // **注意** 满足依赖的逻辑仍与online一致
       // 不需要与daemon建立连接 因daemon对所有kernel的依赖都已知
@@ -2026,27 +2266,39 @@ event handler::scheduleOffline() {
       // **注意** MQueue在此才rebind 之前有暂未出现过的逻辑使用MQueue
       // 此时有刚启动的daemon
       if (kernel_exec_info.exec) {
+#ifdef SNMD_OFFLINE
+        detail::ProgramManager::getInstance().NumParts =
+            std::max(1, kernel_exec_info.num_parts);
+#endif
         std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
-        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(kernel_exec_info.device_index);
+        const int ActualDeviceIndex =
+            clampOfflineDeviceIndex(kernel_exec_info.device_index);
+        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
         std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
-        kernel_queue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), kernel_queue->getAsyncHandler(), kernel_queue->getPropertyList()));
+        kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
 
         // resubmit
-        event last_event = resubmit(*sycl_kernel_cg);
+        uint64_t HostStart = offlineNowNs();
+        last_event = resubmit(*sycl_kernel_cg);
+        uint64_t HostEnd = offlineNowNs();
+        int ProfileNumParts = 1;
+#ifdef SNMD_OFFLINE
+        ProfileNumParts =
+            static_cast<int>(detail::ProgramManager::getInstance().NumParts);
+#endif
+        profile_events.push_back({kernel_count, ActualDeviceIndex,
+                                  std::max(1, ProfileNumParts), HostStart,
+                                  HostEnd, last_event});
         std::cout << "=== handler === Process " << getpid() << " === resubmit kernel: " << kernel_count << std::endl;
-        if (exec_num == kernel_exec_infos.size() - 1) {
-          return last_event;
-        }
       }
       else {
         std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
-        if (exec_num == kernel_exec_infos.size() - 1) {
-          event empty;
-          return empty;
-        }
       }
     }
+    processOfflineProfilingBatch(daemon_wait_count, profile_events);
+    clearOfflineBatch();
+    return last_event;
   }
   //【通用情况】
   else {
@@ -2056,7 +2308,6 @@ event handler::scheduleOffline() {
     // for (S2DKernelReqData &kernel_req_data : kernel_req_datas) {
     //   std::cout << "=== handler === Process " << getpid() << " === kernel_req_data: " << kernel_req_data.serialize();
     // }
-    int kernel_nums = kernel_req_datas.size();
     {
       // **注意** 在最前面加上daemon_wait_count
       std::string serialized_data = std::to_string(daemon_wait_count) + "\n";
@@ -2089,6 +2340,8 @@ event handler::scheduleOffline() {
           std::getline(stream, line);
           obj_data += line + "\n";             // device_index
           std::getline(stream, line);
+          obj_data += line + "\n";             // num_parts
+          std::getline(stream, line);
           obj_data += line + "\n";             // scale_count
           std::getline(stream, line);
           obj_data += line + "\n";             // req_counts.size()
@@ -2107,6 +2360,7 @@ event handler::scheduleOffline() {
                     << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
                     << " exec: " << kernel_exec_info.exec
                     << " device_index: " << kernel_exec_info.device_index
+                    << " num_parts: " << kernel_exec_info.num_parts
                     << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       } else {
@@ -2139,6 +2393,7 @@ event handler::scheduleOffline() {
           detail::ProgramManager::getInstance().kernel_scale_exec_infos = kernel_exec_infos;
 
           event empty;
+          clearOfflineBatch();
           return empty;
         }
       }
@@ -2152,7 +2407,8 @@ event handler::scheduleOffline() {
     for (int exec_num = 0; exec_num < kernel_exec_infos.size(); exec_num++) {
       D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
       int kernel_count = kernel_exec_info.kernel_count;
-      detail::SyclKernelCg *sycl_kernel_cg = kernel_cgs.at(kernel_count - 1);
+      detail::SyclKernelCg *sycl_kernel_cg =
+          findOfflineKernelCg(kernel_cgs, kernel_count);
       std::cout << "=== handler === Process " << getpid() << " === kernel_count: " << kernel_count << std::endl;
 
       // **注意** 满足依赖的逻辑仍与online一致
@@ -2246,29 +2502,42 @@ event handler::scheduleOffline() {
       // **注意** MQueue在此才rebind 之前有暂未出现过的逻辑使用MQueue
       // 此时有刚启动的daemon
       if (kernel_exec_info.exec) {
+#ifdef SNMD_OFFLINE
+        detail::ProgramManager::getInstance().NumParts =
+            std::max(1, kernel_exec_info.num_parts);
+#endif
         std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
-        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(kernel_exec_info.device_index);
+        const int ActualDeviceIndex =
+            clampOfflineDeviceIndex(kernel_exec_info.device_index);
+        device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
         std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
-        kernel_queue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), kernel_queue->getAsyncHandler(), kernel_queue->getPropertyList()));
+        kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
         std::cout << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
 
         // resubmit
-        event last_event = resubmit(*sycl_kernel_cg);
+        uint64_t HostStart = offlineNowNs();
+        last_event = resubmit(*sycl_kernel_cg);
+        uint64_t HostEnd = offlineNowNs();
+        int ProfileNumParts = 1;
+#ifdef SNMD_OFFLINE
+        ProfileNumParts =
+            static_cast<int>(detail::ProgramManager::getInstance().NumParts);
+#endif
+        profile_events.push_back({kernel_count, ActualDeviceIndex,
+                                  std::max(1, ProfileNumParts), HostStart,
+                                  HostEnd, last_event});
         std::cout << getpid() << " === handler === resubmitted kernel: " << kernel_count << std::endl;
-        if (exec_num == kernel_exec_infos.size() - 1) {
+        if (exec_num == kernel_exec_infos.size() - 1)
           std::cout << "=== handler === Process " << getpid() << " === resubmit last kernel: " << kernel_count << std::endl;
-          return last_event;
-        }
       }
       else {
         std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
-        if (exec_num == kernel_exec_infos.size() - 1) {
-          event empty;
-          return empty;
-        }
       }
     }
+    processOfflineProfilingBatch(daemon_wait_count, profile_events);
+    clearOfflineBatch();
+    return last_event;
   }
 }
 

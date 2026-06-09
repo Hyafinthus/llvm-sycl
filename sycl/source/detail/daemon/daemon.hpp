@@ -7,6 +7,7 @@
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <cstdint>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -38,13 +39,15 @@ enum class acc_mode {
 #define MAX_MSG_SUBMIT_SIZE 256
 #define MESSAGE_QUEUE_SUBMIT_NAME "/sycl_mq_submit"
 
-#define MAX_MSG_DAEMON_SIZE 1024
+#define MAX_MSG_DAEMON_SIZE 8192
 #define MESSAGE_QUEUE_DAEMON_NAME_MAX 50
 #define MESSAGE_QUEUE_DAEMON_PATTERN "/sycl_mq_daemon_%d" // pid
 
-#define MAX_MSG_PROGRAM_SIZE 512
+#define MAX_MSG_PROGRAM_SIZE 8192
 #define MESSAGE_QUEUE_PROGRAM_NAME_MAX 50
 #define MESSAGE_QUEUE_PROGRAM_PATTERN "/sycl_mq_program_%d" // pid
+
+#define S2D_PROFILE_BATCH_TAG "PROFILE_BATCH"
 
 // D2D: Daemon to Daemon
 // D2S: Daemon to SYCL
@@ -111,12 +114,49 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
   }
 };
 
+inline bool profileKeyReadAccess(acc_mode mode) {
+  return mode == acc_mode::read || mode == acc_mode::read_write ||
+         mode == acc_mode::atomic;
+}
+
+inline bool profileKeyWriteAccess(acc_mode mode) {
+  return mode == acc_mode::write || mode == acc_mode::read_write ||
+         mode == acc_mode::discard_write ||
+         mode == acc_mode::discard_read_write ||
+         mode == acc_mode::atomic;
+}
+
+inline std::string buildKernelProfileKey(const std::vector<SyclReqData> &reqs) {
+  size_t read_bytes = 0;
+  size_t write_bytes = 0;
+  std::ostringstream oss;
+  oss << "reqs=" << reqs.size() << "|";
+  for (const SyclReqData &req : reqs) {
+    const size_t bytes =
+        static_cast<size_t>(req.elem_size) * static_cast<size_t>(req.buff_size);
+    if (profileKeyReadAccess(req.req_accmode)) {
+      read_bytes += bytes;
+    }
+    if (profileKeyWriteAccess(req.req_accmode)) {
+      write_bytes += bytes;
+    }
+    oss << static_cast<int>(req.req_accmode) << ":" << req.elem_size << ":"
+        << req.buff_size << ";";
+  }
+  oss << "|rb=" << read_bytes << "|wb=" << write_bytes;
+  return oss.str();
+}
+
 struct S2DKernelReqData { // daemon需要的一个kernel的信息
   pid_t pid;
 
   int kernel_count;
   int req_size;
   std::vector<SyclReqData> reqs;
+
+  std::string profileKey() const {
+    return buildKernelProfileKey(reqs);
+  }
 
   std::string serialize() const {
     std::ostringstream oss;
@@ -158,6 +198,81 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
   }
 };
 
+struct S2DKernelProfileData {
+  pid_t pid = 0;
+  int wait_count = 0;
+  int kernel_count = 0;
+  int device_index = 0;
+  int num_parts = 1;
+  uint64_t duration_ns = 0;
+  std::string kernel_key;
+
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << pid << "\n"
+        << wait_count << "\n"
+        << kernel_count << "\n"
+        << device_index << "\n"
+        << num_parts << "\n"
+        << duration_ns << "\n"
+        << kernel_key << "\n";
+    return oss.str();
+  }
+
+  static S2DKernelProfileData deserialize(std::istream &is) {
+    S2DKernelProfileData profile;
+    is >> profile.pid;
+    is >> profile.wait_count;
+    is >> profile.kernel_count;
+    is >> profile.device_index;
+    is >> profile.num_parts;
+    is >> profile.duration_ns;
+    is.ignore();
+    std::getline(is, profile.kernel_key);
+    return profile;
+  }
+};
+
+struct S2DProfileBatchData {
+  std::vector<S2DKernelProfileData> profiles;
+
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << S2D_PROFILE_BATCH_TAG << "\n";
+    oss << profiles.size() << "\n";
+    for (const S2DKernelProfileData &profile : profiles) {
+      oss << profile.serialize();
+    }
+    return oss.str();
+  }
+
+  static bool isProfileBatch(const std::string &data) {
+    std::istringstream iss(data);
+    std::string tag;
+    std::getline(iss, tag);
+    return tag == S2D_PROFILE_BATCH_TAG;
+  }
+
+  static S2DProfileBatchData deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    std::string tag;
+    std::getline(iss, tag);
+
+    S2DProfileBatchData batch;
+    if (tag != S2D_PROFILE_BATCH_TAG) {
+      return batch;
+    }
+
+    size_t profile_count = 0;
+    iss >> profile_count;
+    iss.ignore();
+    for (size_t i = 0; i < profile_count; ++i) {
+      batch.profiles.push_back(S2DKernelProfileData::deserialize(iss));
+    }
+    return batch;
+  }
+};
+
 struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个rank执行的信息
   // std::string kernel_id; // 没有kernel这个对象 CommandGroup还未创建
   int kernel_count; // 是一个SYCL进程中kernel的唯一标识 体现在用户代码的顺序中
@@ -168,6 +283,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
   //   -1:随机 0:未指定 >=1:存kernel_count
   // OFFLINE daemon指定需要哪个device执行
   int exec_device = 0;
+  int num_parts = 1; // >1 表示在同一rank上使用SNMD split
   std::map<SyclReqData, int> req_rank; // 需要的数据 在哪个rank上
 
   bool operator<(const D2DKernelSchedInfo &other) const {
@@ -201,7 +317,8 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
     oss << kernel_count << "\n"
         << exec_order << "\n"
         << exec_rank << "\n"
-        << exec_device << "\n";
+        << exec_device << "\n"
+        << num_parts << "\n";
 
     oss << req_rank.size() << "\n";
     for (const auto &pair : req_rank) {
@@ -220,6 +337,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
     iss >> sched_info.exec_order;
     iss >> sched_info.exec_rank;
     iss >> sched_info.exec_device;
+    iss >> sched_info.num_parts;
 
     size_t map_size;
     iss >> map_size;
@@ -248,7 +366,8 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
 struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执行等依赖数据信息
   int kernel_count; // 唯一标识
   bool exec = false; // 是否执行
-  int device_index; // 执行设备
+  int device_index = 0; // 执行设备
+  int num_parts = 1; // >1 表示handler按SNMD split提交
 
   // 快速跳过前几个kernel
   // 0: kernel_count从1开始 默认值
@@ -266,6 +385,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     oss << kernel_count << "\n"
         << exec << "\n"
         << device_index << "\n"
+        << num_parts << "\n"
         << scale_count << "\n";
 
     // 序列化 req_counts 的大小
@@ -284,6 +404,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     iss >> kernel_info.kernel_count;
     iss >> kernel_info.exec;
     iss >> kernel_info.device_index;
+    iss >> kernel_info.num_parts;
     iss >> kernel_info.scale_count;
 
     size_t req_count;
@@ -344,6 +465,7 @@ struct DAGNode { // 一个kernel的依赖关系
 
   int exec_rank = -1; // 选择的rank
   int exec_proc = -1; // 选择的proc
+  int num_parts = 1; // >1 表示这个kernel选择SNMD split
   // bool executed = false; // online无法获取 --offline用于区别kernel是否已被调度 暂时用不上--
 
   DAGNode(int count, const std::vector<SyclReqData> &reqs) : kernel_count(count), req_data(reqs) {}

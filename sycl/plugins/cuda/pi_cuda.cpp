@@ -4381,7 +4381,7 @@ pi_result cuda_piEnqueueMemBufferWriteRect(
   return retErr;
 }
 
-#define SNMD_OFFLINE
+// #define SNMD_OFFLINE
 #ifdef SNMD_OFFLINE
 static bool canAccessPeerAndEnable(pi_context dstCtx, pi_context srcCtx) {
   if (!dstCtx || !srcCtx)

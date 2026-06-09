@@ -174,7 +174,7 @@ public:
            "Wrong type of exec kernel CG.");
   }
 
-#define SNMD_OFFLINE
+// #define SNMD_OFFLINE
 #ifdef SNMD_OFFLINE
   std::unique_ptr<CGExecKernel> cloneForSplit(const NDRDescT &NewNDR) const {
     // CG基类里有 MArgsStorage MAccStorage MSharedPtrStorage MRequirements MEvents
