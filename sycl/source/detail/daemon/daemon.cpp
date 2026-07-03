@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <tuple>
@@ -41,15 +42,21 @@ std::unordered_map<pid_t, std::shared_ptr<std::condition_variable>> pid_to_scale
 
 // ====【Monitor】
 static constexpr int MAX_MONITOR_DEVICES = 16;
+static constexpr int MONITOR_PACKED_FIELDS = 5; // valid, util, mem, fp32, fp64
+struct ComputeCapability {
+  double fp32 = 1.0;
+  double fp64 = 0.5;
+};
 std::map<int, int> index_sycl_nvml; // 根据busid确定sycl::device到gpu映射
 std::map<int, int> index_nvml_sycl;
 std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
+std::vector<ComputeCapability> device_capability(1); // 本rank设备原始能力, 编号与handler的globalDevices一致
 std::vector<std::vector<MonitorInfo>> cluster_monitor_info;
+std::vector<std::vector<ComputeCapability>> cluster_device_capability;
 std::vector<int> ranks_idle;
 
 // ====【Algorithm】
-// 暂时先不考虑CPU 如果要放CPU算要额外考虑CPU和GPU的性能差
-std::vector<std::vector<double>> gpu_capability; // 不同rank的gpu算力 monitor初始化写成表
+std::vector<std::vector<ComputeCapability>> gpu_capability; // 不同rank的设备算力, 包含fp32/fp64两套归一化能力
 std::vector<std::vector<double>> gpu_available_time; // 不同gpu的可用时间 monitor查看空闲？不空闲怎么做
 
 struct ProfileCostKey {
@@ -697,53 +704,171 @@ static bool lookupProfileCost(const std::string &kernel_key, int rank,
   return false;
 }
 
-static void ensureOfflineDeviceModel() {
-  size_t rank_count = std::max(gpu_capability.size(), cluster_monitor_info.size());
-  if (rank_count == 0) {
-    rank_count = 1;
-  }
-
-  gpu_capability.resize(rank_count);
-  gpu_available_time.resize(rank_count);
-
-  for (size_t rank = 0; rank < rank_count; ++rank) {
-    const bool has_monitor_device_count =
-        rank < cluster_monitor_info.size() && !cluster_monitor_info[rank].empty();
-    size_t device_count = gpu_capability[rank].size();
-    if (has_monitor_device_count) {
-      device_count = cluster_monitor_info[rank].size();
-    }
-    if (device_count == 0) {
-      device_count = 1;
-    }
-
-    if (gpu_capability[rank].empty()) {
-      gpu_capability[rank].resize(device_count, 1.0);
-      for (size_t proc = 1; proc < device_count; ++proc) {
-        gpu_capability[rank][proc] = 10.0;
-      }
-    } else if (gpu_capability[rank].size() < device_count) {
-      size_t old_size = gpu_capability[rank].size();
-      gpu_capability[rank].resize(device_count, 10.0);
-      if (old_size == 0) {
-        gpu_capability[rank][0] = 1.0;
-      }
-    } else if (has_monitor_device_count &&
-               gpu_capability[rank].size() > device_count) {
-      gpu_capability[rank].resize(device_count);
-    }
-
-    gpu_available_time[rank].assign(gpu_capability[rank].size(), 0.0);
-  }
+static std::string toLowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
 }
 
-static double deviceCapability(int rank, int proc) {
-  if (rank >= 0 && rank < static_cast<int>(gpu_capability.size()) &&
-      proc >= 0 && proc < static_cast<int>(gpu_capability[rank].size()) &&
-      gpu_capability[rank][proc] > 0.0) {
-    return gpu_capability[rank][proc];
+static bool containsIgnoreCase(const std::string &value,
+                               const std::string &pattern) {
+  return toLowerAscii(value).find(toLowerAscii(pattern)) != std::string::npos;
+}
+
+static std::string readCpuModelName() {
+  std::ifstream file("/proc/cpuinfo");
+  std::string line;
+  while (std::getline(file, line)) {
+    const std::string key = "model name";
+    if (line.rfind(key, 0) != 0) {
+      continue;
+    }
+
+    size_t colon = line.find(':');
+    if (colon == std::string::npos || colon + 1 >= line.size()) {
+      return line;
+    }
+    size_t start = colon + 1;
+    while (start < line.size() &&
+           std::isspace(static_cast<unsigned char>(line[start]))) {
+      ++start;
+    }
+    return line.substr(start);
   }
-  return proc == 0 ? 1.0 : 10.0;
+  return "CPU";
+}
+
+static ComputeCapability inferCpuCapabilityFromName(const std::string &name) {
+  if (containsIgnoreCase(name, "epyc 7763")) {
+    return ComputeCapability{4.4, 2.2};
+  }
+  if (containsIgnoreCase(name, "xeon") &&
+      containsIgnoreCase(name, "gold 6530")) {
+    return ComputeCapability{3.2, 1.6};
+  }
+  if (containsIgnoreCase(name, "epyc")) {
+    return ComputeCapability{3.0, 1.5};
+  }
+  if (containsIgnoreCase(name, "xeon")) {
+    return ComputeCapability{2.0, 1.0};
+  }
+  return ComputeCapability{1.0, 0.5};
+}
+
+static ComputeCapability inferGpuCapabilityFromName(const std::string &name) {
+  if (containsIgnoreCase(name, "h100")) {
+    return ComputeCapability{67.0, 33.5};
+  }
+  if (containsIgnoreCase(name, "rtx 6000") &&
+      containsIgnoreCase(name, "ada")) {
+    return ComputeCapability{91.0, 1.42};
+  }
+  if (containsIgnoreCase(name, "rtx 4090")) {
+    return ComputeCapability{82.6, 1.29};
+  }
+  if (containsIgnoreCase(name, "rtx 3090")) {
+    return ComputeCapability{35.6, 0.56};
+  }
+  if (containsIgnoreCase(name, "a100")) {
+    return ComputeCapability{19.5, 9.7};
+  }
+  if (containsIgnoreCase(name, "a40")) {
+    return ComputeCapability{37.4, 0.58};
+  }
+  if (containsIgnoreCase(name, "rtx a6000") ||
+      containsIgnoreCase(name, "a6000")) {
+    return ComputeCapability{38.7, 0.60};
+  }
+  return ComputeCapability{10.0, 1.0};
+}
+
+static ComputeCapability inferDeviceCapabilityFromName(const std::string &name,
+                                                       bool is_cpu) {
+  return is_cpu ? inferCpuCapabilityFromName(name)
+                : inferGpuCapabilityFromName(name);
+}
+
+static ComputeCapability fallbackCapabilityForProc(int proc) {
+  return proc == 0 ? ComputeCapability{1.0, 0.5}
+                   : ComputeCapability{10.0, 1.0};
+}
+
+static ComputeCapability maxCapability(const ComputeCapability &lhs,
+                                       const ComputeCapability &rhs) {
+  return ComputeCapability{std::max(lhs.fp32, rhs.fp32),
+                           std::max(lhs.fp64, rhs.fp64)};
+}
+
+static double minPositiveCapability(
+    const std::vector<std::vector<ComputeCapability>> &capabilities) {
+  double min_capability = std::numeric_limits<double>::infinity();
+  for (const std::vector<ComputeCapability> &rank_capability : capabilities) {
+    for (const ComputeCapability &capability : rank_capability) {
+      if (capability.fp32 > 0.0) {
+        min_capability = std::min(min_capability, capability.fp32);
+      }
+      if (capability.fp64 > 0.0) {
+        min_capability = std::min(min_capability, capability.fp64);
+      }
+    }
+  }
+  return std::isfinite(min_capability) ? min_capability : 1.0;
+}
+
+static double initialAvailableTimeFromUtil(double util, double capability) {
+  util = std::max(0.0, std::min(100.0, util));
+  if (util < MONITOR_THRESHOLD) {
+    return 0.0;
+  }
+
+  const double busy_ratio =
+      (util - MONITOR_THRESHOLD) / (100.0 - MONITOR_THRESHOLD);
+  return busy_ratio * 1000.0 / std::max(0.1, capability);
+}
+
+static size_t offlineRankCount() {
+  size_t rank_count = std::max(gpu_capability.size(), cluster_monitor_info.size());
+  rank_count = std::max(rank_count, cluster_device_capability.size());
+  if (monitor_size > 0) {
+    rank_count = std::max(rank_count, static_cast<size_t>(monitor_size));
+  }
+  if (mpi_size > 0) {
+    rank_count = std::max(rank_count, static_cast<size_t>(mpi_size));
+  }
+  return std::max<size_t>(rank_count, 1);
+}
+
+static size_t offlineDeviceCountForRank(size_t rank) {
+  if (rank < cluster_monitor_info.size() &&
+      !cluster_monitor_info[rank].empty()) {
+    return cluster_monitor_info[rank].size();
+  }
+  if (rank < cluster_device_capability.size() &&
+      !cluster_device_capability[rank].empty()) {
+    return cluster_device_capability[rank].size();
+  }
+  if (rank == static_cast<size_t>(monitor_rank) &&
+      !device_monitor_info.empty()) {
+    return device_monitor_info.size();
+  }
+  return 1;
+}
+
+static ComputeCapability rawCapabilityForDevice(size_t rank, size_t proc) {
+  if (rank < cluster_device_capability.size() &&
+      proc < cluster_device_capability[rank].size() &&
+      (cluster_device_capability[rank][proc].fp32 > 0.0 ||
+       cluster_device_capability[rank][proc].fp64 > 0.0)) {
+    return cluster_device_capability[rank][proc];
+  }
+  if (rank == static_cast<size_t>(monitor_rank) &&
+      proc < device_capability.size() &&
+      (device_capability[proc].fp32 > 0.0 ||
+       device_capability[proc].fp64 > 0.0)) {
+    return device_capability[proc];
+  }
+  return fallbackCapabilityForProc(static_cast<int>(proc));
 }
 
 static const MonitorInfo *monitorInfoForDevice(int rank, int proc) {
@@ -756,6 +881,102 @@ static const MonitorInfo *monitorInfoForDevice(int rank, int proc) {
     return &device_monitor_info[proc];
   }
   return nullptr;
+}
+
+static void ensureOfflineDeviceModel() {
+  const size_t rank_count = offlineRankCount();
+
+  std::vector<std::vector<ComputeCapability>> raw_capability(rank_count);
+  for (size_t rank = 0; rank < rank_count; ++rank) {
+    const size_t device_count = offlineDeviceCountForRank(rank);
+    raw_capability[rank].resize(device_count);
+    for (size_t proc = 0; proc < device_count; ++proc) {
+      raw_capability[rank][proc] = rawCapabilityForDevice(rank, proc);
+    }
+  }
+
+  const double min_capability = minPositiveCapability(raw_capability);
+  gpu_capability.resize(rank_count);
+  gpu_available_time.resize(rank_count);
+
+  for (size_t rank = 0; rank < rank_count; ++rank) {
+    gpu_capability[rank].resize(raw_capability[rank].size());
+    gpu_available_time[rank].resize(raw_capability[rank].size());
+
+    for (size_t proc = 0; proc < raw_capability[rank].size(); ++proc) {
+      gpu_capability[rank][proc] = ComputeCapability{
+          std::max(0.1, raw_capability[rank][proc].fp32 / min_capability),
+          std::max(0.1, raw_capability[rank][proc].fp64 / min_capability)};
+
+      const MonitorInfo *info =
+          monitorInfoForDevice(static_cast<int>(rank), static_cast<int>(proc));
+      const double util = info == nullptr ? 0.0 : info->util_used;
+      const double available_capability =
+          std::max(gpu_capability[rank][proc].fp32,
+                   gpu_capability[rank][proc].fp64);
+      gpu_available_time[rank][proc] =
+          initialAvailableTimeFromUtil(util, available_capability);
+
+      std::cout << "ensureOfflineDeviceModel: Rank " << rank
+                << " Proc " << proc
+                << " FP32Capability " << gpu_capability[rank][proc].fp32
+                << " FP64Capability " << gpu_capability[rank][proc].fp64
+                << " Util " << util
+                << " AvailableTime " << gpu_available_time[rank][proc]
+                << std::endl;
+    }
+  }
+}
+
+enum class KernelPrecision {
+  unknown,
+  fp32,
+  fp64
+};
+
+static KernelPrecision inferKernelPrecisionFromReqs(
+    const std::vector<SyclReqData> &reqs) {
+  double fp32_elems = 0.0;
+  double fp64_elems = 0.0;
+  for (const SyclReqData &req : reqs) {
+    if (req.elem_size == 4) {
+      fp32_elems += req.buff_size;
+    } else if (req.elem_size == 8) {
+      fp64_elems += req.buff_size;
+    }
+  }
+
+  if (fp64_elems == 0.0 && fp32_elems == 0.0) {
+    return KernelPrecision::unknown;
+  }
+  return fp64_elems > fp32_elems ? KernelPrecision::fp64
+                                 : KernelPrecision::fp32;
+}
+
+static const char *precisionName(KernelPrecision precision) {
+  switch (precision) {
+  case KernelPrecision::fp32:
+    return "fp32";
+  case KernelPrecision::fp64:
+    return "fp64";
+  case KernelPrecision::unknown:
+    return "unknown";
+  }
+  return "unknown";
+}
+
+static double deviceCapability(int rank, int proc, KernelPrecision precision) {
+  if (rank >= 0 && rank < static_cast<int>(gpu_capability.size()) &&
+      proc >= 0 && proc < static_cast<int>(gpu_capability[rank].size()) &&
+      (gpu_capability[rank][proc].fp32 > 0.0 ||
+       gpu_capability[rank][proc].fp64 > 0.0)) {
+    if (precision == KernelPrecision::fp64) {
+      return gpu_capability[rank][proc].fp64;
+    }
+    return gpu_capability[rank][proc].fp32;
+  }
+  const ComputeCapability fallback = fallbackCapabilityForProc(proc);
+  return precision == KernelPrecision::fp64 ? fallback.fp64 : fallback.fp32;
 }
 
 static double monitorPenalty(int rank, int proc) {
@@ -791,8 +1012,10 @@ static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
     return std::max(0.001, profile_cost) * monitorPenalty(rank, proc);
   }
 
+  const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
   const double cold_cost = std::max(1.0, node->total_elem) /
-                           std::max(0.1, deviceCapability(rank, proc));
+                           std::max(0.1, deviceCapability(rank, proc,
+                                                          precision));
   return cold_cost * monitorPenalty(rank, proc);
 }
 
@@ -941,23 +1164,8 @@ static double estimateAverageRankCost(DAGNode *node) {
 
 // nodes: 这批要调度的所有kernel
 void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
-  // TODO 需要gpu的结束时间 / 空闲的gpu
-  // 需要整个DAG来计算数据传输代价
-  // 需要用capability结合DAG得nodes在不同gpu上的传输代价
-
-  // TEST 不同rank的device算力
-  // 以算力最低（3090节点cpu）为1
-  gpu_capability = {
-    {1, 11.2, 11.2, 11.2, 11.2, 11.2, 11.2, 11.2, 11.2},
-    {4.4, 33.2, 33.2}
-  };
-  // comm_capability 同节点100 跨节点1
-
-  // TEST device的上一个空闲时间 TODO 可共享的怎么算？
-  gpu_available_time = {
-    {0, 0, 0, 0, 0, 0, 0, 0, 0},
-    {0, 0, 0}
-  };
+  // 根据当前monitor得到每个rank的设备数量、归一化算力和初始可用时间。
+  // 0号设备固定是CPU，后续编号保持和handler端globalDevices一致。
   ensureOfflineDeviceModel();
 
   // 1.根据(规模+monitor)生成执行时间表 对于每个任务t_i计算w(i) 以及任务在不同proc上时各个pre的传输代价
@@ -968,7 +1176,11 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
       total_elem += req.buff_size; // buff_size就是总数据量 不需要除以elem_size
     }
     node->total_elem = total_elem / 1000; // TODO 归一化
-    std::cout << "algorithmHEFT: Kernel " << node->kernel_count << " total_elem: " << total_elem << std::endl;
+    std::cout << "algorithmHEFT: Kernel " << node->kernel_count
+              << " total_elem: " << total_elem
+              << " precision: "
+              << precisionName(inferKernelPrecisionFromReqs(node->req_data))
+              << std::endl;
 
     // 1.2. 计算每个任务需要从各个前序接收多少数据
     for (std::pair<DAGNode *, std::set<SyclReqData>> dep_pair : node->depend_on_mem) {
@@ -1106,7 +1318,7 @@ void CPUMonitor() {
   // std::cout << "CPU Utilization: " << utilization << "%" << std::endl;
   prev = curr;
 
-  size_t mem_available;
+  size_t mem_available = 0;
   file.open("/proc/meminfo");
   if(!file.is_open()) {
     std::string errorMsg = "Error: Rank " + std::to_string(mpi_rank) + " /proc/meminfo open failed";
@@ -1144,6 +1356,9 @@ int getCudaPciBusId(const sycl::device &device) {
 }
 
 int MonitorInit() {
+  device_capability.resize(1);
+  device_capability[0] = inferCpuCapabilityFromName(readCpuModelName());
+
   nvmlReturn_t result;
   result = nvmlInit();
   if (result != NVML_SUCCESS) {
@@ -1161,6 +1376,7 @@ int MonitorInit() {
       return -1;
   }
   std::cout << "Number of GPUs: " << device_count << std::endl;
+  device_capability.resize(device_count + 1, fallbackCapabilityForProc(1));
   
   std::vector<int> nvmlBusIds;
   for (int i = 0; i < device_count; ++i) {
@@ -1196,21 +1412,37 @@ int MonitorInit() {
   );
   for (int i = 0; i < globalDevices.size(); i++) {
     sycl::device device = globalDevices[i];
+    if (i >= static_cast<int>(device_capability.size())) {
+      device_capability.resize(i + 1, fallbackCapabilityForProc(i));
+    }
     // **注意** 获取device::name必不可少 不然无法切换cuda上下文
-    device.get_info<sycl::info::device::name>();
+    std::string sycl_device_name =
+        device.get_info<sycl::info::device::name>();
+    if (device.is_cpu()) {
+      device_capability[0] =
+          maxCapability(device_capability[0],
+                        inferDeviceCapabilityFromName(sycl_device_name, true));
+    }
     int busId = getCudaPciBusId(device);
-    std::cout << "SYCL Device " << i << ": PCI Bus ID: " << busId << std::endl;
+    std::cout << "SYCL Device " << i << " (" << sycl_device_name
+              << "): PCI Bus ID: " << busId << std::endl;
 
     if (busId != -1) {
       auto it = std::find(nvmlBusIds.begin(), nvmlBusIds.end(), busId);
       if (it != nvmlBusIds.end()) {
         index_sycl_nvml[i] = std::distance(nvmlBusIds.begin(), it) + 1;
         index_nvml_sycl[index_sycl_nvml[i]] = i;
+        device_capability[i] =
+            inferDeviceCapabilityFromName(sycl_device_name, false);
       }
     }
   }
   for (auto pair : index_sycl_nvml) {
-    std::cout << "SYCL Device " << pair.first << " mapped to GPU " << pair.second << std::endl;
+    std::cout << "SYCL Device " << pair.first << " mapped to GPU "
+              << pair.second << " fp32 capability "
+              << device_capability[pair.first].fp32
+              << " fp64 capability "
+              << device_capability[pair.first].fp64 << std::endl;
   }
 
   return device_count;
@@ -1263,7 +1495,22 @@ void CudaMonitor(int device_count) {
       // std::cout << "  Memory Used: " << memoryInfo.used / 1024.0 << " kB" << std::endl;
       // std::cout << "  Memory Free: " << memoryInfo.free / 1024.0 << " kB" << std::endl;
 
-      device_monitor_info[i + 1] = MonitorInfo{name, utilization.gpu, memoryInfo.free / 1024.0};
+      int device_index = i + 1;
+      auto sycl_it = index_nvml_sycl.find(device_index);
+      if (sycl_it != index_nvml_sycl.end()) {
+        device_index = sycl_it->second;
+      }
+      if (device_index >= static_cast<int>(device_monitor_info.size())) {
+        device_monitor_info.resize(device_index + 1);
+      }
+      if (device_index >= static_cast<int>(device_capability.size())) {
+        device_capability.resize(device_index + 1,
+                                 fallbackCapabilityForProc(device_index));
+      }
+      device_monitor_info[device_index] =
+          MonitorInfo{name, utilization.gpu, memoryInfo.free / 1024.0};
+      device_capability[device_index] =
+          inferDeviceCapabilityFromName(name, false);
   }
 }
 
@@ -1271,6 +1518,7 @@ void *SystemMonitor(void *arg) {
   int device_count = MonitorInit();
   if (device_count != -1) {
     device_monitor_info.resize(device_count + 1);
+    device_capability.resize(device_count + 1, fallbackCapabilityForProc(1));
   }
   
   while(1) {
@@ -1301,6 +1549,7 @@ void *SystemSchedulerMonitor(void *arg) {
 
   ranks_idle.resize(monitor_size, false);
   cluster_monitor_info.resize(monitor_size);
+  cluster_device_capability.resize(monitor_size);
 
   // 每个rank彼此感知是否有空闲即可 无需传递所有状态？
   while (1) {
@@ -1314,26 +1563,38 @@ void *SystemSchedulerMonitor(void *arg) {
 
     MPI_Allgather(&is_idle, 1, MPI_INT, ranks_idle.data(), 1, MPI_INT, comm_monitor);
 
-    std::array<double, MAX_MONITOR_DEVICES * 3> local_monitor{};
+    std::array<double, MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS> local_monitor{};
     const int local_device_count =
         std::min<int>(device_monitor_info.size(), MAX_MONITOR_DEVICES);
     for (int i = 0; i < local_device_count; ++i) {
-      local_monitor[i * 3 + 0] = 1.0;
-      local_monitor[i * 3 + 1] = device_monitor_info[i].util_used;
-      local_monitor[i * 3 + 2] =
+      const int offset = i * MONITOR_PACKED_FIELDS;
+      local_monitor[offset + 0] = 1.0;
+      local_monitor[offset + 1] = device_monitor_info[i].util_used;
+      local_monitor[offset + 2] =
           static_cast<double>(device_monitor_info[i].mem_available);
+      const ComputeCapability capability =
+          i < static_cast<int>(device_capability.size())
+              ? device_capability[i]
+              : fallbackCapabilityForProc(i);
+      local_monitor[offset + 3] = capability.fp32;
+      local_monitor[offset + 4] = capability.fp64;
     }
 
     std::vector<double> packed_monitor(
-        monitor_size * MAX_MONITOR_DEVICES * 3, 0.0);
-    MPI_Allgather(local_monitor.data(), MAX_MONITOR_DEVICES * 3, MPI_DOUBLE,
-                  packed_monitor.data(), MAX_MONITOR_DEVICES * 3, MPI_DOUBLE,
+        monitor_size * MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS, 0.0);
+    MPI_Allgather(local_monitor.data(),
+                  MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS, MPI_DOUBLE,
+                  packed_monitor.data(),
+                  MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS, MPI_DOUBLE,
                   comm_monitor);
 
     for (int rank = 0; rank < monitor_size; ++rank) {
       std::vector<MonitorInfo> rank_info;
+      std::vector<ComputeCapability> rank_capability;
       for (int device = 0; device < MAX_MONITOR_DEVICES; ++device) {
-        const int offset = rank * MAX_MONITOR_DEVICES * 3 + device * 3;
+        const int offset =
+            rank * MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS +
+            device * MONITOR_PACKED_FIELDS;
         if (packed_monitor[offset] == 0.0) {
           continue;
         }
@@ -1341,8 +1602,12 @@ void *SystemSchedulerMonitor(void *arg) {
             device == 0 ? "CPU" : "GPU",
             packed_monitor[offset + 1],
             static_cast<size_t>(packed_monitor[offset + 2])});
+        rank_capability.push_back(
+            ComputeCapability{packed_monitor[offset + 3],
+                              packed_monitor[offset + 4]});
       }
       cluster_monitor_info[rank] = std::move(rank_info);
+      cluster_device_capability[rank] = std::move(rank_capability);
     }
 
     // for (int i = 0; i < monitor_size; i++) {

@@ -385,6 +385,7 @@ event handler::finalize() {
             req_data.kernel_count = kernel_req_data.kernel_count;
             req_data.req_count = i + 1;
             req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
+            // Daemon HEFT uses elem_size to infer fp32/fp64 precision.
             req_data.elem_size = static_cast<int>(Req->MElemSize);
             req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
 
@@ -461,6 +462,7 @@ event handler::finalize() {
           req_data.kernel_count = kernel_req_data.kernel_count;
           req_data.req_count = i + 1;
           req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
+          // Daemon HEFT uses elem_size to infer fp32/fp64 precision.
           req_data.elem_size = static_cast<int>(Req->MElemSize);
           req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
 
@@ -652,6 +654,7 @@ event handler::finalize() {
         req_data.kernel_count = kernel_req_data.kernel_count;
         req_data.req_count = i + 1;
         req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
+        // Daemon HEFT uses elem_size to infer fp32/fp64 precision.
         req_data.elem_size = static_cast<int>(Req->MElemSize);
         req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
 
