@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <tuple>
 #include <unordered_set>
 #include <cuda_runtime_api.h>
@@ -53,11 +55,13 @@ std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息,
 std::vector<ComputeCapability> device_capability(1); // 本rank设备原始能力, 编号与handler的globalDevices一致
 std::vector<std::vector<MonitorInfo>> cluster_monitor_info;
 std::vector<std::vector<ComputeCapability>> cluster_device_capability;
+std::vector<int> cluster_comm_profile_ids;
 std::vector<int> ranks_idle;
 
 // ====【Algorithm】
 std::vector<std::vector<ComputeCapability>> gpu_capability; // 不同rank的设备算力, 包含fp32/fp64两套归一化能力
 std::vector<std::vector<double>> gpu_available_time; // 不同gpu的可用时间 monitor查看空闲？不空闲怎么做
+int local_comm_profile_id = -1;
 
 struct ProfileCostKey {
   std::string kernel_key;
@@ -443,9 +447,18 @@ static void addDAGDependency(DAGNode *pre_node, DAGNode *node,
   }
 }
 
-static double getCommElem(DAGNode *node, DAGNode *pre_node) {
-  auto it = node->comm_elem.find(pre_node);
-  return it == node->comm_elem.end() ? 0.0 : it->second;
+static double getCommBytes(DAGNode *node, DAGNode *pre_node) {
+  auto it = node->depend_on_mem.find(pre_node);
+  if (it == node->depend_on_mem.end()) {
+    return 0.0;
+  }
+
+  double bytes = 0.0;
+  for (const SyclReqData &req : it->second) {
+    bytes += static_cast<double>(req.elem_size) *
+             static_cast<double>(req.buff_size);
+  }
+  return bytes;
 }
 
 static std::vector<DAGNode *> reverseTopologicalOrder(
@@ -600,10 +613,72 @@ void generateDAGs(std::vector<DAGNode *> &kernel_dag_nodes, std::vector<DAGNode 
 }
 
 static constexpr double PROFILE_NS_TO_COST = 10000.0;
-static constexpr double SAME_RANK_BANDWIDTH = 100.0;
-static constexpr double CROSS_RANK_BANDWIDTH = 1.0;
+static constexpr double GIB_BYTES = 1024.0 * 1024.0 * 1024.0;
+static constexpr double HEFT_COMM_COST_PER_SECOND = 100000.0;
+static constexpr double FALLBACK_HOST_BW_GIB = 12.0;
+static constexpr double FALLBACK_H2D_BW_GIB = 20.0;
+static constexpr double FALLBACK_D2H_BW_GIB = 20.0;
+static constexpr double FALLBACK_D2D_BW_GIB = 12.0;
+static constexpr double FALLBACK_CROSS_RANK_BW_GIB = 0.106;
 static constexpr double SPLIT_EFFICIENCY = 0.85;
 static constexpr double SPLIT_MIN_ELEMS = 65536.0;
+
+struct NodeCommProfile {
+  int id = -1;
+  std::string key;
+  double shm_bw_gib = FALLBACK_HOST_BW_GIB;
+  double same_node_staged_bw_gib = 4.0;
+  std::vector<double> h2d_bw_gib; // index 0 is CPU/host, GPUs start at 1
+  std::vector<double> d2h_bw_gib; // index 0 is CPU/host, GPUs start at 1
+  std::map<std::pair<int, int>, double> d2d_bw_gib;
+};
+
+static const std::map<std::string, NodeCommProfile> &nodeCommProfiles() {
+  static const std::map<std::string, NodeCommProfile> profiles = {
+      {"4090-01", // profile map key: hostname/env/device detection result
+       NodeCommProfile{
+          1,         // profile id: the compact value exchanged by MPI_Allgather
+          "4090-01", // profile key: used by crossNodeCommProfiles lookup
+          18.5,      // shm_bw_gib: test_host_shm_memcpy_bandwidth, large-size host<->shm
+          5.5,       // same_node_staged_bw_gib: mpirun -n 2 test_mpi_cuda_staged_bandwidth on 4090 node
+          {0.0, 24.0, 22.0}, // h2d_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_H2D, index 0 CPU, 1..N GPU
+          {0.0, 25.0, 12.6}, // d2h_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_D2H, index 0 CPU, 1..N GPU
+          {// d2d_bw_gib: test_cuda_p2p_bandwidth; daemon proc id, so CUDA0->CUDA1 is 1->2
+           {{1, 2}, 20.7}, // GPU proc 1 -> GPU proc 2
+           {{2, 1}, 7.5}}}}, // GPU proc 2 -> GPU proc 1
+      {"a6000-01", // profile map key: hostname/env/device detection result
+       NodeCommProfile{
+          2,          // profile id: the compact value exchanged by MPI_Allgather
+          "a6000-01", // profile key: used by crossNodeCommProfiles lookup
+          12.5,       // shm_bw_gib: test_host_shm_memcpy_bandwidth, large-size host<->shm
+          4.5,        // same_node_staged_bw_gib: mpirun -n 2 test_mpi_cuda_staged_bandwidth on a6000 node
+          {0.0, 25.1, 25.1, 25.1, 25.0}, // h2d_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_H2D
+          {0.0, 24.5, 24.5, 24.5, 23.3}, // d2h_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_D2H
+          {// d2d_bw_gib: test_cuda_p2p_bandwidth; daemon proc id, GPU procs are 1..4
+           {{1, 2}, 24.58}, // GPU proc 1 -> GPU proc 2
+           {{2, 1}, 24.58}, // GPU proc 2 -> GPU proc 1
+           {{1, 3}, 21.22}, // GPU proc 1 -> GPU proc 3
+           {{3, 1}, 21.22}, // GPU proc 3 -> GPU proc 1
+           {{1, 4}, 20.93}, // GPU proc 1 -> GPU proc 4
+           {{4, 1}, 21.20}, // GPU proc 4 -> GPU proc 1
+           {{2, 3}, 21.22}, // GPU proc 2 -> GPU proc 3
+           {{3, 2}, 21.22}, // GPU proc 3 -> GPU proc 2
+           {{2, 4}, 20.97}, // GPU proc 2 -> GPU proc 4
+           {{4, 2}, 21.15}, // GPU proc 4 -> GPU proc 2
+           {{3, 4}, 24.48}, // GPU proc 3 -> GPU proc 4
+           {{4, 3}, 24.58}}}}, // GPU proc 4 -> GPU proc 3
+  };
+  return profiles;
+}
+
+static const std::map<std::pair<std::string, std::string>, double> &
+crossNodeCommProfiles() {
+  static const std::map<std::pair<std::string, std::string>, double> profiles = {
+      {{"4090-01", "a6000-01"}, 0.106}, // hostfile cross-node test_mpi_cuda_staged_bandwidth
+      {{"a6000-01", "4090-01"}, 0.106}, // hostfile cross-node test_mpi_cuda_staged_bandwidth
+  };
+  return profiles;
+}
 
 struct TaskCandidate {
   int rank = -1;
@@ -649,6 +724,16 @@ static double totalReadElems(const DAGNode *node) {
   return elems;
 }
 
+static double totalReadBytes(const DAGNode *node) {
+  double bytes = 0.0;
+  for (const SyclReqData &req : node->req_data) {
+    if (isReadAccess(req.req_accmode)) {
+      bytes += reqBytes(req);
+    }
+  }
+  return bytes;
+}
+
 static double totalWriteElems(const DAGNode *node) {
   double elems = 0.0;
   for (const SyclReqData &req : node->req_data) {
@@ -657,6 +742,16 @@ static double totalWriteElems(const DAGNode *node) {
     }
   }
   return elems;
+}
+
+static double totalWriteBytes(const DAGNode *node) {
+  double bytes = 0.0;
+  for (const SyclReqData &req : node->req_data) {
+    if (isWriteAccess(req.req_accmode)) {
+      bytes += reqBytes(req);
+    }
+  }
+  return bytes;
 }
 
 static void updateProfileCostTable(const S2DKernelProfileData &profile,
@@ -790,6 +885,196 @@ static ComputeCapability inferGpuCapabilityFromName(const std::string &name) {
   return ComputeCapability{10.0, 1.0};
 }
 
+static const NodeCommProfile *findNodeCommProfileByKey(
+    const std::string &key) {
+  const auto it = nodeCommProfiles().find(key);
+  if (it != nodeCommProfiles().end()) {
+    return &it->second;
+  }
+  return nullptr;
+}
+
+static const NodeCommProfile *findNodeCommProfileById(int id) {
+  for (const auto &entry : nodeCommProfiles()) {
+    const NodeCommProfile &profile = entry.second;
+    if (profile.id == id) {
+      return &profile;
+    }
+  }
+  return nullptr;
+}
+
+static std::string localHostName() {
+  char hostname[256] = {};
+  if (gethostname(hostname, sizeof(hostname) - 1) == 0) {
+    return hostname;
+  }
+  return "";
+}
+
+static std::string inferCommProfileKeyFromHostName(
+    const std::string &hostname) {
+  if (containsIgnoreCase(hostname, "4090")) {
+    return "4090-01";
+  }
+  if (containsIgnoreCase(hostname, "a6000")) {
+    return "a6000-01";
+  }
+  return "";
+}
+
+static std::string inferCommProfileKeyFromLocalDevices() {
+  for (const MonitorInfo &info : device_monitor_info) {
+    if (containsIgnoreCase(info.name, "4090")) {
+      return "4090-01";
+    }
+    if (containsIgnoreCase(info.name, "rtx 6000") &&
+        containsIgnoreCase(info.name, "ada")) {
+      return "a6000-01";
+    }
+  }
+  return "";
+}
+
+static int detectLocalCommProfileId() {
+  const char *override_key = std::getenv("SYCL_DAEMON_NODE_KEY");
+  if (override_key != nullptr && override_key[0] != '\0') {
+    const NodeCommProfile *profile = findNodeCommProfileByKey(override_key);
+    if (profile != nullptr) {
+      return profile->id;
+    }
+    std::cout << "CommProfile: unknown SYCL_DAEMON_NODE_KEY=" << override_key
+              << ", fallback to auto detection" << std::endl;
+  }
+
+  std::string key = inferCommProfileKeyFromHostName(localHostName());
+  if (key.empty()) {
+    key = inferCommProfileKeyFromLocalDevices();
+  }
+
+  const NodeCommProfile *profile = findNodeCommProfileByKey(key);
+  return profile == nullptr ? -1 : profile->id;
+}
+
+static const NodeCommProfile *commProfileForRank(int rank) {
+  if (rank >= 0 && rank < static_cast<int>(cluster_comm_profile_ids.size())) {
+    const NodeCommProfile *profile =
+        findNodeCommProfileById(cluster_comm_profile_ids[rank]);
+    if (profile != nullptr) {
+      return profile;
+    }
+  }
+  if (rank == mpi_rank) {
+    return findNodeCommProfileById(local_comm_profile_id);
+  }
+  return nullptr;
+}
+
+static void ensureLocalCommProfileVisible(size_t rank_count) {
+  local_comm_profile_id = detectLocalCommProfileId();
+  if (cluster_comm_profile_ids.size() < rank_count) {
+    cluster_comm_profile_ids.resize(rank_count, -1);
+  }
+  if (local_comm_profile_id < 0) {
+    return;
+  }
+
+  if (mpi_rank >= 0 &&
+      mpi_rank < static_cast<int>(cluster_comm_profile_ids.size())) {
+    cluster_comm_profile_ids[mpi_rank] = local_comm_profile_id;
+  }
+  if (monitor_rank >= 0 &&
+      monitor_rank < static_cast<int>(cluster_comm_profile_ids.size())) {
+    cluster_comm_profile_ids[monitor_rank] = local_comm_profile_id;
+  }
+}
+
+static double bandwidthAtDeviceIndex(const std::vector<double> &bandwidths,
+                                     int device, double fallback) {
+  if (device >= 0 && device < static_cast<int>(bandwidths.size()) &&
+      bandwidths[device] > 0.0) {
+    return bandwidths[device];
+  }
+  return fallback;
+}
+
+static double secondsForBytesAtBandwidth(double bytes, double bw_gib) {
+  if (bytes <= 0.0) {
+    return 0.0;
+  }
+  return bytes / (std::max(0.001, bw_gib) * GIB_BYTES);
+}
+
+static double heftCostFromSeconds(double seconds) {
+  return seconds * HEFT_COMM_COST_PER_SECOND;
+}
+
+static double sameRankCopySeconds(int rank, int src_proc, int dst_proc,
+                                  double bytes) {
+  if (bytes <= 0.0 || src_proc == dst_proc) {
+    return 0.0;
+  }
+
+  const NodeCommProfile *profile = commProfileForRank(rank);
+  const double shm_bw = profile == nullptr ? FALLBACK_HOST_BW_GIB
+                                           : profile->shm_bw_gib;
+
+  if (src_proc == 0 && dst_proc > 0) {
+    const double h2d_bw =
+        profile == nullptr ? FALLBACK_H2D_BW_GIB
+                           : bandwidthAtDeviceIndex(profile->h2d_bw_gib,
+                                                    dst_proc,
+                                                    FALLBACK_H2D_BW_GIB);
+    return secondsForBytesAtBandwidth(bytes, h2d_bw);
+  }
+  if (src_proc > 0 && dst_proc == 0) {
+    const double d2h_bw =
+        profile == nullptr ? FALLBACK_D2H_BW_GIB
+                           : bandwidthAtDeviceIndex(profile->d2h_bw_gib,
+                                                    src_proc,
+                                                    FALLBACK_D2H_BW_GIB);
+    return secondsForBytesAtBandwidth(bytes, d2h_bw);
+  }
+  if (src_proc == 0 && dst_proc == 0) {
+    return secondsForBytesAtBandwidth(bytes, shm_bw);
+  }
+
+  if (profile != nullptr) {
+    auto it = profile->d2d_bw_gib.find({src_proc, dst_proc});
+    if (it != profile->d2d_bw_gib.end() && it->second > 0.0) {
+      return secondsForBytesAtBandwidth(bytes, it->second);
+    }
+
+    const double d2h_bw = bandwidthAtDeviceIndex(profile->d2h_bw_gib,
+                                                 src_proc,
+                                                 FALLBACK_D2H_BW_GIB);
+    const double h2d_bw = bandwidthAtDeviceIndex(profile->h2d_bw_gib,
+                                                 dst_proc,
+                                                 FALLBACK_H2D_BW_GIB);
+    return secondsForBytesAtBandwidth(bytes, d2h_bw) +
+           secondsForBytesAtBandwidth(bytes, h2d_bw);
+  }
+
+  return secondsForBytesAtBandwidth(bytes, FALLBACK_D2D_BW_GIB);
+}
+
+static double crossRankBandwidthGiB(int src_rank, int dst_rank) {
+  const NodeCommProfile *src_profile = commProfileForRank(src_rank);
+  const NodeCommProfile *dst_profile = commProfileForRank(dst_rank);
+  if (src_profile != nullptr && dst_profile != nullptr) {
+    if (src_profile->key == dst_profile->key) {
+      return std::min(src_profile->same_node_staged_bw_gib,
+                      dst_profile->same_node_staged_bw_gib);
+    }
+    const auto it =
+        crossNodeCommProfiles().find({src_profile->key, dst_profile->key});
+    if (it != crossNodeCommProfiles().end()) {
+      return it->second;
+    }
+  }
+  return FALLBACK_CROSS_RANK_BW_GIB;
+}
+
 static ComputeCapability inferDeviceCapabilityFromName(const std::string &name,
                                                        bool is_cpu) {
   return is_cpu ? inferCpuCapabilityFromName(name)
@@ -892,6 +1177,7 @@ static const MonitorInfo *monitorInfoForDevice(int rank, int proc) {
 
 static void ensureOfflineDeviceModel() {
   const size_t rank_count = offlineRankCount();
+  ensureLocalCommProfileVisible(rank_count);
 
   std::vector<std::vector<ComputeCapability>> raw_capability(rank_count);
   for (size_t rank = 0; rank < rank_count; ++rank) {
@@ -1026,38 +1312,71 @@ static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
   return cold_cost * monitorPenalty(rank, proc);
 }
 
-static double estimateCommCost(DAGNode *node, DAGNode *pre_node, int rank,
-                               int proc, int num_parts) {
+static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
+                                         int rank,
+                                         const std::vector<int> &target_procs) {
   if (pre_node->exec_rank < 0) {
     return 0.0;
   }
 
-  const double comm_elem = getCommElem(node, pre_node);
-  if (comm_elem == 0.0) {
+  const double comm_bytes = getCommBytes(node, pre_node);
+  if (comm_bytes == 0.0 || target_procs.empty()) {
     return 0.0;
   }
 
   if (pre_node->exec_rank != rank) {
-    return comm_elem / CROSS_RANK_BANDWIDTH;
+    return heftCostFromSeconds(secondsForBytesAtBandwidth(
+        comm_bytes, crossRankBandwidthGiB(pre_node->exec_rank, rank)));
   }
 
-  if (pre_node->num_parts > 1 || num_parts > 1 || pre_node->exec_proc != proc) {
-    return comm_elem / SAME_RANK_BANDWIDTH;
+  std::vector<int> source_procs;
+  if (pre_node->num_parts > 1 && !pre_node->split_devices.empty()) {
+    source_procs = pre_node->split_devices;
+  } else {
+    source_procs.push_back(pre_node->exec_proc);
   }
 
-  return 0.0;
+  double total_seconds = 0.0;
+  for (int dst_proc : target_procs) {
+    bool already_local = false;
+    for (int src_proc : source_procs) {
+      if (src_proc == dst_proc) {
+        already_local = true;
+        break;
+      }
+    }
+    if (already_local) {
+      continue;
+    }
+
+    double best_seconds = std::numeric_limits<double>::infinity();
+    for (int src_proc : source_procs) {
+      best_seconds =
+          std::min(best_seconds,
+                   sameRankCopySeconds(rank, src_proc, dst_proc, comm_bytes));
+    }
+    if (std::isfinite(best_seconds)) {
+      total_seconds += best_seconds;
+    }
+  }
+
+  return heftCostFromSeconds(total_seconds);
 }
 
-static double dependencyReadyTime(DAGNode *node, int rank, int proc,
-                                  int num_parts) {
+static double dependencyReadyTimeForDevices(DAGNode *node, int rank,
+                                            const std::vector<int> &target_procs) {
   double ready_time = 0.0;
   for (DAGNode *pre_node : node->depend_on) {
     ready_time = std::max(
         ready_time,
         pre_node->finish_time +
-            estimateCommCost(node, pre_node, rank, proc, num_parts));
+            estimateCommCostForDevices(node, pre_node, rank, target_procs));
   }
   return ready_time;
+}
+
+static double dependencyReadyTime(DAGNode *node, int rank, int proc) {
+  return dependencyReadyTimeForDevices(node, rank, std::vector<int>{proc});
 }
 
 static bool worthConsideringSplit(DAGNode *node, int num_parts) {
@@ -1080,6 +1399,27 @@ static int countMaskBits(uint64_t mask) {
     mask >>= 1;
   }
   return count;
+}
+
+static double estimateSplitInternalCopyCost(
+    DAGNode *node, int rank, const std::vector<int> &split_devices) {
+  if (split_devices.size() <= 1) {
+    return 0.0;
+  }
+
+  const int main_proc = split_devices.front();
+  const double read_bytes = totalReadBytes(node);
+  const double write_part_bytes =
+      totalWriteBytes(node) / static_cast<double>(split_devices.size());
+
+  double seconds = 0.0;
+  for (size_t i = 1; i < split_devices.size(); ++i) {
+    const int proc = split_devices[i];
+    seconds += sameRankCopySeconds(rank, main_proc, proc, read_bytes);
+    seconds += sameRankCopySeconds(rank, proc, main_proc, write_part_bytes);
+  }
+
+  return heftCostFromSeconds(seconds);
 }
 
 static double estimateSplitExecCost(DAGNode *node, int rank,
@@ -1111,8 +1451,7 @@ static double estimateSplitExecCost(DAGNode *node, int rank,
   }
 
   const double copy_overhead =
-      (totalReadElems(node) * (num_parts - 1) + totalWriteElems(node)) /
-      1000.0 / SAME_RANK_BANDWIDTH;
+      estimateSplitInternalCopyCost(node, rank, split_devices);
   const double launch_overhead = 0.2 * num_parts;
   return best_single / (num_parts * SPLIT_EFFICIENCY) + copy_overhead +
          launch_overhead;
@@ -1130,7 +1469,7 @@ static TaskCandidate makeSingleCandidate(DAGNode *node, int rank, int proc) {
   }
 
   const double device_ready = gpu_available_time[rank][proc];
-  const double dep_ready = dependencyReadyTime(node, rank, proc, 1);
+  const double dep_ready = dependencyReadyTime(node, rank, proc);
   candidate.start_time = std::max(device_ready, dep_ready);
   candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
   candidate.finish_time = candidate.start_time + candidate.exec_cost;
@@ -1183,7 +1522,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     }
 
     const double dep_ready =
-        dependencyReadyTime(node, rank, split_devices.front(), num_parts);
+        dependencyReadyTimeForDevices(node, rank, split_devices);
     const double start_time = std::max(device_ready, dep_ready);
     const double exec_cost = estimateSplitExecCost(node, rank, split_devices);
     const double finish_time = start_time + exec_cost;
@@ -1214,6 +1553,43 @@ static double estimateAverageRankCost(DAGNode *node) {
     return std::max(1.0, node->total_elem);
   }
   return sum / count;
+}
+
+static double estimateAverageCommCost(DAGNode *node, DAGNode *pre_node) {
+  const double comm_bytes = getCommBytes(node, pre_node);
+  if (comm_bytes <= 0.0) {
+    return 0.0;
+  }
+
+  double total_cost = 0.0;
+  int count = 0;
+  for (int src_rank = 0;
+       src_rank < static_cast<int>(gpu_available_time.size()); ++src_rank) {
+    for (int src_proc = 0;
+         src_proc < static_cast<int>(gpu_available_time[src_rank].size());
+         ++src_proc) {
+      for (int dst_rank = 0;
+           dst_rank < static_cast<int>(gpu_available_time.size());
+           ++dst_rank) {
+        for (int dst_proc = 0;
+             dst_proc < static_cast<int>(gpu_available_time[dst_rank].size());
+             ++dst_proc) {
+          double seconds = 0.0;
+          if (src_rank == dst_rank) {
+            seconds =
+                sameRankCopySeconds(src_rank, src_proc, dst_proc, comm_bytes);
+          } else {
+            seconds = secondsForBytesAtBandwidth(
+                comm_bytes, crossRankBandwidthGiB(src_rank, dst_rank));
+          }
+          total_cost += heftCostFromSeconds(seconds);
+          count++;
+        }
+      }
+    }
+  }
+
+  return count == 0 ? 0.0 : total_cost / static_cast<double>(count);
 }
 
 // nodes: 这批要调度的所有kernel
@@ -1258,7 +1634,8 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
       if (!current_nodes.count(succ_node)) {
         continue;
       }
-      const double succ_cost = getCommElem(succ_node, node) + succ_node->rank_u;
+      const double succ_cost =
+          estimateAverageCommCost(succ_node, node) + succ_node->rank_u;
       if (succ_cost > max_succ) {
         max_succ = succ_cost;
       }
@@ -1611,9 +1988,12 @@ void *SystemSchedulerMonitor(void *arg) {
   ranks_idle.resize(monitor_size, false);
   cluster_monitor_info.resize(monitor_size);
   cluster_device_capability.resize(monitor_size);
+  cluster_comm_profile_ids.resize(monitor_size, -1);
 
   // 每个rank彼此感知是否有空闲即可 无需传递所有状态？
   while (1) {
+    local_comm_profile_id = detectLocalCommProfileId();
+
     int is_idle = 0;
     for (int i = 1; i < device_monitor_info.size(); i++) {
       if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
@@ -1623,6 +2003,9 @@ void *SystemSchedulerMonitor(void *arg) {
     }
 
     MPI_Allgather(&is_idle, 1, MPI_INT, ranks_idle.data(), 1, MPI_INT, comm_monitor);
+    MPI_Allgather(&local_comm_profile_id, 1, MPI_INT,
+                  cluster_comm_profile_ids.data(), 1, MPI_INT,
+                  comm_monitor);
 
     std::array<double, MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS> local_monitor{};
     const int local_device_count =
