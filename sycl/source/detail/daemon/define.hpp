@@ -10,4 +10,4 @@
 // #define SCHEDULE 1 // 重绑定的调度决策
 #define SCHEDULE_OFFLINE 1 // 延迟提交kernel的离线调度
 
-// #define SNMD_OFFLINE 1 // 单节点多设备的数据并行 且kernel接入先wait后调度的离线逻辑
+#define SNMD_OFFLINE 1 // 单节点多设备的数据并行 且kernel接入先wait后调度的离线逻辑

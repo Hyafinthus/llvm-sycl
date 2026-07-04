@@ -284,6 +284,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
   // OFFLINE daemon指定需要哪个device执行
   int exec_device = 0;
   int num_parts = 1; // >1 表示在同一rank上使用SNMD split
+  std::vector<int> split_devices; // SNMD split实际使用的SYCL device index
   std::map<SyclReqData, int> req_rank; // 需要的数据 在哪个rank上
 
   bool operator<(const D2DKernelSchedInfo &other) const {
@@ -320,6 +321,11 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
         << exec_device << "\n"
         << num_parts << "\n";
 
+    oss << split_devices.size() << "\n";
+    for (int device : split_devices) {
+      oss << device << "\n";
+    }
+
     oss << req_rank.size() << "\n";
     for (const auto &pair : req_rank) {
       oss << pair.first.serialize();
@@ -338,6 +344,15 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
     iss >> sched_info.exec_rank;
     iss >> sched_info.exec_device;
     iss >> sched_info.num_parts;
+
+    size_t split_device_count = 0;
+    iss >> split_device_count;
+    iss.ignore();
+    sched_info.split_devices.resize(split_device_count);
+    for (size_t i = 0; i < split_device_count; ++i) {
+      iss >> sched_info.split_devices[i];
+      iss.ignore();
+    }
 
     size_t map_size;
     iss >> map_size;
@@ -368,6 +383,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
   bool exec = false; // 是否执行
   int device_index = 0; // 执行设备
   int num_parts = 1; // >1 表示handler按SNMD split提交
+  std::vector<int> split_devices; // SNMD split实际使用的SYCL device index
 
   // 快速跳过前几个kernel
   // 0: kernel_count从1开始 默认值
@@ -385,8 +401,14 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     oss << kernel_count << "\n"
         << exec << "\n"
         << device_index << "\n"
-        << num_parts << "\n"
-        << scale_count << "\n";
+        << num_parts << "\n";
+
+    oss << split_devices.size() << "\n";
+    for (int device : split_devices) {
+      oss << device << "\n";
+    }
+
+    oss << scale_count << "\n";
 
     // 序列化 req_counts 的大小
     oss << req_counts.size() << "\n";
@@ -405,6 +427,16 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     iss >> kernel_info.exec;
     iss >> kernel_info.device_index;
     iss >> kernel_info.num_parts;
+
+    size_t split_device_count = 0;
+    iss >> split_device_count;
+    iss.ignore();
+    kernel_info.split_devices.resize(split_device_count);
+    for (size_t i = 0; i < split_device_count; ++i) {
+      iss >> kernel_info.split_devices[i];
+      iss.ignore();
+    }
+
     iss >> kernel_info.scale_count;
 
     size_t req_count;
@@ -466,6 +498,7 @@ struct DAGNode { // 一个kernel的依赖关系
   int exec_rank = -1; // 选择的rank
   int exec_proc = -1; // 选择的proc
   int num_parts = 1; // >1 表示这个kernel选择SNMD split
+  std::vector<int> split_devices; // num_parts>1时参与split的device index
   // bool executed = false; // online无法获取 --offline用于区别kernel是否已被调度 暂时用不上--
 
   DAGNode(int count, const std::vector<SyclReqData> &reqs) : kernel_count(count), req_data(reqs) {}

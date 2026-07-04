@@ -323,6 +323,7 @@ public:
 
 #ifdef SNMD_OFFLINE
   size_t NumParts = 1; // 默认值 由hanlder修改 在addCG中读取并重置
+  std::vector<int> SplitDevices; // daemon选择的实际split设备index
   std::vector<detail::QueueImplPtr> SplitQueues_Write; // Q_G0 Q_G1
   // CHECKED 已更新逻辑 WriteReq不需要clone 直接使用完整OriReq 导致所有的Req都不用存
   // std::vector<Requirement*> SplitReqs_onlyRead; // E F

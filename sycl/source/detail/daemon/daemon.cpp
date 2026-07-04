@@ -219,6 +219,13 @@ void SendD2DKernelSchedInfos(MPI_Comm comm_daemon, int master_rank, int daemon_r
       std::getline(stream, line);
       obj_data += line + "\n";  // num_parts
       std::getline(stream, line);
+      obj_data += line + "\n";  // split_devices.size()
+      int split_device_count = std::stoi(line);
+      for (int i = 0; i < split_device_count; ++i) {
+        std::getline(stream, line);
+        obj_data += line + "\n";  // split device index
+      }
+      std::getline(stream, line);
       obj_data += line + "\n";  // req_rank.size()
       int map_size = std::stoi(line);
       for (int i = 0; i < map_size; ++i) {
@@ -1066,19 +1073,36 @@ static bool worthConsideringSplit(DAGNode *node, int num_parts) {
   return true;
 }
 
-static double estimateSplitExecCost(DAGNode *node, int rank, int num_parts) {
+static int countMaskBits(uint64_t mask) {
+  int count = 0;
+  while (mask != 0) {
+    count += static_cast<int>(mask & 1ULL);
+    mask >>= 1;
+  }
+  return count;
+}
+
+static double estimateSplitExecCost(DAGNode *node, int rank,
+                                    const std::vector<int> &split_devices) {
+  const int num_parts = static_cast<int>(split_devices.size());
+  if (num_parts <= 1) {
+    return estimateSingleExecCost(
+        node, rank, split_devices.empty() ? 1 : split_devices.front());
+  }
+
   double profile_cost = 0.0;
   const std::string key = profileKeyForNode(node);
-  if (lookupProfileCost(key, rank, 1, num_parts, profile_cost)) {
+  if (lookupProfileCost(key, rank, split_devices.front(), num_parts,
+                        profile_cost)) {
     double penalty = 1.0;
-    for (int proc = 1; proc <= num_parts; ++proc) {
+    for (int proc : split_devices) {
       penalty = std::max(penalty, monitorPenalty(rank, proc));
     }
     return std::max(0.001, profile_cost) * penalty;
   }
 
   double best_single = std::numeric_limits<double>::infinity();
-  for (int proc = 1; proc <= num_parts; ++proc) {
+  for (int proc : split_devices) {
     best_single = std::min(best_single, estimateSingleExecCost(node, rank, proc));
   }
 
@@ -1117,7 +1141,6 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
                                         int num_parts) {
   TaskCandidate candidate;
   candidate.rank = rank;
-  candidate.proc = 1;
   candidate.num_parts = num_parts;
 
   if (!worthConsideringSplit(node, num_parts)) {
@@ -1128,19 +1151,50 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     return candidate;
   }
 
-  double device_ready = 0.0;
-  for (int proc = 1; proc <= num_parts; ++proc) {
+  std::vector<int> gpu_procs;
+  for (int proc = 1; proc < static_cast<int>(gpu_available_time[rank].size());
+       ++proc) {
     if (!monitorMemoryFits(node, rank, proc, num_parts)) {
-      return candidate;
+      continue;
     }
-    candidate.occupied_procs.push_back(proc);
-    device_ready = std::max(device_ready, gpu_available_time[rank][proc]);
+    gpu_procs.push_back(proc);
+  }
+  if (static_cast<int>(gpu_procs.size()) < num_parts ||
+      gpu_procs.size() >= 63) {
+    return candidate;
   }
 
-  const double dep_ready = dependencyReadyTime(node, rank, 1, num_parts);
-  candidate.start_time = std::max(device_ready, dep_ready);
-  candidate.exec_cost = estimateSplitExecCost(node, rank, num_parts);
-  candidate.finish_time = candidate.start_time + candidate.exec_cost;
+  const uint64_t mask_limit = 1ULL << gpu_procs.size();
+  for (uint64_t mask = 0; mask < mask_limit; ++mask) {
+    if (countMaskBits(mask) != num_parts) {
+      continue;
+    }
+
+    std::vector<int> split_devices;
+    split_devices.reserve(num_parts);
+    double device_ready = 0.0;
+    for (size_t i = 0; i < gpu_procs.size(); ++i) {
+      if ((mask & (1ULL << i)) == 0) {
+        continue;
+      }
+      const int proc = gpu_procs[i];
+      split_devices.push_back(proc);
+      device_ready = std::max(device_ready, gpu_available_time[rank][proc]);
+    }
+
+    const double dep_ready =
+        dependencyReadyTime(node, rank, split_devices.front(), num_parts);
+    const double start_time = std::max(device_ready, dep_ready);
+    const double exec_cost = estimateSplitExecCost(node, rank, split_devices);
+    const double finish_time = start_time + exec_cost;
+    if (finish_time < candidate.finish_time) {
+      candidate.proc = split_devices.front();
+      candidate.occupied_procs = split_devices;
+      candidate.start_time = start_time;
+      candidate.exec_cost = exec_cost;
+      candidate.finish_time = finish_time;
+    }
+  }
   return candidate;
 }
 
@@ -1252,6 +1306,7 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
     node->exec_rank = best_candidate.rank;
     node->exec_proc = best_candidate.proc;
     node->num_parts = best_candidate.num_parts;
+    node->split_devices = best_candidate.occupied_procs;
     node->finish_time = best_candidate.finish_time;
     for (int proc : best_candidate.occupied_procs) {
       gpu_available_time[node->exec_rank][proc] = node->finish_time;
@@ -1263,12 +1318,18 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
     kernel_sched_info.exec_rank = node->exec_rank;
     kernel_sched_info.exec_device = node->exec_proc;
     kernel_sched_info.num_parts = node->num_parts;
+    kernel_sched_info.split_devices = node->split_devices;
     kernel_sched_order_infos.push_back(kernel_sched_info);
 
     std::cout << "algorithmHEFT: Kernel " << node->kernel_count
               << " assigned to Rank " << node->exec_rank
               << " Proc " << node->exec_proc
               << " NumParts " << node->num_parts
+              << " SplitDevices";
+    for (int split_device : node->split_devices) {
+      std::cout << " " << split_device;
+    }
+    std::cout
               << " start_time " << best_candidate.start_time
               << " exec_cost " << best_candidate.exec_cost
               << " finish_time " << node->finish_time << std::endl;
@@ -2062,6 +2123,7 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
 
         kernel_exec_info.device_index = kernel_sched_info.exec_device;
         kernel_exec_info.num_parts = kernel_sched_info.num_parts;
+        kernel_exec_info.split_devices = kernel_sched_info.split_devices;
       }
       else {
         req_for_rank = kernel_sched_info.get_req_for_rank(daemon_rank);
@@ -2092,6 +2154,11 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
                 << " exec " << kernel_exec_info.exec
                 << " device_index " << kernel_exec_info.device_index
                 << " num_parts " << kernel_exec_info.num_parts
+                << " split_devices";
+      for (int split_device : kernel_exec_info.split_devices) {
+        std::cout << " " << split_device;
+      }
+      std::cout
                 << " req_counts " << kernel_exec_info.req_counts.size()
                 << std::endl;
     }

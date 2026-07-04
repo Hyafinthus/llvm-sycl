@@ -76,7 +76,12 @@ void event::wait() {
 
 // #ifdef SCHEDULE_OFFLINE
 #if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
-  event last_event = getHandler()->scheduleOffline();
+  std::shared_ptr<handler> Handler = getHandler();
+  if (!Handler) {
+    impl->wait(impl);
+    return;
+  }
+  event last_event = Handler->scheduleOffline();
   std::cout << "===event.cpp=== scheduleOffline last_event" << std::endl;
   last_event.impl->wait(last_event.impl);
   std::cout << "===event.cpp=== scheduleOffline wait finished" << std::endl;

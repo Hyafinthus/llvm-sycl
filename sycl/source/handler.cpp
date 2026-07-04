@@ -150,6 +150,71 @@ static int clampOfflineDeviceIndex(int RequestedDeviceIndex) {
   return ClampedDeviceIndex;
 }
 
+#ifdef SNMD_OFFLINE
+static std::vector<int>
+normalizeOfflineSplitDevices(const D2SKernelExecInfo &KernelExecInfo,
+                             int ActualDeviceIndex) {
+  const auto &Devices = detail::ProgramManager::getInstance().globalDevices;
+  std::vector<int> SplitDevices;
+  const int RequestedParts = std::max(1, KernelExecInfo.num_parts);
+
+  auto addDevice = [&](int DeviceIndex) {
+    if (DeviceIndex <= 0 ||
+        DeviceIndex >= static_cast<int>(Devices.size())) {
+      return;
+    }
+    if (std::find(SplitDevices.begin(), SplitDevices.end(), DeviceIndex) !=
+        SplitDevices.end()) {
+      return;
+    }
+    SplitDevices.push_back(DeviceIndex);
+  };
+
+  if (RequestedParts > 1) {
+    for (int DeviceIndex : KernelExecInfo.split_devices) {
+      addDevice(DeviceIndex);
+    }
+    addDevice(ActualDeviceIndex);
+    for (int DeviceIndex = 1;
+         DeviceIndex < static_cast<int>(Devices.size()) &&
+         static_cast<int>(SplitDevices.size()) < RequestedParts;
+         ++DeviceIndex) {
+      addDevice(DeviceIndex);
+    }
+  }
+
+  if (static_cast<int>(SplitDevices.size()) > RequestedParts) {
+    SplitDevices.resize(RequestedParts);
+  }
+  return SplitDevices;
+}
+
+static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
+                                      int ActualDeviceIndex) {
+  auto &PM = detail::ProgramManager::getInstance();
+  PM.NumParts = 1;
+  PM.SplitDevices.clear();
+
+  if (KernelExecInfo.num_parts <= 1) {
+    return;
+  }
+
+  PM.SplitDevices =
+      normalizeOfflineSplitDevices(KernelExecInfo, ActualDeviceIndex);
+  if (PM.SplitDevices.size() <= 1) {
+    PM.SplitDevices.clear();
+    return;
+  }
+
+  PM.NumParts = PM.SplitDevices.size();
+  std::cout << "=== handler === Offline split devices:";
+  for (int DeviceIndex : PM.SplitDevices) {
+    std::cout << " " << DeviceIndex;
+  }
+  std::cout << " num_parts: " << PM.NumParts << std::endl;
+}
+#endif
+
 static void clearOfflineBatch() {
   auto &PM = detail::ProgramManager::getInstance();
   for (detail::SyclKernelCg *KernelCg : PM.kernel_cgs) {
@@ -161,6 +226,7 @@ static void clearOfflineBatch() {
 #endif
 #ifdef SNMD_OFFLINE
   PM.NumParts = 1;
+  PM.SplitDevices.clear();
   PM.SplitQueues_Write.clear();
 #endif
 }
@@ -1823,18 +1889,33 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   detail::QueueImplPtr KernelQueue = sycl_kernel_cg.kernel_queue;
   std::vector<Requirement *> &KernelReqs = ExecCG->MRequirements;
   size_t &NumParts = PM.NumParts;
+  std::vector<int> &SplitDevices = PM.SplitDevices;
 
   // SPLIT
   if (NumParts > 1) {
-    size_t AvailableSplitDevices =
-        PM.globalDevices.size() > 1 ? PM.globalDevices.size() - 1 : 0;
-    if (NumParts > AvailableSplitDevices) {
-      std::cout << "=== handler === Split NumParts clamped from "
-                << NumParts << " to " << AvailableSplitDevices << std::endl;
-      NumParts = AvailableSplitDevices;
+    std::vector<int> ValidSplitDevices;
+    for (int DeviceIndex : SplitDevices) {
+      if (DeviceIndex <= 0 ||
+          DeviceIndex >= static_cast<int>(PM.globalDevices.size())) {
+        std::cout << "=== handler === Split device_index out of range: "
+                  << DeviceIndex << std::endl;
+        continue;
+      }
+      if (std::find(ValidSplitDevices.begin(), ValidSplitDevices.end(),
+                    DeviceIndex) == ValidSplitDevices.end()) {
+        ValidSplitDevices.push_back(DeviceIndex);
+      }
     }
-    if (NumParts <= 1) {
+    if (ValidSplitDevices.size() < NumParts) {
+      std::cout << "=== handler === Split NumParts clamped from "
+                << NumParts << " to " << ValidSplitDevices.size()
+                << std::endl;
+      NumParts = ValidSplitDevices.size();
+    }
+    SplitDevices = std::move(ValidSplitDevices);
+    if (NumParts <= 1 || SplitDevices.size() <= 1) {
       NumParts = 1;
+      SplitDevices.clear();
     }
   }
 
@@ -1844,12 +1925,15 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     // 1
     std::vector<detail::QueueImplPtr> &SplitQueues_Write = PM.SplitQueues_Write;
     SplitQueues_Write.clear();
-    for (int i = 1; i <= NumParts; i++) {
-      device SplitDevice = PM.globalDevices.at(i);
+    for (size_t p = 0; p < NumParts; p++) {
+      int SplitDeviceIndex = SplitDevices[p];
+      device SplitDevice = PM.globalDevices.at(SplitDeviceIndex);
       detail::DeviceImplPtr SplitDP = detail::getSyclObjImpl(SplitDevice);
       std::shared_ptr<detail::queue_impl> SplitQueue =
           makeOfflineProfilingQueue(SplitDP, KernelQueue);
       SplitQueues_Write.push_back(SplitQueue);
+      std::cout << "=== handler === Split part " << p
+                << " uses device_index: " << SplitDeviceIndex << std::endl;
     }
     detail::QueueImplPtr hostQ = Scheduler::getInstance().getDefaultHostQueue();
     auto hostCtx = hostQ->getContextImplPtr();
@@ -1859,6 +1943,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     std::vector<Requirement *> SplitReqs_onlyRead;
     std::vector<Requirement *> SplitReqs_hasWrite;
     std::vector<std::vector<Requirement*>> SplitReqs_Copy;
+    std::vector<std::unique_ptr<Requirement>> SplitReqOwners;
     SplitReqs_Copy.resize(NumParts);
     std::cout << "=== handler === Split step2 SplitReqs_Copy resized to NumParts: " << NumParts << std::endl;
 
@@ -1950,12 +2035,14 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
           size_t part0 = end0 - begin0;
           std::cout << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
 
-          Requirement *CopyReq = new Requirement(*Req);
+          auto CopyReqOwner = std::make_unique<Requirement>(*Req);
+          Requirement *CopyReq = CopyReqOwner.get();
           CopyReq->MOffset = id<3>(begin0, 0, 0);
           CopyReq->MAccessRange = range<3>(part0, FullRange[1], FullRange[2]);
           CopyReq->MMemoryRange = FullRange;
           CopyReq->MOffsetInBytes = begin0 * FullRange[1] * FullRange[2] * Req->MElemSize;
           SplitReqs_Copy[p].push_back(CopyReq);
+          SplitReqOwners.push_back(std::move(CopyReqOwner));
         }
       }
     }
@@ -2047,6 +2134,9 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 event handler::scheduleOffline() {
   std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
   std::cout << "=== handler === Process " << getpid() << " scheduleOffline kernel_cgs.size: " << kernel_cgs.size() << std::endl;
+  if (kernel_cgs.empty()) {
+    return event{};
+  }
   std::vector<OfflineProfileEvent> profile_events;
   event last_event;
   for (int i = 0; i < kernel_cgs.size(); ++i) {
@@ -2087,7 +2177,12 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 event handler::scheduleOffline() {
   using namespace sycl::detail;
   // **注意** 一组kernel只调用一次
-  
+  if (detail::ProgramManager::getInstance().kernel_cgs.empty()) {
+    std::cout << "=== handler === Process " << getpid()
+              << " === scheduleOffline empty batch" << std::endl;
+    return event{};
+  }
+
   // 【流程】
   // master接收一组kernel 确定需要扩容
   // master通知其他scale 起对应daemom
@@ -2147,6 +2242,13 @@ event handler::scheduleOffline() {
           std::getline(stream, line);
           obj_data += line + "\n";             // num_parts
           std::getline(stream, line);
+          obj_data += line + "\n";             // split_devices.size()
+          int split_device_count = std::stoi(line);
+          for (int i = 0; i < split_device_count; ++i) {
+            std::getline(stream, line);
+            obj_data += line + "\n";           // split device index
+          }
+          std::getline(stream, line);
           obj_data += line + "\n";             // scale_count
           std::getline(stream, line);
           obj_data += line + "\n";             // req_counts.size()
@@ -2164,6 +2266,11 @@ event handler::scheduleOffline() {
                     << " exec: " << kernel_exec_info.exec
                     << " device_index: " << kernel_exec_info.device_index
                     << " num_parts: " << kernel_exec_info.num_parts
+                    << " split_devices:";
+          for (int DeviceIndex : kernel_exec_info.split_devices) {
+            std::cout << " " << DeviceIndex;
+          }
+          std::cout
                     << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       } else {
@@ -2269,13 +2376,12 @@ event handler::scheduleOffline() {
       // **注意** MQueue在此才rebind 之前有暂未出现过的逻辑使用MQueue
       // 此时有刚启动的daemon
       if (kernel_exec_info.exec) {
-#ifdef SNMD_OFFLINE
-        detail::ProgramManager::getInstance().NumParts =
-            std::max(1, kernel_exec_info.num_parts);
-#endif
-        std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
         const int ActualDeviceIndex =
             clampOfflineDeviceIndex(kernel_exec_info.device_index);
+#ifdef SNMD_OFFLINE
+        applyOfflineSplitDecision(kernel_exec_info, ActualDeviceIndex);
+#endif
+        std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
         std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
@@ -2345,6 +2451,13 @@ event handler::scheduleOffline() {
           std::getline(stream, line);
           obj_data += line + "\n";             // num_parts
           std::getline(stream, line);
+          obj_data += line + "\n";             // split_devices.size()
+          int split_device_count = std::stoi(line);
+          for (int i = 0; i < split_device_count; ++i) {
+            std::getline(stream, line);
+            obj_data += line + "\n";           // split device index
+          }
+          std::getline(stream, line);
           obj_data += line + "\n";             // scale_count
           std::getline(stream, line);
           obj_data += line + "\n";             // req_counts.size()
@@ -2364,6 +2477,11 @@ event handler::scheduleOffline() {
                     << " exec: " << kernel_exec_info.exec
                     << " device_index: " << kernel_exec_info.device_index
                     << " num_parts: " << kernel_exec_info.num_parts
+                    << " split_devices:";
+          for (int DeviceIndex : kernel_exec_info.split_devices) {
+            std::cout << " " << DeviceIndex;
+          }
+          std::cout
                     << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       } else {
@@ -2505,13 +2623,12 @@ event handler::scheduleOffline() {
       // **注意** MQueue在此才rebind 之前有暂未出现过的逻辑使用MQueue
       // 此时有刚启动的daemon
       if (kernel_exec_info.exec) {
-#ifdef SNMD_OFFLINE
-        detail::ProgramManager::getInstance().NumParts =
-            std::max(1, kernel_exec_info.num_parts);
-#endif
-        std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
         const int ActualDeviceIndex =
             clampOfflineDeviceIndex(kernel_exec_info.device_index);
+#ifdef SNMD_OFFLINE
+        applyOfflineSplitDecision(kernel_exec_info, ActualDeviceIndex);
+#endif
+        std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
         std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;

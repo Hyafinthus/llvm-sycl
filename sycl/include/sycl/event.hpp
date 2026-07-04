@@ -19,6 +19,7 @@
 #include <sycl/stl.hpp>
 
 #include <memory>
+#include <utility>
 
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
@@ -85,9 +86,9 @@ public:
   /// Wait for the event.
   void wait();
 
-  void setHandler(handler *h) { kernel_handler = h; }
+  void setHandler(std::shared_ptr<handler> h) { kernel_handler = std::move(h); }
 
-  handler* getHandler() const { return kernel_handler; }
+  std::shared_ptr<handler> getHandler() const { return kernel_handler; }
 
   /// Synchronously wait on a list of events.
   ///
@@ -137,7 +138,7 @@ public:
   backend get_backend() const noexcept;
 
 private:
-  handler *kernel_handler = nullptr;
+  std::shared_ptr<handler> kernel_handler;
 
   event(std::shared_ptr<detail::event_impl> EventImpl);
 

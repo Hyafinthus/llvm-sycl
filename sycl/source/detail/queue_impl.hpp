@@ -684,7 +684,8 @@ protected:
   // template is needed for proper unit testing
   template <typename HandlerType = handler>
   void finalizeHandler(HandlerType &Handler, const CG::CGTYPE &Type,
-                       event &EventRet) {
+                       event &EventRet,
+                       std::shared_ptr<handler> HandlerOwner = nullptr) {
     if (MIsInorder) {
 
       auto IsExpDepManaged = [](const CG::CGTYPE &Type) {
@@ -713,7 +714,11 @@ protected:
     } else
       EventRet = Handler.finalize();
 
-    EventRet.setHandler(&Handler);
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+    if (HandlerOwner) {
+      EventRet.setHandler(std::move(HandlerOwner));
+    }
+#endif
   }
 
 protected:
@@ -734,7 +739,13 @@ protected:
                     const detail::code_location &Loc,
                     const SubmitPostProcessF *PostProcess) {
     // The handler is created with the queue's context, not the queue's device.
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+    auto HandlerOwner =
+        std::make_shared<handler>(Self, PrimaryQueue, SecondaryQueue, MHostQueue);
+    handler &Handler = *HandlerOwner;
+#else
     handler Handler(Self, PrimaryQueue, SecondaryQueue, MHostQueue);
+#endif
     // Save the code location for the handler.
     Handler.saveCodeLoc(Loc);
     // handler作为CGF的单数，即sycl::handler cgh
@@ -759,11 +770,20 @@ protected:
                            ProgramManager::getInstance().kernelUsesAssert(
                                Handler.MOSModuleHandle, Handler.MKernelName);
 
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+      finalizeHandler(Handler, Type, Event, HandlerOwner);
+#else
       finalizeHandler(Handler, Type, Event);
+#endif
 
       (*PostProcess)(IsKernel, KernelUsesAssert, Event);
-    } else
+    } else {
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+      finalizeHandler(Handler, Type, Event, HandlerOwner);
+#else
       finalizeHandler(Handler, Type, Event);
+#endif
+    }
 
     #ifdef PRINT_TRACE
     std::cout << "===queue_impl.cpp===finalized handler" << std::endl;
