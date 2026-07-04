@@ -416,6 +416,20 @@ private:
 
   ~handler() = default;
 
+  struct HandlerDeleter {
+    void operator()(handler *HandlerPtr) const { delete HandlerPtr; }
+  };
+
+  static std::shared_ptr<handler>
+  makeShared(std::shared_ptr<detail::queue_impl> Queue,
+             std::shared_ptr<detail::queue_impl> PrimaryQueue,
+             std::shared_ptr<detail::queue_impl> SecondaryQueue, bool IsHost) {
+    return std::shared_ptr<handler>(
+        new handler(std::move(Queue), std::move(PrimaryQueue),
+                    std::move(SecondaryQueue), IsHost),
+        HandlerDeleter{});
+  }
+
   // TODO: Private and unusued. Remove when ABI break is allowed.
   bool is_host() { return MIsHost; }
 

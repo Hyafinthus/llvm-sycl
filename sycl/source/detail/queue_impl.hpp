@@ -741,7 +741,7 @@ protected:
     // The handler is created with the queue's context, not the queue's device.
 #if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
     auto HandlerOwner =
-        std::make_shared<handler>(Self, PrimaryQueue, SecondaryQueue, MHostQueue);
+        handler::makeShared(Self, PrimaryQueue, SecondaryQueue, MHostQueue);
     handler &Handler = *HandlerOwner;
 #else
     handler Handler(Self, PrimaryQueue, SecondaryQueue, MHostQueue);
