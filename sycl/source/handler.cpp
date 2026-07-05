@@ -1988,7 +1988,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
           if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
             try {
               EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, SrcQueue);
-              // ev_p2p->wait(ev_p2p);
+              ev_p2p->wait(ev_p2p);
               moved_by_p2p = true;
               std::cout << "=== handler === Split step3 direct D2D success\n";
             } catch (const std::exception &e) {
@@ -2001,12 +2001,12 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
           if (!moved_by_p2p) {
             if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
               EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SrcQueue);
-              // ev_host->wait(ev_host);
+              ev_host->wait(ev_host);
               std::cout << "=== handler === Split step3 copy back host\n";
             }
 
             EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
-            // ev_split->wait(ev_split);
+            ev_split->wait(ev_split);
             std::cout << "=== handler === Split step3 copy to split device\n";
           }
         }
@@ -2054,11 +2054,15 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     Event->wait(Event);
     std::cout << "=== handler === Split after wait\n";
 
-    // 5
+    // 5. Merge split writes back to a device context. event::wait() only
+    // synchronizes execution; it must not force data back to host.
     for (size_t p = 0; p < NumParts; ++p) {
       for (int i = 0; i < SplitReqs_Copy[p].size(); ++i) {
         Requirement *CopyReq = SplitReqs_Copy[p][i];
         MemObjRecord *Rec = detail::Scheduler::getInstance().getMemObjRecord(CopyReq);
+        if (Rec == nullptr) {
+          continue;
+        }
         ContextImplPtr SrcCtx = Rec->MCurContext;
         QueueImplPtr SrcQueue = hostQ;
         if (SrcCtx != hostCtx) {
@@ -2072,36 +2076,50 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
         }
         std::cout << "=== handler === Split step5 PartReq " << CopyReq << " Record: " << Rec << " SrcCtx: " << SrcCtx << " SrcQueue: " << SrcQueue << " is host: " << (SrcCtx == hostCtx ? "true" : "false") << "\n";
 
+        QueueImplPtr MergeQueue = SplitQueues_Write.front();
+        if (SrcCtx != hostCtx && SrcQueue != nullptr) {
+          for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+            if (detail::sameCtx(SplitQueue->getContextImplPtr(), SrcCtx)) {
+              MergeQueue = SplitQueue;
+              break;
+            }
+          }
+        }
+        ContextImplPtr MergeCtx = MergeQueue->getContextImplPtr();
+
+        if (detail::sameCtx(SplitQueues_Write[p]->getContextImplPtr(),
+                            MergeCtx)) {
+          Rec->MCurContext = MergeCtx;
+          std::cout << "=== handler === Split step5 keep partition on merge device\n";
+          continue;
+        }
+
         bool moved_by_p2p = false;
-        if (SrcCtx != hostCtx) {
-          if (SplitQueues_Write[p]->getContextImplPtr() == SrcCtx) {
-            std::cout << "=== handler === Split step5 SplitQueue is SrcQueue, continue\n";
-            continue;
-          }
-          
-          try {
-            EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, SplitQueues_Write[p]);
-            // ev_p2p->wait(ev_p2p);
-            moved_by_p2p = true;
-            std::cout << "=== handler === Split step5 direct D2D success\n";
-          } catch (const std::exception &e) {
-            std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
-          } catch (...) {
-            std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D\n";
-          }
+        try {
+          EventImplPtr ev_p2p =
+              detail::Scheduler::getInstance().addMemoryMove(
+                  CopyReq, MergeQueue, SplitQueues_Write[p]);
+          ev_p2p->wait(ev_p2p);
+          moved_by_p2p = true;
+          std::cout << "=== handler === Split step5 merge direct D2D success\n";
+        } catch (const std::exception &e) {
+          std::cout << "=== handler === Split step5 merge direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+        } catch (...) {
+          std::cout << "=== handler === Split step5 merge direct D2D failed, fallback D2H->H2D\n";
         }
 
         if (!moved_by_p2p) {
           EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(CopyReq, hostQ, SplitQueues_Write[p]);
-          // ev_host->wait(ev_host);
-          std::cout << "=== handler === Split step5 copy back host\n";
+          ev_host->wait(ev_host);
+          std::cout << "=== handler === Split step5 copy partition to host\n";
 
-          if (SrcCtx != hostCtx) {
-            EventImplPtr ev_src = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, hostQ);
-            // ev_src->wait(ev_src);
-            std::cout << "=== handler === Split step5 copy to src device\n";
-          }
+          EventImplPtr ev_merge = detail::Scheduler::getInstance().addMemoryMove(CopyReq, MergeQueue, hostQ);
+          ev_merge->wait(ev_merge);
+          std::cout << "=== handler === Split step5 copy partition to merge device\n";
         }
+
+        Rec->MCurContext = MergeCtx;
+        std::cout << "=== handler === Split step5 current context moved to merge device\n";
       }
     }
 
