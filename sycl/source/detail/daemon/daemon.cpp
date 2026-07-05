@@ -847,7 +847,10 @@ static ComputeCapability inferCpuCapabilityFromName(const std::string &name) {
   }
   if (containsIgnoreCase(name, "xeon") &&
       containsIgnoreCase(name, "gold 6530")) {
-    return ComputeCapability{3.2, 1.6};
+    // Calibrated from fdtd2d_timer_32768 on a6000-docker.
+    // Baseline is Xeon Gold 6530 FP32 kernel-run time: fp32=1.0,
+    // fp64=319.533s/595.512s.
+    return ComputeCapability{1.0, 0.537};
   }
   if (containsIgnoreCase(name, "epyc")) {
     return ComputeCapability{3.0, 1.5};
@@ -864,7 +867,9 @@ static ComputeCapability inferGpuCapabilityFromName(const std::string &name) {
   }
   if (containsIgnoreCase(name, "rtx 6000") &&
       containsIgnoreCase(name, "ada")) {
-    return ComputeCapability{91.0, 1.42};
+    // Calibrated from fdtd2d_timer_32768 on a6000-docker.
+    // fp32=319.533s/28.0602s, fp64=319.533s/57.4197s.
+    return ComputeCapability{11.39, 5.56};
   }
   if (containsIgnoreCase(name, "rtx 4090")) {
     return ComputeCapability{82.6, 1.29};
