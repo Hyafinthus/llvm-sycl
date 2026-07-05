@@ -780,30 +780,15 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
             << " samples " << entry.samples << std::endl;
 }
 
-static bool lookupProfileCost(const std::string &kernel_key, int rank,
-                              int device, int num_parts, double &cost) {
+static bool lookupExactProfileCost(const std::string &kernel_key, int rank,
+                                   int device, int num_parts, double &cost) {
   ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts)};
   auto exact_it = profile_cost_table.find(exact);
-  if (exact_it != profile_cost_table.end()) {
-    cost = exact_it->second.ewma_cost;
-    return true;
+  if (exact_it == profile_cost_table.end()) {
+    return false;
   }
-
-  double sum = 0.0;
-  int samples = 0;
-  for (const auto &entry : profile_cost_table) {
-    if (entry.first.kernel_key == kernel_key &&
-        entry.first.num_parts == std::max(1, num_parts)) {
-      sum += entry.second.ewma_cost * entry.second.samples;
-      samples += entry.second.samples;
-    }
-  }
-  if (samples > 0) {
-    cost = sum / samples;
-    return true;
-  }
-
-  return false;
+  cost = exact_it->second.ewma_cost;
+  return true;
 }
 
 static std::string toLowerAscii(std::string value) {
@@ -1277,6 +1262,42 @@ static double deviceCapability(int rank, int proc, KernelPrecision precision) {
   return precision == KernelPrecision::fp64 ? fallback.fp64 : fallback.fp32;
 }
 
+static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
+                                    int device, int num_parts,
+                                    KernelPrecision precision, double &cost) {
+  if (lookupExactProfileCost(kernel_key, rank, device, num_parts, cost)) {
+    return true;
+  }
+
+  const int parts = std::max(1, num_parts);
+  const double target_capability =
+      std::max(0.1, deviceCapability(rank, device, precision));
+  double weighted_sum = 0.0;
+  int samples = 0;
+
+  for (const auto &entry : profile_cost_table) {
+    const ProfileCostKey &sample_key = entry.first;
+    if (sample_key.kernel_key != kernel_key || sample_key.num_parts != parts) {
+      continue;
+    }
+
+    const double source_capability =
+        std::max(0.1, deviceCapability(sample_key.rank, sample_key.device,
+                                       precision));
+    const double scaled_cost =
+        entry.second.ewma_cost * source_capability / target_capability;
+    weighted_sum += scaled_cost * entry.second.samples;
+    samples += entry.second.samples;
+  }
+
+  if (samples == 0) {
+    return false;
+  }
+
+  cost = weighted_sum / samples;
+  return true;
+}
+
 static double monitorPenalty(int rank, int proc) {
   const MonitorInfo *info = monitorInfoForDevice(rank, proc);
   if (info == nullptr) {
@@ -1306,11 +1327,11 @@ static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
 static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
   double profile_cost = 0.0;
   const std::string key = profileKeyForNode(node);
-  if (lookupProfileCost(key, rank, proc, 1, profile_cost)) {
+  const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
+  if (lookupScaledProfileCost(key, rank, proc, 1, precision, profile_cost)) {
     return std::max(0.001, profile_cost) * monitorPenalty(rank, proc);
   }
 
-  const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
   const double cold_cost = std::max(1.0, node->total_elem) /
                            std::max(0.1, deviceCapability(rank, proc,
                                                           precision));
@@ -1370,14 +1391,15 @@ static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
 
 static double dependencyReadyTimeForDevices(DAGNode *node, int rank,
                                             const std::vector<int> &target_procs) {
-  double ready_time = 0.0;
+  double latest_predecessor_finish = 0.0;
+  double total_comm_cost = 0.0;
   for (DAGNode *pre_node : node->depend_on) {
-    ready_time = std::max(
-        ready_time,
-        pre_node->finish_time +
-            estimateCommCostForDevices(node, pre_node, rank, target_procs));
+    latest_predecessor_finish =
+        std::max(latest_predecessor_finish, pre_node->finish_time);
+    total_comm_cost += estimateCommCostForDevices(node, pre_node, rank,
+                                                  target_procs);
   }
-  return ready_time;
+  return latest_predecessor_finish + total_comm_cost;
 }
 
 static double dependencyReadyTime(DAGNode *node, int rank, int proc) {
@@ -1437,8 +1459,9 @@ static double estimateSplitExecCost(DAGNode *node, int rank,
 
   double profile_cost = 0.0;
   const std::string key = profileKeyForNode(node);
-  if (lookupProfileCost(key, rank, split_devices.front(), num_parts,
-                        profile_cost)) {
+  const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
+  if (lookupScaledProfileCost(key, rank, split_devices.front(), num_parts,
+                              precision, profile_cost)) {
     double penalty = 1.0;
     for (int proc : split_devices) {
       penalty = std::max(penalty, monitorPenalty(rank, proc));
