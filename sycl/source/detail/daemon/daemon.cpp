@@ -690,6 +690,14 @@ struct TaskCandidate {
   std::vector<int> occupied_procs;
 };
 
+struct NodePlacementState {
+  int exec_rank = -1;
+  int exec_proc = -1;
+  int num_parts = 1;
+  double finish_time = 0.0;
+  std::vector<int> split_devices;
+};
+
 static std::string profileKeyForNode(const DAGNode *node) {
   return buildKernelProfileKey(node->req_data);
 }
@@ -789,6 +797,13 @@ static bool lookupExactProfileCost(const std::string &kernel_key, int rank,
   }
   cost = exact_it->second.ewma_cost;
   return true;
+}
+
+static bool hasExactProfileCost(const std::string &kernel_key, int rank,
+                                int device, int num_parts) {
+  double ignored_cost = 0.0;
+  return lookupExactProfileCost(kernel_key, rank, device, num_parts,
+                                ignored_cost);
 }
 
 static std::string toLowerAscii(std::string value) {
@@ -1262,6 +1277,18 @@ static double deviceCapability(int rank, int proc, KernelPrecision precision) {
   return precision == KernelPrecision::fp64 ? fallback.fp64 : fallback.fp32;
 }
 
+static bool rankHasGpuProc(int rank) {
+  return rank >= 0 && rank < static_cast<int>(gpu_available_time.size()) &&
+         gpu_available_time[rank].size() > 1;
+}
+
+static bool isKernelPlacementProc(int rank, int proc) {
+  if (rankHasGpuProc(rank)) {
+    return proc > 0;
+  }
+  return proc == 0;
+}
+
 static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
                                     int device, int num_parts,
                                     KernelPrecision precision, double &cost) {
@@ -1309,6 +1336,11 @@ static double monitorPenalty(int rank, int proc) {
 
 static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
                               int num_parts) {
+  if (proc > 0 &&
+      hasExactProfileCost(profileKeyForNode(node), rank, proc, num_parts)) {
+    return true;
+  }
+
   const MonitorInfo *info = monitorInfoForDevice(rank, proc);
   if (info == nullptr || info->mem_available == 0) {
     return true;
@@ -1492,6 +1524,9 @@ static TaskCandidate makeSingleCandidate(DAGNode *node, int rank, int proc) {
   candidate.num_parts = 1;
   candidate.occupied_procs.push_back(proc);
 
+  if (!isKernelPlacementProc(rank, proc)) {
+    return candidate;
+  }
   if (!monitorMemoryFits(node, rank, proc, 1)) {
     return candidate;
   }
@@ -1502,6 +1537,171 @@ static TaskCandidate makeSingleCandidate(DAGNode *node, int rank, int proc) {
   candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
   candidate.finish_time = candidate.start_time + candidate.exec_cost;
   return candidate;
+}
+
+static TaskCandidate makeSingleCandidateNoMemoryFilter(DAGNode *node, int rank,
+                                                       int proc) {
+  TaskCandidate candidate;
+  candidate.rank = rank;
+  candidate.proc = proc;
+  candidate.num_parts = 1;
+  candidate.occupied_procs.push_back(proc);
+
+  if (!isKernelPlacementProc(rank, proc)) {
+    return candidate;
+  }
+
+  const double device_ready = gpu_available_time[rank][proc];
+  const double dep_ready = dependencyReadyTime(node, rank, proc);
+  candidate.start_time = std::max(device_ready, dep_ready);
+  candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
+  candidate.finish_time = candidate.start_time + candidate.exec_cost;
+  return candidate;
+}
+
+static std::vector<NodePlacementState>
+saveNodePlacementStates(const std::vector<DAGNode *> &nodes) {
+  std::vector<NodePlacementState> states;
+  states.reserve(nodes.size());
+  for (const DAGNode *node : nodes) {
+    states.push_back(NodePlacementState{node->exec_rank, node->exec_proc,
+                                        node->num_parts, node->finish_time,
+                                        node->split_devices});
+  }
+  return states;
+}
+
+static void restoreNodePlacementStates(
+    const std::vector<DAGNode *> &nodes,
+    const std::vector<NodePlacementState> &states) {
+  for (size_t i = 0; i < nodes.size() && i < states.size(); ++i) {
+    DAGNode *node = nodes[i];
+    const NodePlacementState &state = states[i];
+    node->exec_rank = state.exec_rank;
+    node->exec_proc = state.exec_proc;
+    node->num_parts = state.num_parts;
+    node->finish_time = state.finish_time;
+    node->split_devices = state.split_devices;
+  }
+}
+
+static double batchFinishTime(const std::vector<DAGNode *> &nodes) {
+  double finish = 0.0;
+  for (const DAGNode *node : nodes) {
+    finish = std::max(finish, node->finish_time);
+  }
+  return finish;
+}
+
+static std::vector<DAGNode *>
+topologicalOrderForCurrentBatch(const std::vector<DAGNode *> &nodes) {
+  std::vector<DAGNode *> order = reverseTopologicalOrder(nodes);
+  std::reverse(order.begin(), order.end());
+  return order;
+}
+
+static void rebuildKernelSchedInfos(
+    const std::vector<DAGNode *> &order,
+    std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
+  kernel_sched_order_infos.clear();
+  int exec_order = 1;
+  for (DAGNode *node : order) {
+    D2DKernelSchedInfo kernel_sched_info;
+    kernel_sched_info.kernel_count = node->kernel_count;
+    kernel_sched_info.exec_order = exec_order++;
+    kernel_sched_info.exec_rank = node->exec_rank;
+    kernel_sched_info.exec_device = node->exec_proc;
+    kernel_sched_info.num_parts = node->num_parts;
+    kernel_sched_info.split_devices = node->split_devices;
+    kernel_sched_order_infos.push_back(kernel_sched_info);
+  }
+}
+
+static bool applyCoLocatedGpuScheduleIfBetter(
+    const std::vector<DAGNode *> &nodes,
+    const std::vector<NodePlacementState> &initial_node_states,
+    const std::vector<std::vector<double>> &initial_available_time,
+    double heft_finish_time,
+    std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
+  if (nodes.size() < 2) {
+    return false;
+  }
+
+  const std::vector<NodePlacementState> heft_states =
+      saveNodePlacementStates(nodes);
+  const std::vector<std::vector<double>> heft_available_time =
+      gpu_available_time;
+  const std::vector<DAGNode *> topo_order = topologicalOrderForCurrentBatch(nodes);
+  std::vector<NodePlacementState> best_states;
+  std::vector<std::vector<double>> best_available_time;
+  double best_finish_time = std::numeric_limits<double>::infinity();
+
+  for (int rank = 0; rank < static_cast<int>(initial_available_time.size());
+       ++rank) {
+    for (int proc = 1;
+         proc < static_cast<int>(initial_available_time[rank].size());
+         ++proc) {
+      if (!isKernelPlacementProc(rank, proc)) {
+        continue;
+      }
+
+      restoreNodePlacementStates(nodes, initial_node_states);
+      gpu_available_time = initial_available_time;
+
+      bool valid = true;
+      for (DAGNode *node : topo_order) {
+        TaskCandidate candidate =
+            makeSingleCandidateNoMemoryFilter(node, rank, proc);
+        if (!std::isfinite(candidate.finish_time)) {
+          valid = false;
+          break;
+        }
+
+        node->exec_rank = candidate.rank;
+        node->exec_proc = candidate.proc;
+        node->num_parts = candidate.num_parts;
+        node->split_devices = candidate.occupied_procs;
+        node->finish_time = candidate.finish_time;
+        gpu_available_time[rank][proc] = candidate.finish_time;
+      }
+
+      if (!valid) {
+        continue;
+      }
+
+      const double finish_time = batchFinishTime(nodes);
+      if (finish_time < best_finish_time) {
+        best_finish_time = finish_time;
+        best_states = saveNodePlacementStates(nodes);
+        best_available_time = gpu_available_time;
+      }
+    }
+  }
+
+  restoreNodePlacementStates(nodes, initial_node_states);
+  gpu_available_time = initial_available_time;
+
+  if (!std::isfinite(best_finish_time) || best_finish_time >= heft_finish_time) {
+    restoreNodePlacementStates(nodes, heft_states);
+    gpu_available_time = heft_available_time;
+    return false;
+  }
+
+  restoreNodePlacementStates(nodes, best_states);
+  gpu_available_time = best_available_time;
+  rebuildKernelSchedInfos(topo_order, kernel_sched_order_infos);
+
+  std::cout << "algorithmHEFT: co-located GPU batch schedule selected"
+            << " finish_time " << best_finish_time
+            << " previous_heft_finish_time " << heft_finish_time << std::endl;
+  for (DAGNode *node : topo_order) {
+    std::cout << "algorithmHEFT: Kernel " << node->kernel_count
+              << " co-located to Rank " << node->exec_rank
+              << " Proc " << node->exec_proc
+              << " NumParts " << node->num_parts
+              << " finish_time " << node->finish_time << std::endl;
+  }
+  return true;
 }
 
 static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
@@ -1571,7 +1771,8 @@ static double estimateAverageRankCost(DAGNode *node) {
   for (int rank = 0; rank < static_cast<int>(gpu_available_time.size()); ++rank) {
     for (int proc = 0; proc < static_cast<int>(gpu_available_time[rank].size());
          ++proc) {
-      if (monitorMemoryFits(node, rank, proc, 1)) {
+      if (isKernelPlacementProc(rank, proc) &&
+          monitorMemoryFits(node, rank, proc, 1)) {
         sum += estimateSingleExecCost(node, rank, proc);
         count++;
       }
@@ -1596,12 +1797,18 @@ static double estimateAverageCommCost(DAGNode *node, DAGNode *pre_node) {
     for (int src_proc = 0;
          src_proc < static_cast<int>(gpu_available_time[src_rank].size());
          ++src_proc) {
+      if (!isKernelPlacementProc(src_rank, src_proc)) {
+        continue;
+      }
       for (int dst_rank = 0;
            dst_rank < static_cast<int>(gpu_available_time.size());
            ++dst_rank) {
         for (int dst_proc = 0;
              dst_proc < static_cast<int>(gpu_available_time[dst_rank].size());
              ++dst_proc) {
+          if (!isKernelPlacementProc(dst_rank, dst_proc)) {
+            continue;
+          }
           double seconds = 0.0;
           if (src_rank == dst_rank) {
             seconds =
@@ -1679,6 +1886,11 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
     return a->rank_u > b->rank_u;
   });
 
+  const std::vector<NodePlacementState> initial_node_states =
+      saveNodePlacementStates(nodes);
+  const std::vector<std::vector<double>> initial_available_time =
+      gpu_available_time;
+
   // 3.每个任务计算 对于每个proc 计算start_v(p)=max_[last_finish(p),finish(u_1)+comm(u_1,v),...]
   // 和finish_v(p)=start_v(p)+w(v,p)
   // 同时把SNMD split作为候选放置方式，选择earliest_finish_p(v)最小者。
@@ -1705,7 +1917,24 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
     }
 
     if (best_candidate.rank < 0 || best_candidate.proc < 0) {
-      best_candidate = makeSingleCandidate(node, 0, 0);
+      for (int rank = 0; rank < static_cast<int>(gpu_available_time.size()) &&
+                         (best_candidate.rank < 0 ||
+                          best_candidate.proc < 0);
+           rank++) {
+        for (int proc = 0;
+             proc < static_cast<int>(gpu_available_time[rank].size());
+             proc++) {
+          if (!isKernelPlacementProc(rank, proc)) {
+            continue;
+          }
+          best_candidate = makeSingleCandidateNoMemoryFilter(node, rank, proc);
+          break;
+        }
+      }
+    }
+
+    if (best_candidate.rank < 0 || best_candidate.proc < 0) {
+      best_candidate = makeSingleCandidateNoMemoryFilter(node, 0, 0);
     }
 
     node->exec_rank = best_candidate.rank;
@@ -1739,6 +1968,11 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
               << " exec_cost " << best_candidate.exec_cost
               << " finish_time " << node->finish_time << std::endl;
   }
+
+  const double heft_finish_time = batchFinishTime(nodes);
+  applyCoLocatedGpuScheduleIfBetter(nodes, initial_node_states,
+                                    initial_available_time, heft_finish_time,
+                                    kernel_sched_order_infos);
 
   regenerateReqRanksAfterHEFT(nodes, kernel_sched_order_infos);
 
