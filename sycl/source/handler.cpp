@@ -487,12 +487,13 @@ static bool collectOfflineProfilingInfo(
     int WaitCount, const OfflineProfileEvent &ProfileEvent,
     S2DKernelProfileData &ProfileData) {
   try {
-    ProfileEvent.Event.wait();
+    sycl::event ProfileEventCopy = ProfileEvent.Event;
+    ProfileEventCopy.wait();
     uint64_t Start =
-        ProfileEvent.Event.get_profiling_info<
+        ProfileEventCopy.get_profiling_info<
             info::event_profiling::command_start>();
     uint64_t End =
-        ProfileEvent.Event.get_profiling_info<
+        ProfileEventCopy.get_profiling_info<
             info::event_profiling::command_end>();
     uint64_t Duration = End >= Start ? End - Start : 0;
     std::cout << "=== handler === Offline profiling kernel_count: "
