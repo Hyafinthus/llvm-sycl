@@ -762,6 +762,67 @@ static double totalWriteBytes(const DAGNode *node) {
   return bytes;
 }
 
+static double dependentReadBytes(const DAGNode *node) {
+  double bytes = 0.0;
+  std::unordered_set<void *> seen_mem;
+  for (const auto &dep_pair : node->depend_on_mem) {
+    for (const SyclReqData &req : dep_pair.second) {
+      if (!isReadAccess(req.req_accmode)) {
+        continue;
+      }
+      if (seen_mem.insert(req.mem_pointer).second) {
+        bytes += reqBytes(req);
+      }
+    }
+  }
+  return bytes;
+}
+
+static double coldArithmeticIntensityFactor(const DAGNode *node) {
+  if (node->depend_on.empty()) {
+    return 1.0;
+  }
+
+  int read_only_reqs = 0;
+  int write_reqs = 0;
+  double min_req_elems = std::numeric_limits<double>::infinity();
+  double max_req_elems = 0.0;
+  double max_write_elems = 0.0;
+
+  for (const SyclReqData &req : node->req_data) {
+    const bool reads = isReadAccess(req.req_accmode);
+    const bool writes = isWriteAccess(req.req_accmode);
+    if (reads && !writes) {
+      ++read_only_reqs;
+    }
+    if (writes) {
+      ++write_reqs;
+      max_write_elems =
+          std::max(max_write_elems, static_cast<double>(req.buff_size));
+    }
+    if (reads || writes) {
+      const double elems = static_cast<double>(req.buff_size);
+      min_req_elems = std::min(min_req_elems, elems);
+      max_req_elems = std::max(max_req_elems, elems);
+    }
+  }
+
+  if (read_only_reqs < 2 || write_reqs == 0 ||
+      !std::isfinite(min_req_elems) || min_req_elems <= 0.0 ||
+      max_req_elems / min_req_elems > 1.05 ||
+      max_write_elems < 1024.0 * 1024.0) {
+    return 1.0;
+  }
+
+  const double linear_extent = std::sqrt(max_write_elems);
+  return std::max(1.0, std::min(64.0, linear_extent / 256.0));
+}
+
+static double coldWorkElems(const DAGNode *node) {
+  return std::max(1.0, node->total_elem) *
+         coldArithmeticIntensityFactor(node);
+}
+
 static void updateProfileCostTable(const S2DKernelProfileData &profile,
                                    int sample_rank) {
   if (profile.duration_ns == 0 || profile.kernel_key.empty()) {
@@ -1364,7 +1425,7 @@ static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
     return std::max(0.001, profile_cost) * monitorPenalty(rank, proc);
   }
 
-  const double cold_cost = std::max(1.0, node->total_elem) /
+  const double cold_cost = coldWorkElems(node) /
                            std::max(0.1, deviceCapability(rank, proc,
                                                           precision));
   return cold_cost * monitorPenalty(rank, proc);
@@ -1467,7 +1528,8 @@ static double estimateSplitInternalCopyCost(
   }
 
   const int main_proc = split_devices.front();
-  const double read_bytes = totalReadBytes(node);
+  const double read_bytes =
+      std::max(0.0, totalReadBytes(node) - dependentReadBytes(node));
   const double write_part_bytes =
       totalWriteBytes(node) / static_cast<double>(split_devices.size());
 
@@ -1846,6 +1908,12 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
               << " precision: "
               << precisionName(inferKernelPrecisionFromReqs(node->req_data))
               << std::endl;
+    const double cold_intensity = coldArithmeticIntensityFactor(node);
+    if (cold_intensity > 1.0) {
+      std::cout << "algorithmHEFT: Kernel " << node->kernel_count
+                << " cold_arithmetic_intensity_factor: "
+                << cold_intensity << std::endl;
+    }
 
     // 1.2. 计算每个任务需要从各个前序接收多少数据
     for (std::pair<DAGNode *, std::set<SyclReqData>> dep_pair : node->depend_on_mem) {
