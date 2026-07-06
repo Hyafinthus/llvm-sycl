@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <utility>
 
 #include <detail/config.hpp>
 #include <detail/global_handler.hpp>
@@ -213,6 +214,9 @@ static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
   }
   std::cout << " num_parts: " << PM.NumParts << std::endl;
 }
+
+static void finalizeAllPendingOfflineSplits();
+static void clearPendingOfflineSplitState();
 #endif
 
 static void clearOfflineBatch() {
@@ -225,9 +229,11 @@ static void clearOfflineBatch() {
   PM.kernel_reqs.clear();
 #endif
 #ifdef SNMD_OFFLINE
+  finalizeAllPendingOfflineSplits();
   PM.NumParts = 1;
   PM.SplitDevices.clear();
   PM.SplitQueues_Write.clear();
+  clearPendingOfflineSplitState();
 #endif
 }
 
@@ -251,6 +257,219 @@ static uint64_t offlineNowNs() {
       .count();
 }
 
+#ifdef SNMD_OFFLINE
+struct PendingOfflineSplitMerge {
+  int KernelCount = 0;
+  detail::EventImplPtr Event;
+  detail::QueueImplPtr HostQueue;
+  detail::ContextImplPtr HostContext;
+  std::vector<detail::QueueImplPtr> SplitQueues;
+  std::vector<std::vector<detail::Requirement *>> SplitReqsCopy;
+  std::vector<std::unique_ptr<detail::Requirement>> SplitReqOwners;
+  std::vector<detail::SYCLMemObjI *> WrittenMemObjs;
+};
+
+static std::vector<PendingOfflineSplitMerge> &pendingOfflineSplitMerges() {
+  static std::vector<PendingOfflineSplitMerge> PendingSplits;
+  return PendingSplits;
+}
+
+static std::vector<std::pair<int, uint64_t>> &offlineSplitFinalizeTimes() {
+  static std::vector<std::pair<int, uint64_t>> FinalizeTimes;
+  return FinalizeTimes;
+}
+
+static void clearPendingOfflineSplitState() {
+  pendingOfflineSplitMerges().clear();
+  offlineSplitFinalizeTimes().clear();
+}
+
+static void rememberOfflineSplitWrite(PendingOfflineSplitMerge &Pending,
+                                      detail::SYCLMemObjI *MemObj) {
+  if (MemObj == nullptr) {
+    return;
+  }
+  if (std::find(Pending.WrittenMemObjs.begin(), Pending.WrittenMemObjs.end(),
+                MemObj) == Pending.WrittenMemObjs.end()) {
+    Pending.WrittenMemObjs.push_back(MemObj);
+  }
+}
+
+static bool kernelTouchesPendingOfflineSplit(
+    detail::SyclKernelCg *KernelCg, const PendingOfflineSplitMerge &Pending) {
+  if (KernelCg == nullptr || !KernelCg->kernel_cg) {
+    return false;
+  }
+
+  auto *ExecCG =
+      dynamic_cast<detail::CGExecKernel *>(KernelCg->kernel_cg.get());
+  if (ExecCG == nullptr) {
+    return false;
+  }
+
+  for (detail::Requirement *Req : ExecCG->MRequirements) {
+    if (Req == nullptr) {
+      continue;
+    }
+    if (std::find(Pending.WrittenMemObjs.begin(),
+                  Pending.WrittenMemObjs.end(),
+                  Req->MSYCLMemObj) != Pending.WrittenMemObjs.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
+  if (!Pending.Event) {
+    return;
+  }
+
+  std::cout << "=== handler === Split finalize kernel_count: "
+            << Pending.KernelCount << " before wait" << std::endl;
+  Pending.Event->wait(Pending.Event);
+  std::cout << "=== handler === Split finalize kernel_count: "
+            << Pending.KernelCount << " after wait" << std::endl;
+
+  if (Pending.SplitQueues.empty()) {
+    offlineSplitFinalizeTimes().push_back(
+        {Pending.KernelCount, offlineNowNs()});
+    return;
+  }
+
+  for (size_t p = 0; p < Pending.SplitReqsCopy.size(); ++p) {
+    for (detail::Requirement *CopyReq : Pending.SplitReqsCopy[p]) {
+      detail::MemObjRecord *Rec =
+          detail::Scheduler::getInstance().getMemObjRecord(CopyReq);
+      if (Rec == nullptr) {
+        continue;
+      }
+      detail::ContextImplPtr SrcCtx = Rec->MCurContext;
+      detail::QueueImplPtr SrcQueue = Pending.HostQueue;
+      if (SrcCtx != Pending.HostContext) {
+        SrcQueue = nullptr;
+        for (detail::AllocaCommandBase *AllocaCmd : Rec->MAllocaCommands) {
+          if (AllocaCmd->getQueue() != nullptr &&
+              AllocaCmd->getQueue()->getContextImplPtr() == SrcCtx) {
+            SrcQueue = AllocaCmd->getQueue();
+            break;
+          }
+        }
+      }
+      std::cout << "=== handler === Split finalize PartReq " << CopyReq
+                << " Record: " << Rec << " SrcCtx: " << SrcCtx
+                << " SrcQueue: " << SrcQueue << " is host: "
+                << (SrcCtx == Pending.HostContext ? "true" : "false")
+                << std::endl;
+
+      detail::QueueImplPtr MergeQueue = Pending.SplitQueues.front();
+      if (SrcCtx != Pending.HostContext && SrcQueue != nullptr) {
+        for (const detail::QueueImplPtr &SplitQueue : Pending.SplitQueues) {
+          if (detail::sameCtx(SplitQueue->getContextImplPtr(), SrcCtx)) {
+            MergeQueue = SplitQueue;
+            break;
+          }
+        }
+      }
+      detail::ContextImplPtr MergeCtx = MergeQueue->getContextImplPtr();
+
+      if (p < Pending.SplitQueues.size() &&
+          detail::sameCtx(Pending.SplitQueues[p]->getContextImplPtr(),
+                          MergeCtx)) {
+        Rec->MCurContext = MergeCtx;
+        std::cout
+            << "=== handler === Split finalize keep partition on merge device"
+            << std::endl;
+        continue;
+      }
+
+      bool moved_by_p2p = false;
+      if (p < Pending.SplitQueues.size()) {
+        try {
+          detail::EventImplPtr ev_p2p =
+              detail::Scheduler::getInstance().addMemoryMove(
+                  CopyReq, MergeQueue, Pending.SplitQueues[p]);
+          ev_p2p->wait(ev_p2p);
+          moved_by_p2p = true;
+          std::cout
+              << "=== handler === Split finalize merge direct D2D success"
+              << std::endl;
+        } catch (const std::exception &e) {
+          std::cout
+              << "=== handler === Split finalize merge direct D2D failed, "
+              << "fallback D2H->H2D, reason: " << e.what() << std::endl;
+        } catch (...) {
+          std::cout
+              << "=== handler === Split finalize merge direct D2D failed, "
+              << "fallback D2H->H2D" << std::endl;
+        }
+      }
+
+      if (!moved_by_p2p && p < Pending.SplitQueues.size()) {
+        detail::EventImplPtr ev_host =
+            detail::Scheduler::getInstance().addMemoryMove(
+                CopyReq, Pending.HostQueue, Pending.SplitQueues[p]);
+        ev_host->wait(ev_host);
+        std::cout << "=== handler === Split finalize copy partition to host"
+                  << std::endl;
+
+        detail::EventImplPtr ev_merge =
+            detail::Scheduler::getInstance().addMemoryMove(
+                CopyReq, MergeQueue, Pending.HostQueue);
+        ev_merge->wait(ev_merge);
+        std::cout
+            << "=== handler === Split finalize copy partition to merge device"
+            << std::endl;
+      }
+
+      Rec->MCurContext = MergeCtx;
+      std::cout
+          << "=== handler === Split finalize current context moved to merge "
+          << "device" << std::endl;
+    }
+  }
+
+  offlineSplitFinalizeTimes().push_back({Pending.KernelCount, offlineNowNs()});
+}
+
+static void finalizePendingOfflineSplitsForKernel(
+    detail::SyclKernelCg *KernelCg) {
+  std::vector<PendingOfflineSplitMerge> &PendingSplits =
+      pendingOfflineSplitMerges();
+  for (size_t I = 0; I < PendingSplits.size();) {
+    if (kernelTouchesPendingOfflineSplit(KernelCg, PendingSplits[I])) {
+      finalizePendingOfflineSplit(PendingSplits[I]);
+      PendingSplits.erase(PendingSplits.begin() + I);
+    } else {
+      ++I;
+    }
+  }
+}
+
+static void finalizeAllPendingOfflineSplits() {
+  std::vector<PendingOfflineSplitMerge> &PendingSplits =
+      pendingOfflineSplitMerges();
+  for (PendingOfflineSplitMerge &Pending : PendingSplits) {
+    finalizePendingOfflineSplit(Pending);
+  }
+  PendingSplits.clear();
+}
+
+static void applyOfflineSplitFinalizeTimes(
+    std::vector<OfflineProfileEvent> &ProfileEvents) {
+  for (const std::pair<int, uint64_t> &FinalizeTime :
+       offlineSplitFinalizeTimes()) {
+    for (OfflineProfileEvent &ProfileEvent : ProfileEvents) {
+      if (ProfileEvent.KernelCount == FinalizeTime.first &&
+          FinalizeTime.second > ProfileEvent.HostEndNs) {
+        ProfileEvent.HostEndNs = FinalizeTime.second;
+      }
+    }
+  }
+  offlineSplitFinalizeTimes().clear();
+}
+#endif
+
 static void fillOfflineProfileData(int WaitCount,
                                    const OfflineProfileEvent &ProfileEvent,
                                    uint64_t Duration,
@@ -268,6 +487,7 @@ static bool collectOfflineProfilingInfo(
     int WaitCount, const OfflineProfileEvent &ProfileEvent,
     S2DKernelProfileData &ProfileData) {
   try {
+    ProfileEvent.Event.wait();
     uint64_t Start =
         ProfileEvent.Event.get_profiling_info<
             info::event_profiling::command_start>();
@@ -1938,6 +2158,11 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     detail::QueueImplPtr hostQ = Scheduler::getInstance().getDefaultHostQueue();
     auto hostCtx = hostQ->getContextImplPtr();
     std::cout << "=== handler === Split step1 hostQ: " << hostQ << " hostCtx: " << hostCtx << std::endl;
+    PendingOfflineSplitMerge PendingSplit;
+    PendingSplit.KernelCount = sycl_kernel_cg.kernel_count;
+    PendingSplit.HostQueue = hostQ;
+    PendingSplit.HostContext = hostCtx;
+    PendingSplit.SplitQueues = SplitQueues_Write;
 
     // 2
     std::vector<Requirement *> SplitReqs_onlyRead;
@@ -2026,6 +2251,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
         SplitReqs_onlyRead.push_back(Req);
       } else {
         SplitReqs_hasWrite.push_back(Req);
+        rememberOfflineSplitWrite(PendingSplit, Req->MSYCLMemObj);
         range<3> FullRange = Req->MMemoryRange;
         size_t dim0 = FullRange[0];
         size_t chunk = dim0 / NumParts;
@@ -2050,78 +2276,12 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 
     // 4
     detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(std::move(sycl_kernel_cg.kernel_cg), std::move(KernelQueue));
-    std::cout << "=== handler === Split before wait\n";
-    Event->wait(Event);
-    std::cout << "=== handler === Split after wait\n";
-
-    // 5. Merge split writes back to a device context. event::wait() only
-    // synchronizes execution; it must not force data back to host.
-    for (size_t p = 0; p < NumParts; ++p) {
-      for (int i = 0; i < SplitReqs_Copy[p].size(); ++i) {
-        Requirement *CopyReq = SplitReqs_Copy[p][i];
-        MemObjRecord *Rec = detail::Scheduler::getInstance().getMemObjRecord(CopyReq);
-        if (Rec == nullptr) {
-          continue;
-        }
-        ContextImplPtr SrcCtx = Rec->MCurContext;
-        QueueImplPtr SrcQueue = hostQ;
-        if (SrcCtx != hostCtx) {
-          SrcQueue = nullptr;
-          for (AllocaCommandBase *AllocaCmd : Rec->MAllocaCommands) {
-            if (AllocaCmd->getQueue()->getContextImplPtr() == SrcCtx) {
-              SrcQueue = AllocaCmd->getQueue();
-              break;
-            }
-          }
-        }
-        std::cout << "=== handler === Split step5 PartReq " << CopyReq << " Record: " << Rec << " SrcCtx: " << SrcCtx << " SrcQueue: " << SrcQueue << " is host: " << (SrcCtx == hostCtx ? "true" : "false") << "\n";
-
-        QueueImplPtr MergeQueue = SplitQueues_Write.front();
-        if (SrcCtx != hostCtx && SrcQueue != nullptr) {
-          for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
-            if (detail::sameCtx(SplitQueue->getContextImplPtr(), SrcCtx)) {
-              MergeQueue = SplitQueue;
-              break;
-            }
-          }
-        }
-        ContextImplPtr MergeCtx = MergeQueue->getContextImplPtr();
-
-        if (detail::sameCtx(SplitQueues_Write[p]->getContextImplPtr(),
-                            MergeCtx)) {
-          Rec->MCurContext = MergeCtx;
-          std::cout << "=== handler === Split step5 keep partition on merge device\n";
-          continue;
-        }
-
-        bool moved_by_p2p = false;
-        try {
-          EventImplPtr ev_p2p =
-              detail::Scheduler::getInstance().addMemoryMove(
-                  CopyReq, MergeQueue, SplitQueues_Write[p]);
-          ev_p2p->wait(ev_p2p);
-          moved_by_p2p = true;
-          std::cout << "=== handler === Split step5 merge direct D2D success\n";
-        } catch (const std::exception &e) {
-          std::cout << "=== handler === Split step5 merge direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
-        } catch (...) {
-          std::cout << "=== handler === Split step5 merge direct D2D failed, fallback D2H->H2D\n";
-        }
-
-        if (!moved_by_p2p) {
-          EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(CopyReq, hostQ, SplitQueues_Write[p]);
-          ev_host->wait(ev_host);
-          std::cout << "=== handler === Split step5 copy partition to host\n";
-
-          EventImplPtr ev_merge = detail::Scheduler::getInstance().addMemoryMove(CopyReq, MergeQueue, hostQ);
-          ev_merge->wait(ev_merge);
-          std::cout << "=== handler === Split step5 copy partition to merge device\n";
-        }
-
-        Rec->MCurContext = MergeCtx;
-        std::cout << "=== handler === Split step5 current context moved to merge device\n";
-      }
-    }
+    PendingSplit.Event = Event;
+    PendingSplit.SplitReqsCopy = std::move(SplitReqs_Copy);
+    PendingSplit.SplitReqOwners = std::move(SplitReqOwners);
+    pendingOfflineSplitMerges().push_back(std::move(PendingSplit));
+    std::cout << "=== handler === Split submitted async, merge deferred for kernel_count: "
+              << sycl_kernel_cg.kernel_count << std::endl;
 
     std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
     event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
@@ -2159,6 +2319,9 @@ event handler::scheduleOffline() {
   event last_event;
   for (int i = 0; i < kernel_cgs.size(); ++i) {
     detail::SyclKernelCg *sycl_kernel_cg = kernel_cgs.at(i);
+#ifdef SNMD_OFFLINE
+    finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
+#endif
     uint64_t HostStart = offlineNowNs();
     last_event = resubmit(*sycl_kernel_cg);
     uint64_t HostEnd = offlineNowNs();
@@ -2167,6 +2330,10 @@ event handler::scheduleOffline() {
          static_cast<int>(detail::ProgramManager::getInstance().NumParts),
          HostStart, HostEnd, last_event});
   }
+#ifdef SNMD_OFFLINE
+  finalizeAllPendingOfflineSplits();
+  applyOfflineSplitFinalizeTimes(profile_events);
+#endif
   processOfflineProfilingBatch(detail::ProgramManager::getInstance().wait_count,
                                profile_events);
   clearOfflineBatch();
@@ -2308,6 +2475,9 @@ event handler::scheduleOffline() {
       int kernel_count = kernel_exec_info.kernel_count;
       detail::SyclKernelCg *sycl_kernel_cg =
           findOfflineKernelCg(kernel_cgs, kernel_count);
+#ifdef SNMD_OFFLINE
+      finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
+#endif
 
       // **注意** 满足依赖的逻辑仍与online一致
       // 不需要与daemon建立连接 因daemon对所有kernel的依赖都已知
@@ -2423,6 +2593,10 @@ event handler::scheduleOffline() {
         std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
       }
     }
+#ifdef SNMD_OFFLINE
+    finalizeAllPendingOfflineSplits();
+    applyOfflineSplitFinalizeTimes(profile_events);
+#endif
     processOfflineProfilingBatch(daemon_wait_count, profile_events);
     clearOfflineBatch();
     return last_event;
@@ -2549,6 +2723,9 @@ event handler::scheduleOffline() {
       detail::SyclKernelCg *sycl_kernel_cg =
           findOfflineKernelCg(kernel_cgs, kernel_count);
       std::cout << "=== handler === Process " << getpid() << " === kernel_count: " << kernel_count << std::endl;
+#ifdef SNMD_OFFLINE
+      finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
+#endif
 
       // **注意** 满足依赖的逻辑仍与online一致
       // 不需要与daemon建立连接 因daemon对所有kernel的依赖都已知
@@ -2673,6 +2850,10 @@ event handler::scheduleOffline() {
         std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
       }
     }
+#ifdef SNMD_OFFLINE
+    finalizeAllPendingOfflineSplits();
+    applyOfflineSplitFinalizeTimes(profile_events);
+#endif
     processOfflineProfilingBatch(daemon_wait_count, profile_events);
     clearOfflineBatch();
     return last_event;
