@@ -1219,6 +1219,7 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
       size_t &NumParts = PM.NumParts;
       if (NumParts == 0) throw runtime_error("NumParts == 0", PI_ERROR_INVALID_VALUE);
       if (NumParts != PM.SplitQueues_Write.size()) throw runtime_error("SplitQueues_Write != NumParts", PI_ERROR_INVALID_VALUE);
+      PM.SplitEvents.clear();
 
       const NDRDescT &OldNDR = TemplateEK->MNDRDesc;
       const size_t dim0 = OldNDR.GlobalSize[0];
@@ -1284,37 +1285,26 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
 
         std::cout << "=== graph_builder.cpp === Split after graph part " << p
                   << "\n";
+        PM.SplitEvents.push_back(SplitCmdRaw->getEvent());
         SplitCmds.push_back(SplitCmdRaw);
         SplitCmdOwners.push_back(std::move(SplitCmd));
       }
 
-      // 4. 创建joinCmd 不能用addEmptyCmd 会设锁
-      auto Join = std::make_unique<EmptyCommand>(Scheduler::getInstance().getDefaultHostQueue());
-      if (!Join) throw runtime_error("Out of host memory", PI_ERROR_OUT_OF_HOST_MEMORY);
+      // Enqueue split ExecCGCommands directly. A host EmptyCommand join would
+      // wait for its dependencies during enqueue and serialize later
+      // independent split kernels. The handler owns the logical join and waits
+      // on PM.SplitEvents only before a dependent consumer or the batch end.
+      for (size_t I = 0; I + 1 < SplitCmds.size(); ++I)
+        ToEnqueue.push_back(SplitCmds[I]);
 
-      EmptyCommand *JoinRaw = Join.get();
-      std::vector<Command *> JoinToCleanUp;
-
-      // 同时依赖所有分片ExecCGCmd
-      for (ExecCGCommand *SplitCmd : SplitCmds) {
-        if (Command *Conn = JoinRaw->addDep(SplitCmd->getEvent(), JoinToCleanUp))
-          ToEnqueue.push_back(Conn);
-      }
-
-      for (Command *C : JoinToCleanUp)
-        cleanupCommand(C);
-
-      std::cout << "=== graph_builder.cpp === Split after join\n";
-
-      // CHECKED createGraphForSplitCommand已经加入图 不用再加入ToEnqueue
-      // ToEnqueue.push_back(Cmd0Raw);
-      // ToEnqueue.push_back(Cmd1Raw);
-
-      // 5. 转移所有权并返回JoinEvent给scheduler和handler
+      // 5. 转移所有权并返回最后一个split event给scheduler和handler
       for (auto &Cmd : SplitCmdOwners)
         Cmd.release();
-      auto JoinEvent = JoinRaw->getEvent();
-      return {Join.release(), JoinEvent, true};
+      EventImplPtr SplitEvent = PM.SplitEvents.empty()
+                                    ? nullptr
+                                    : PM.SplitEvents.back();
+      return {SplitCmds.empty() ? nullptr : SplitCmds.back(), SplitEvent,
+              true};
     }
 
     PM.NumParts = 1;

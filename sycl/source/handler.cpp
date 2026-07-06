@@ -195,6 +195,7 @@ static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
   auto &PM = detail::ProgramManager::getInstance();
   PM.NumParts = 1;
   PM.SplitDevices.clear();
+  PM.SplitEvents.clear();
 
   if (KernelExecInfo.num_parts <= 1) {
     return;
@@ -233,6 +234,7 @@ static void clearOfflineBatch() {
   PM.NumParts = 1;
   PM.SplitDevices.clear();
   PM.SplitQueues_Write.clear();
+  PM.SplitEvents.clear();
   clearPendingOfflineSplitState();
 #endif
 }
@@ -261,6 +263,7 @@ static uint64_t offlineNowNs() {
 struct PendingOfflineSplitMerge {
   int KernelCount = 0;
   detail::EventImplPtr Event;
+  std::vector<detail::EventImplPtr> Events;
   detail::QueueImplPtr HostQueue;
   detail::ContextImplPtr HostContext;
   std::vector<detail::QueueImplPtr> SplitQueues;
@@ -321,13 +324,21 @@ static bool kernelTouchesPendingOfflineSplit(
 }
 
 static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
-  if (!Pending.Event) {
+  if (!Pending.Event && Pending.Events.empty()) {
     return;
   }
 
   std::cout << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " before wait" << std::endl;
-  Pending.Event->wait(Pending.Event);
+  if (!Pending.Events.empty()) {
+    for (const detail::EventImplPtr &Event : Pending.Events) {
+      if (Event) {
+        Event->wait(Event);
+      }
+    }
+  } else {
+    Pending.Event->wait(Pending.Event);
+  }
   std::cout << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " after wait" << std::endl;
 
@@ -2278,6 +2289,10 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     // 4
     detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(std::move(sycl_kernel_cg.kernel_cg), std::move(KernelQueue));
     PendingSplit.Event = Event;
+    PendingSplit.Events = PM.SplitEvents;
+    if (PendingSplit.Events.empty() && Event) {
+      PendingSplit.Events.push_back(Event);
+    }
     PendingSplit.SplitReqsCopy = std::move(SplitReqs_Copy);
     PendingSplit.SplitReqOwners = std::move(SplitReqOwners);
     pendingOfflineSplitMerges().push_back(std::move(PendingSplit));
