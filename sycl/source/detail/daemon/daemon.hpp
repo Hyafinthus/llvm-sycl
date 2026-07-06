@@ -491,6 +491,7 @@ struct DAGNode { // 一个kernel的依赖关系
   std::map<SyclReqData, DAGNode *> depend_on_node; // 依赖的mem在哪个node上
 
   double total_elem = 0; // 本节点所有要计算的req的数据量
+  int batch_root_count = 0; // 当前wait批次中无前驱kernel的数量
   std::map<DAGNode *, double> comm_elem; // 本节点从不同前序需要通信的数据量(从depend_on_mem计算)
   double rank_u = 0; // 本节点计算出的rank_u
   double finish_time = 0; // 在HEFT中记录

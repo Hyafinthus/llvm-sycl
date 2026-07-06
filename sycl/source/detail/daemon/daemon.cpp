@@ -779,7 +779,7 @@ static double dependentReadBytes(const DAGNode *node) {
 }
 
 static double coldArithmeticIntensityFactor(const DAGNode *node) {
-  if (node->depend_on.empty()) {
+  if (node->depend_on.empty() && node->batch_root_count > 1) {
     return 1.0;
   }
 
@@ -1894,6 +1894,16 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
   // 根据当前monitor得到每个rank的设备数量、归一化算力和初始可用时间。
   // 0号设备固定是CPU，后续编号保持和handler端globalDevices一致。
   ensureOfflineDeviceModel();
+
+  int batch_root_count = 0;
+  for (DAGNode *node : nodes) {
+    if (node->depend_on.empty()) {
+      ++batch_root_count;
+    }
+  }
+  for (DAGNode *node : nodes) {
+    node->batch_root_count = batch_root_count;
+  }
 
   // 1.根据(规模+monitor)生成执行时间表 对于每个任务t_i计算w(i) 以及任务在不同proc上时各个pre的传输代价
   for (DAGNode *node : nodes) {
