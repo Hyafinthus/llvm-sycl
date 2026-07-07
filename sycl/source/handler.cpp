@@ -93,18 +93,18 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
     detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(
         Device, detail::queue_impl::getDefaultOrNew(Device),
         OldQueue->getAsyncHandler(), ProfilingProps);
-    std::cout << "=== handler === Offline profiling queue created, profiling: "
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling queue created, profiling: "
               << NewQueue->has_property<property::queue::enable_profiling>()
               << " in_order: "
               << NewQueue->has_property<property::queue::in_order>()
               << std::endl;
     return NewQueue;
   } catch (const std::exception &e) {
-    std::cout << "=== handler === Offline profiling queue creation failed: "
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling queue creation failed: "
               << e.what() << ". Fallback to original queue properties."
               << std::endl;
   } catch (...) {
-    std::cout << "=== handler === Offline profiling queue creation failed. "
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling queue creation failed. "
               << "Fallback to original queue properties." << std::endl;
   }
 
@@ -145,7 +145,7 @@ static int clampOfflineDeviceIndex(int RequestedDeviceIndex) {
   const int ClampedDeviceIndex =
       std::min(std::max(RequestedDeviceIndex, 0),
                static_cast<int>(Devices.size()) - 1);
-  std::cout << "=== handler === Offline device_index out of range: requested "
+  HANDLER_TRACE_STREAM << "=== handler === Offline device_index out of range: requested "
             << RequestedDeviceIndex << " available " << Devices.size()
             << ", use " << ClampedDeviceIndex << std::endl;
   return ClampedDeviceIndex;
@@ -209,11 +209,11 @@ static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
   }
 
   PM.NumParts = PM.SplitDevices.size();
-  std::cout << "=== handler === Offline split devices:";
+  HANDLER_TRACE_STREAM << "=== handler === Offline split devices:";
   for (int DeviceIndex : PM.SplitDevices) {
-    std::cout << " " << DeviceIndex;
+    HANDLER_TRACE_STREAM << " " << DeviceIndex;
   }
-  std::cout << " num_parts: " << PM.NumParts << std::endl;
+  HANDLER_TRACE_STREAM << " num_parts: " << PM.NumParts << std::endl;
 }
 
 static void finalizeAllPendingOfflineSplits();
@@ -328,7 +328,7 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
     return;
   }
 
-  std::cout << "=== handler === Split finalize kernel_count: "
+  HANDLER_TRACE_STREAM << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " before wait" << std::endl;
   if (!Pending.Events.empty()) {
     for (const detail::EventImplPtr &Event : Pending.Events) {
@@ -339,7 +339,7 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   } else {
     Pending.Event->wait(Pending.Event);
   }
-  std::cout << "=== handler === Split finalize kernel_count: "
+  HANDLER_TRACE_STREAM << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " after wait" << std::endl;
 
   if (Pending.SplitQueues.empty()) {
@@ -367,7 +367,7 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
           }
         }
       }
-      std::cout << "=== handler === Split finalize PartReq " << CopyReq
+      HANDLER_TRACE_STREAM << "=== handler === Split finalize PartReq " << CopyReq
                 << " Record: " << Rec << " SrcCtx: " << SrcCtx
                 << " SrcQueue: " << SrcQueue << " is host: "
                 << (SrcCtx == Pending.HostContext ? "true" : "false")
@@ -388,7 +388,7 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
           detail::sameCtx(Pending.SplitQueues[p]->getContextImplPtr(),
                           MergeCtx)) {
         Rec->MCurContext = MergeCtx;
-        std::cout
+        HANDLER_TRACE_STREAM
             << "=== handler === Split finalize keep partition on merge device"
             << std::endl;
         continue;
@@ -402,15 +402,15 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
                   CopyReq, MergeQueue, Pending.SplitQueues[p]);
           ev_p2p->wait(ev_p2p);
           moved_by_p2p = true;
-          std::cout
+          HANDLER_TRACE_STREAM
               << "=== handler === Split finalize merge direct D2D success"
               << std::endl;
         } catch (const std::exception &e) {
-          std::cout
+          HANDLER_TRACE_STREAM
               << "=== handler === Split finalize merge direct D2D failed, "
               << "fallback D2H->H2D, reason: " << e.what() << std::endl;
         } catch (...) {
-          std::cout
+          HANDLER_TRACE_STREAM
               << "=== handler === Split finalize merge direct D2D failed, "
               << "fallback D2H->H2D" << std::endl;
         }
@@ -421,20 +421,20 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
             detail::Scheduler::getInstance().addMemoryMove(
                 CopyReq, Pending.HostQueue, Pending.SplitQueues[p]);
         ev_host->wait(ev_host);
-        std::cout << "=== handler === Split finalize copy partition to host"
+        HANDLER_TRACE_STREAM << "=== handler === Split finalize copy partition to host"
                   << std::endl;
 
         detail::EventImplPtr ev_merge =
             detail::Scheduler::getInstance().addMemoryMove(
                 CopyReq, MergeQueue, Pending.HostQueue);
         ev_merge->wait(ev_merge);
-        std::cout
+        HANDLER_TRACE_STREAM
             << "=== handler === Split finalize copy partition to merge device"
             << std::endl;
       }
 
       Rec->MCurContext = MergeCtx;
-      std::cout
+      HANDLER_TRACE_STREAM
           << "=== handler === Split finalize current context moved to merge "
           << "device" << std::endl;
     }
@@ -507,7 +507,7 @@ static bool collectOfflineProfilingInfo(
         ProfileEventCopy.get_profiling_info<
             info::event_profiling::command_end>();
     uint64_t Duration = End >= Start ? End - Start : 0;
-    std::cout << "=== handler === Offline profiling kernel_count: "
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling kernel_count: "
               << ProfileEvent.KernelCount << " device_index: "
               << ProfileEvent.DeviceIndex << " num_parts: "
               << ProfileEvent.NumParts << " start_ns: " << Start
@@ -517,17 +517,17 @@ static bool collectOfflineProfilingInfo(
     fillOfflineProfileData(WaitCount, ProfileEvent, Duration, ProfileData);
     return Duration > 0;
   } catch (const std::exception &e) {
-    std::cout << "=== handler === Offline profiling unavailable for kernel_count: "
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling unavailable for kernel_count: "
               << ProfileEvent.KernelCount << " reason: " << e.what()
               << std::endl;
   } catch (...) {
-    std::cout << "=== handler === Offline profiling unavailable for kernel_count: "
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling unavailable for kernel_count: "
               << ProfileEvent.KernelCount << std::endl;
   }
 
   if (ProfileEvent.HostEndNs > ProfileEvent.HostStartNs) {
     uint64_t Duration = ProfileEvent.HostEndNs - ProfileEvent.HostStartNs;
-    std::cout << "=== handler === Offline profiling host fallback kernel_count: "
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling host fallback kernel_count: "
               << ProfileEvent.KernelCount << " device_index: "
               << ProfileEvent.DeviceIndex << " num_parts: "
               << ProfileEvent.NumParts << " duration_ns: " << Duration
@@ -557,11 +557,11 @@ static void processOfflineProfilingBatch(
                   0) == -1) {
         perror("Error: Offline profiling mq_send failed");
       } else {
-        std::cout << "=== handler === Offline profiling sent samples: "
+        HANDLER_TRACE_STREAM << "=== handler === Offline profiling sent samples: "
                   << Batch.profiles.size() << std::endl;
       }
     } else {
-      std::cout << "=== handler === Offline profiling message too large: "
+      HANDLER_TRACE_STREAM << "=== handler === Offline profiling message too large: "
                 << SerializedData.size() << std::endl;
     }
   }
@@ -694,7 +694,7 @@ event handler::finalize() {
           size_t message_size = serialized_data.size();
 
           mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
-          std::cout << getpid() << " === handler === Process " << getpid() << " === Scale mq_send kernel_req_data" << std::endl;
+          HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === Scale mq_send kernel_req_data" << std::endl;
         }
       
         {
@@ -706,12 +706,12 @@ event handler::finalize() {
               EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
               hostEvent->wait(hostEvent);
               delete hostReq;
-              std::cout << getpid() << " === handler === test_mem ==== Scale receiver add host acc" << std::endl;
+              HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Scale receiver add host acc" << std::endl;
 
               using DATA_TYPE = std::byte;
               size_t elem_size = Req->MElemSize;
               size_t buff_size = Req->MMemoryRange.size();
-              std::cout << getpid() << " === handler === test_mem ==== Scale receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+              HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Scale receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
               SYCLMemObjI *MemObj = Req->MSYCLMemObj;
               SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -721,10 +721,10 @@ event handler::finalize() {
               std::vector<DATA_TYPE> host_data(elem_size * buff_size);
               SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
               readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
-              std::cout << getpid() << " === handler === test_mem ==== Scale data read successfully." << std::endl;
+              HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Scale data read successfully." << std::endl;
               cleanupSharedMemory(handle, elem_size * buff_size);
               std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
-              std::cout << getpid() << " === handler === Scale mem copy" << std::endl;
+              HANDLER_TRACE_STREAM << getpid() << " === handler === Scale mem copy" << std::endl;
             }
           }
         }
@@ -734,7 +734,7 @@ event handler::finalize() {
       {
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(detail::ProgramManager::getInstance().scale_device);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-        std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
         MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
       }
     }
@@ -771,7 +771,7 @@ event handler::finalize() {
         size_t message_size = serialized_data.size();
 
         mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
-        std::cout << getpid() << " === handler === Process " << getpid() << " === mq_send kernel_req_data" << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === mq_send kernel_req_data" << std::endl;
       }
 
       // ====【接收daemon执行决策】
@@ -792,10 +792,10 @@ event handler::finalize() {
           daemon_scale_count = kernel_exec_info.scale_count;
           detail::ProgramManager::getInstance().scale_device =
               clampOfflineDeviceIndex(kernel_exec_info.device_index);
-          std::cout << getpid() << " === handler === Process " << getpid() << " === scale_count: " << daemon_scale_count << " device_index: " << kernel_exec_info.device_index << std::endl;
+          HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === scale_count: " << daemon_scale_count << " device_index: " << kernel_exec_info.device_index << std::endl;
           return MLastEvent;
         } else {
-          std::cout << getpid() << " === handler === Process " << getpid() << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count << " exec: " << kernel_exec_info.exec << " device_index: " << kernel_exec_info.device_index << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
+          HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count << " exec: " << kernel_exec_info.exec << " device_index: " << kernel_exec_info.device_index << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       }
 
@@ -809,12 +809,12 @@ event handler::finalize() {
             EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
             hostEvent->wait(hostEvent);
             delete hostReq;
-            std::cout << getpid() << " === handler === test_mem ==== Scale sender add host acc" << std::endl;
+            HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Scale sender add host acc" << std::endl;
 
             using DATA_TYPE = std::byte;
             size_t elem_size = Req->MElemSize;
             size_t buff_size = Req->MMemoryRange.size();
-            std::cout << getpid() << " === handler === test_mem ==== Scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+            HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
             SYCLMemObjI *MemObj = Req->MSYCLMemObj;
             SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -823,11 +823,11 @@ event handler::finalize() {
 
             SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
             writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
-            std::cout << getpid() << " === handler === Scale send host data" << std::endl;
+            HANDLER_TRACE_STREAM << getpid() << " === handler === Scale send host data" << std::endl;
 
             waitForReadCompletion(handle);
             cleanupSharedMemory(handle, elem_size * buff_size);
-            std::cout << getpid() << " === handler === Scale waitForReadCompletion" << std::endl;
+            HANDLER_TRACE_STREAM << getpid() << " === handler === Scale waitForReadCompletion" << std::endl;
           }
         }
         return MLastEvent; // 提供完不执行要返回
@@ -836,7 +836,7 @@ event handler::finalize() {
       // ====【处理kernel的依赖数据】scale完就不需要走这段流程
       else {
         if (daemon_kernel_count != kernel_exec_info.kernel_count) {
-          std::cout << getpid() << " === handler === Process " << getpid() << " === kernel count not match" << std::endl;
+          HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === kernel count not match" << std::endl;
           exit(1);
         }
         auto &req_counts = kernel_exec_info.req_counts;
@@ -851,12 +851,12 @@ event handler::finalize() {
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << getpid() << " === handler === test_mem ==== sender add host acc" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== sender add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << getpid() << " === handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -865,15 +865,15 @@ event handler::finalize() {
 
                 SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
                 writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
-                std::cout << getpid() << " === handler === send host data" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === send host data" << std::endl;
 
                 waitForReadCompletion(handle);
                 cleanupSharedMemory(handle, elem_size * buff_size);
-                std::cout << getpid() << " === handler === waitForReadCompletion" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === waitForReadCompletion" << std::endl;
               }
             }
           }
-          std::cout << getpid() << " === handler === kernel_count: " << daemon_kernel_count << " MLastEvent: " << &MLastEvent << std::endl;
+          HANDLER_TRACE_STREAM << getpid() << " === handler === kernel_count: " << daemon_kernel_count << " MLastEvent: " << &MLastEvent << std::endl;
           return MLastEvent;
         }
         // 如果执行 需要等待可能的通信数据 也需要host 被用的时候再从host->device
@@ -887,12 +887,12 @@ event handler::finalize() {
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -902,11 +902,11 @@ event handler::finalize() {
                 std::vector<DATA_TYPE> host_data(elem_size * buff_size);
                 SharedMemoryHandle handle = initSharedMemory(kernel_req_data.pid, daemon_kernel_count, daemon_req_count, elem_size * buff_size);
                 readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
-                std::cout << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
                 cleanupSharedMemory(handle, elem_size * buff_size);
                 std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
 
-                std::cout << getpid() << " === handler === mem copy" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === mem copy" << std::endl;
               }
             }
           }
@@ -919,7 +919,7 @@ event handler::finalize() {
             clampOfflineDeviceIndex(kernel_exec_info.device_index);
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-        std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
         MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
       }
     }
@@ -961,11 +961,11 @@ event handler::finalize() {
     }
     kernel_reqs.push_back(kernel_req_data);
 
-    std::cout << "=== handler === Process " << getpid() << " === set sycl_kernel_cg: " << detail::ProgramManager::getInstance().kernel_count << " MQueue: " << MQueue << " MRequirements: " << MRequirements.size() << " -";
+    HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === set sycl_kernel_cg: " << detail::ProgramManager::getInstance().kernel_count << " MQueue: " << MQueue << " MRequirements: " << MRequirements.size() << " -";
     for (Requirement *req : MRequirements) {
-      std::cout << " " << req->MSYCLMemObj;
+      HANDLER_TRACE_STREAM << " " << req->MSYCLMemObj;
     }
-    std::cout << " MEvents: " << MEvents.size() << std::endl;  
+    HANDLER_TRACE_STREAM << " MEvents: " << MEvents.size() << std::endl;
   }
 #endif
 
@@ -986,7 +986,7 @@ event handler::finalize() {
       // graph_builder里用Mrequirements和MEvents构建依赖图
       detail::combineAccessModesOfReqs(MRequirements);
       std::vector<Command *> ToEnqueue; // scheduler.cpp中的AuxiliaryCmds
-      std::cout << getpid() << " === handler === BEFORE REQS" << std::endl;
+      HANDLER_TRACE_STREAM << getpid() << " === handler === BEFORE REQS" << std::endl;
 
       // 在gloabal_handler初始化时获取所有device，并循环判断如果使用每个device的queue会造成几次数据移动
       for (device tempD : detail::ProgramManager::getInstance().globalDevices) {
@@ -994,7 +994,7 @@ event handler::finalize() {
         MQueue.reset(new detail::queue_impl(tempDP, detail::queue_impl::getDefaultOrNew(tempDP), MQueue->getAsyncHandler(), MQueue->getPropList()));
         int notSameCtxCount = 0;
 
-        std::cout << getpid() << " === handler === TRY: " << tempD.get_info<info::device::name>() << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === TRY: " << tempD.get_info<info::device::name>() << std::endl;
         for (Requirement *Req : MRequirements) {
           // Req->MAccessMode
           MemObjRecord *record = nullptr;
@@ -1007,7 +1007,7 @@ event handler::finalize() {
           // MemObjRecord *Record = getMemObjRecord(MemObject);
           //                      = MemObject->MRecord.get();
           record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
-          std::cout << getpid() << " === handler === test_mem ==== record: " << record << std::endl;
+          HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== record: " << record << std::endl;
 
           // 不清楚具体逻辑 不需要
           // detail::Scheduler::getInstance().MGraphBuilder.markModifiedIfWrite(record, Req);
@@ -1022,12 +1022,12 @@ event handler::finalize() {
             notSameCtxCount++;
           }
         }
-        std::cout << getpid() << " === handler === notSameCtx: " << notSameCtxCount << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === notSameCtx: " << notSameCtxCount << std::endl;
       }
     }
 #endif
   for (device d : detail::ProgramManager::getInstance().globalDevices) {
-    std::cout << getpid() << " === handler === Process " << getpid() << " === global_device cpu: " << d.is_cpu() << " gpu: " << d.is_gpu() << " acc: " << d.is_accelerator() << std::endl;
+    HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === global_device cpu: " << d.is_cpu() << " gpu: " << d.is_gpu() << " acc: " << d.is_accelerator() << std::endl;
   }
 
   // 应被替换为运行时调度设备选择
@@ -1057,7 +1057,7 @@ event handler::finalize() {
   // }
 
   detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
-  std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
+  HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
   // MQueue->rebindDevice(dp);
   MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
 
@@ -1082,8 +1082,8 @@ event handler::finalize() {
         // std::cout << getpid() << " === handler === req 1"<< std::endl;
         // 获取的就是内存需求 对应数组
         record = detail::Scheduler::getInstance().MGraphBuilder.getOrInsertMemObjRecord(MQueue, Req, ToEnqueue);
-        std::cout << getpid() << " === handler === test_mem ==== record: " << record << std::endl;
-        std::cout << getpid() << " === handler === test_mem ==== memobj: " << Req->MSYCLMemObj << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== record: " << record << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== memobj: " << Req->MSYCLMemObj << std::endl;
 
         if (detail::ProgramManager::getInstance().kernel_count == 3) {
           // std::cout << getpid() << " === handler === test_mem ==== kernel count 3" << std::endl;
@@ -1106,7 +1106,7 @@ event handler::finalize() {
             delete hostReq;
             // 会导致notSameCtx 不知道是否是删除了device上的数据？下次就要再加载进device？未测试
 
-            std::cout << getpid() << " === handler === test_mem ==== add host acc" << std::endl;
+            HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== add host acc" << std::endl;
 
             // 尝试直接获取用户的数据指针
             using DATA_TYPE = float;
@@ -1121,7 +1121,7 @@ event handler::finalize() {
               }
               std::cerr << std::endl;
             }
-            std::cout << getpid() << " === handler === test_mem ==== get user ptr" << std::endl;
+            HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== get user ptr" << std::endl;
           }
         }
         
@@ -1131,7 +1131,7 @@ event handler::finalize() {
           notSameCtxCount++;
         }
       }
-      std::cout << getpid() << " === handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
+      HANDLER_TRACE_STREAM << getpid() << " === handler === REBIND === notSameCtx: " << notSameCtxCount << std::endl;
     }    
   }
 #endif
@@ -1145,7 +1145,7 @@ event handler::finalize() {
   if (cmdType == detail::CG::Kernel) {
     auto &PM = detail::ProgramManager::getInstance();
     PM.kernel_count++;
-    std::cout << "=== handler === kernel_count: " << PM.kernel_count << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === kernel_count: " << PM.kernel_count << std::endl;
     detail::combineAccessModesOfReqs(MRequirements);
 
     // CHECKED 测试完毕 ===【获取Req实际数据指针】
@@ -1167,7 +1167,7 @@ event handler::finalize() {
     // ===【REBIND】
     device d = PM.globalDevices.at(1);
     detail::DeviceImplPtr dp = detail::getSyclObjImpl(d);
-    std::cout << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
+    HANDLER_TRACE_STREAM << getpid() << " === handler === Process " << getpid() << " === rebind_device is_gpu: " << d.is_gpu() << std::endl;
     MQueue.reset(new detail::queue_impl(dp, detail::queue_impl::getDefaultOrNew(dp), MQueue->getAsyncHandler(), MQueue->getPropertyList()));
 
     // ===【SPLIT】
@@ -1243,9 +1243,9 @@ event handler::finalize() {
         MemObjRecord *ReqRecord = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req) : nullptr;
         ContextImplPtr ReqCurCtx = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req)->MCurContext : hostCtx;
         if (ReqCurCtx != hostCtx) {
-          std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx not host\n";
+          HANDLER_TRACE_STREAM << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx not host\n";
         } else {
-          std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx is host\n";
+          HANDLER_TRACE_STREAM << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx is host\n";
         }
 
         // 3.1【有读/只写 只用来处理 数据移动】
@@ -1260,12 +1260,12 @@ event handler::finalize() {
                 break;
               }
             }
-            std::cout << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
+            HANDLER_TRACE_STREAM << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
           }
 
           for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
             if (ReqCurCtx != hostCtx && SplitQueue->getContextImplPtr() == ReqCurCtx) {
-              std::cout << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
               continue;
             }
 
@@ -1275,11 +1275,11 @@ event handler::finalize() {
                 EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, SrcQueue);
                 ev_p2p->wait(ev_p2p);
                 moved_by_p2p = true;
-                std::cout << "=== handler === Split step3 direct D2D success\n";
+                HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D success\n";
               } catch (const std::exception &e) {
-                std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+                HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
               } catch (...) {
-                std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
+                HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
               }
             }
 
@@ -1287,12 +1287,12 @@ event handler::finalize() {
               if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
                 EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SrcQueue);
                 ev_host->wait(ev_host);
-                std::cout << "=== handler === Split step3 copy back host\n";
+                HANDLER_TRACE_STREAM << "=== handler === Split step3 copy back host\n";
               }
 
               EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
               ev_split->wait(ev_split);
-              std::cout << "=== handler === Split step3 copy to split device\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step3 copy to split device\n";
             }
           }
         }
@@ -1323,7 +1323,7 @@ event handler::finalize() {
             size_t begin0 = p * chunk;
             size_t end0 = (p + 1 == NumParts) ? (dim0) : (begin0 + chunk);
             size_t part0 = end0 - begin0;
-            std::cout << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
+            HANDLER_TRACE_STREAM << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
 
             Requirement *CopyReq = new Requirement(*Req);
             CopyReq->MOffset = id<3>(begin0, 0, 0);
@@ -1592,9 +1592,9 @@ event handler::finalize() {
       detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
           std::move(CommandGroup), MQueue);
 
-      std::cout << "=== handler === Split before wait\n";
+      HANDLER_TRACE_STREAM << "=== handler === Split before wait\n";
       Event->wait(Event);
-      std::cout << "=== handler === Split after wait\n";
+      HANDLER_TRACE_STREAM << "=== handler === Split after wait\n";
 
       // CHECKED 测试完毕 在addMemMove前验证G的host是否都为初始化的0值
       // for (size_t p = 0; p < NumParts; ++p) {
@@ -1648,12 +1648,12 @@ event handler::finalize() {
               }
             }
           }
-          std::cout << "=== handler === Split step5 PartReq " << CopyReq << " Record: " << Rec << " SrcCtx: " << SrcCtx << " SrcQueue: " << SrcQueue << " is host: " << (SrcCtx == hostCtx ? "true" : "false") << "\n";
+          HANDLER_TRACE_STREAM << "=== handler === Split step5 PartReq " << CopyReq << " Record: " << Rec << " SrcCtx: " << SrcCtx << " SrcQueue: " << SrcQueue << " is host: " << (SrcCtx == hostCtx ? "true" : "false") << "\n";
 
           bool moved_by_p2p = false;
           if (SrcCtx != hostCtx) {
             if (SplitQueues_Write[p]->getContextImplPtr() == SrcCtx) {
-              std::cout << "=== handler === Split step5 SplitQueue is SrcQueue, continue\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step5 SplitQueue is SrcQueue, continue\n";
               continue;
             }
             
@@ -1661,23 +1661,23 @@ event handler::finalize() {
               EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, SplitQueues_Write[p]);
               ev_p2p->wait(ev_p2p);
               moved_by_p2p = true;
-              std::cout << "=== handler === Split step5 direct D2D success\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step5 direct D2D success\n";
             } catch (const std::exception &e) {
-              std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
             } catch (...) {
-              std::cout << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step5 direct D2D failed, fallback D2H->H2D\n";
             }
           }
 
           if (!moved_by_p2p) {
             EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(CopyReq, hostQ, SplitQueues_Write[p]);
             ev_host->wait(ev_host);
-            std::cout << "=== handler === Split step5 copy back host\n";
+            HANDLER_TRACE_STREAM << "=== handler === Split step5 copy back host\n";
 
             if (SrcCtx != hostCtx) {
               EventImplPtr ev_src = detail::Scheduler::getInstance().addMemoryMove(CopyReq, SrcQueue, hostQ);
               ev_src->wait(ev_src);
-              std::cout << "=== handler === Split step5 copy to src device\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step5 copy to src device\n";
             }
           }
 
@@ -1746,7 +1746,7 @@ event handler::finalize() {
     if (detail::ProgramManager::getInstance().kernel_count == 3) {
       auto &NDR = MNDRDesc;
 
-      std::cout << "=== handler === [K3] before split: Dims = "
+      HANDLER_TRACE_STREAM << "=== handler === [K3] before split: Dims = "
                 << NDR.Dims
                 << " GlobalSize = {"
                 << NDR.GlobalSize[0] << ", "
@@ -1773,7 +1773,7 @@ event handler::finalize() {
         NDR.GlobalSize[0]   = len;
         NDR.GlobalOffset[0] = NDR.GlobalOffset[0] + begin;  // 原来是 0 就等于 begin
 
-        std::cout << "=== handler === [K3] after split: "
+        HANDLER_TRACE_STREAM << "=== handler === [K3] after split: "
                   << "rows [" << begin << ", " << end << ") of original range\n"
                   << "New GlobalSize[0] = " << NDR.GlobalSize[0]
                   << " New Offset[0] = " << NDR.GlobalOffset[0] << "\n";
@@ -1797,7 +1797,7 @@ event handler::finalize() {
     // kernel_bundle主要用于用户控制kernel的编译和链接
     if (KernelBundleImpPtr) {
       #ifdef PRINT_TRACE
-      std::cout << "======handler.cpp KernelBundleImpPtr" << std::endl;
+      HANDLER_TRACE_STREAM << "======handler.cpp KernelBundleImpPtr" << std::endl;
       #endif
       // Make sure implicit non-interop kernel bundles have the kernel
       if (!KernelBundleImpPtr->isInterop() &&
@@ -1906,7 +1906,7 @@ event handler::finalize() {
 
       if (DiscardEvent) {
         #ifdef PRINT_TRACE
-        std::cout << "======handler.cpp DiscardEvent" << std::endl;
+        HANDLER_TRACE_STREAM << "======handler.cpp DiscardEvent" << std::endl;
         #endif
         if (PI_SUCCESS != EnqueueKernel())
           throw runtime_error("Enqueue process failed.",
@@ -2055,7 +2055,7 @@ event handler::finalize() {
   }
   case detail::CG::None:
     if (detail::pi::trace(detail::pi::TraceLevel::PI_TRACE_ALL)) {
-      std::cout << "WARNING: An empty command group is submitted." << std::endl;
+      HANDLER_TRACE_STREAM << "WARNING: An empty command group is submitted." << std::endl;
     }
     detail::EventImplPtr Event = std::make_shared<sycl::detail::event_impl>();
     MLastEvent = detail::createSyclObjFromImpl<event>(Event);
@@ -2069,7 +2069,7 @@ event handler::finalize() {
   }
 
   #ifdef PRINT_TRACE
-  std::cout << "======handler.cpp === type: " << type << " req: " << MRequirements.size() << " queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
+  HANDLER_TRACE_STREAM << "======handler.cpp === type: " << type << " req: " << MRequirements.size() << " queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
   #endif
 
 
@@ -2092,7 +2092,7 @@ event handler::finalize() {
   MLastEvent = detail::createSyclObjFromImpl<event>(Event);
 
   #ifdef PRINT_TRACE
-  std::cout << "======handler.cpp after === queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
+  HANDLER_TRACE_STREAM << "======handler.cpp after === queue: " << MQueue << " event: " << MEvents.size() << " lastevent: " << &MLastEvent << std::endl;
   #endif
 
   return MLastEvent;
@@ -2129,7 +2129,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     for (int DeviceIndex : SplitDevices) {
       if (DeviceIndex <= 0 ||
           DeviceIndex >= static_cast<int>(PM.globalDevices.size())) {
-        std::cout << "=== handler === Split device_index out of range: "
+        HANDLER_TRACE_STREAM << "=== handler === Split device_index out of range: "
                   << DeviceIndex << std::endl;
         continue;
       }
@@ -2139,7 +2139,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       }
     }
     if (ValidSplitDevices.size() < NumParts) {
-      std::cout << "=== handler === Split NumParts clamped from "
+      HANDLER_TRACE_STREAM << "=== handler === Split NumParts clamped from "
                 << NumParts << " to " << ValidSplitDevices.size()
                 << std::endl;
       NumParts = ValidSplitDevices.size();
@@ -2161,7 +2161,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     }
 
     if (AdjustedParts != NumParts) {
-      std::cout << "=== handler === Split NumParts adjusted from "
+      HANDLER_TRACE_STREAM << "=== handler === Split NumParts adjusted from "
                 << NumParts << " to " << AdjustedParts
                 << " for global_size0: " << SplitDim0 << std::endl;
       NumParts = AdjustedParts;
@@ -2177,7 +2177,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   }
 
   if (NumParts > 1) {
-    std::cout << "=== handler === Split NumParts: " << NumParts << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Split NumParts: " << NumParts << std::endl;
 
     // 1
     std::vector<detail::QueueImplPtr> &SplitQueues_Write = PM.SplitQueues_Write;
@@ -2189,12 +2189,12 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       std::shared_ptr<detail::queue_impl> SplitQueue =
           makeOfflineProfilingQueue(SplitDP, KernelQueue);
       SplitQueues_Write.push_back(SplitQueue);
-      std::cout << "=== handler === Split part " << p
+      HANDLER_TRACE_STREAM << "=== handler === Split part " << p
                 << " uses device_index: " << SplitDeviceIndex << std::endl;
     }
     detail::QueueImplPtr hostQ = Scheduler::getInstance().getDefaultHostQueue();
     auto hostCtx = hostQ->getContextImplPtr();
-    std::cout << "=== handler === Split step1 hostQ: " << hostQ << " hostCtx: " << hostCtx << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Split step1 hostQ: " << hostQ << " hostCtx: " << hostCtx << std::endl;
     PendingOfflineSplitMerge PendingSplit;
     PendingSplit.KernelCount = sycl_kernel_cg.kernel_count;
     PendingSplit.HostQueue = hostQ;
@@ -2207,7 +2207,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     std::vector<std::vector<Requirement*>> SplitReqs_Copy;
     std::vector<std::unique_ptr<Requirement>> SplitReqOwners;
     SplitReqs_Copy.resize(NumParts);
-    std::cout << "=== handler === Split step2 SplitReqs_Copy resized to NumParts: " << NumParts << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Split step2 SplitReqs_Copy resized to NumParts: " << NumParts << std::endl;
 
     // 3
     for (Requirement *Req : KernelReqs) {
@@ -2221,9 +2221,9 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       MemObjRecord *ReqRecord = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req) : nullptr;
       ContextImplPtr ReqCurCtx = isRecorded ? detail::Scheduler::getInstance().getMemObjRecord(Req)->MCurContext : hostCtx;
       if (ReqCurCtx != hostCtx) {
-        std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx not host\n";
+        HANDLER_TRACE_STREAM << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx not host\n";
       } else {
-        std::cout << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx is host\n";
+        HANDLER_TRACE_STREAM << " === handler === Split step3 Req:" << Req << "->" << Req->MSYCLMemObj << " CurCtx is host\n";
       }
 
       // 3.1
@@ -2237,12 +2237,12 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
               break;
             }
           }
-          std::cout << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
+          HANDLER_TRACE_STREAM << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
         }
 
         for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
           if (ReqCurCtx != hostCtx && SplitQueue->getContextImplPtr() == ReqCurCtx) {
-            std::cout << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
+            HANDLER_TRACE_STREAM << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
             continue;
           }
 
@@ -2252,11 +2252,11 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
               EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, SrcQueue);
               ev_p2p->wait(ev_p2p);
               moved_by_p2p = true;
-              std::cout << "=== handler === Split step3 direct D2D success\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D success\n";
             } catch (const std::exception &e) {
-              std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
             } catch (...) {
-              std::cout << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
             }
           }
 
@@ -2264,12 +2264,12 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
             if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
               EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SrcQueue);
               ev_host->wait(ev_host);
-              std::cout << "=== handler === Split step3 copy back host\n";
+              HANDLER_TRACE_STREAM << "=== handler === Split step3 copy back host\n";
             }
 
             EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
             ev_split->wait(ev_split);
-            std::cout << "=== handler === Split step3 copy to split device\n";
+            HANDLER_TRACE_STREAM << "=== handler === Split step3 copy to split device\n";
           }
         }
       } else {
@@ -2296,7 +2296,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
           size_t begin0 = p * chunk;
           size_t end0 = (p + 1 == NumParts) ? (dim0) : (begin0 + chunk);
           size_t part0 = end0 - begin0;
-          std::cout << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
+          HANDLER_TRACE_STREAM << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
 
           auto CopyReqOwner = std::make_unique<Requirement>(*Req);
           Requirement *CopyReq = CopyReqOwner.get();
@@ -2309,7 +2309,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
         }
       }
     }
-    std::cout << "=== handler === Split step3 onlyRead: " << SplitReqs_onlyRead.size() << " hasWrite: " << SplitReqs_hasWrite.size() << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Split step3 onlyRead: " << SplitReqs_onlyRead.size() << " hasWrite: " << SplitReqs_hasWrite.size() << std::endl;
 
     // 4
     detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(std::move(sycl_kernel_cg.kernel_cg), std::move(KernelQueue));
@@ -2321,24 +2321,24 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     PendingSplit.SplitReqsCopy = std::move(SplitReqs_Copy);
     PendingSplit.SplitReqOwners = std::move(SplitReqOwners);
     pendingOfflineSplitMerges().push_back(std::move(PendingSplit));
-    std::cout << "=== handler === Split submitted async, merge deferred for kernel_count: "
+    HANDLER_TRACE_STREAM << "=== handler === Split submitted async, merge deferred for kernel_count: "
               << sycl_kernel_cg.kernel_count << std::endl;
 
-    std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
+    HANDLER_TRACE_STREAM << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
     event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
     return MLastEvent;
   }
   else {
     NumParts = 1;
-    std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
+    HANDLER_TRACE_STREAM << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
     
 #if !defined(SCHEDULE_OFFLINE)
     std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg.kernel_queue;
     device exec_device = PM.globalDevices.at(1);
     detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-    std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
     kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
-    std::cout << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
 #endif
 
     detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(std::move(sycl_kernel_cg.kernel_cg), std::move(sycl_kernel_cg.kernel_queue));
@@ -2352,7 +2352,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 // event::wait()调用此函数
 event handler::scheduleOffline() {
   std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
-  std::cout << "=== handler === Process " << getpid() << " scheduleOffline kernel_cgs.size: " << kernel_cgs.size() << std::endl;
+  HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " scheduleOffline kernel_cgs.size: " << kernel_cgs.size() << std::endl;
   if (kernel_cgs.empty()) {
     return event{};
   }
@@ -2388,7 +2388,7 @@ event handler::scheduleOffline() {
 #ifdef SCHEDULE_OFFLINE
 #if !defined(SNMD_OFFLINE)
 event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
-  std::cout << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
+  HANDLER_TRACE_STREAM << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
   detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
       std::move(sycl_kernel_cg.kernel_cg), std::move(sycl_kernel_cg.kernel_queue));
   event MLastEvent = detail::createSyclObjFromImpl<event>(Event);
@@ -2404,7 +2404,7 @@ event handler::scheduleOffline() {
   using namespace sycl::detail;
   // **注意** 一组kernel只调用一次
   if (detail::ProgramManager::getInstance().kernel_cgs.empty()) {
-    std::cout << "=== handler === Process " << getpid()
+    HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
               << " === scheduleOffline empty batch" << std::endl;
     return event{};
   }
@@ -2432,17 +2432,17 @@ event handler::scheduleOffline() {
   std::vector<OfflineProfileEvent> profile_events;
   event last_event;
 
-  std::cout << "=== handler === Process " << getpid() << " === daemon_wait_count: " << daemon_wait_count << " daemon_scale_count: " << daemon_scale_count << std::endl;
+  HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === daemon_wait_count: " << daemon_wait_count << " daemon_scale_count: " << daemon_scale_count << std::endl;
 
   // 除了第一次扩容后的的后续扩容 即跳过前几个wait
   if (daemon_wait_count < daemon_scale_count) {
-    std::cout << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " skip first wait" << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " skip first wait" << std::endl;
     event empty;
     clearOfflineBatch();
     return empty;
   }
   else if (daemon_wait_count == daemon_scale_count) {
-    std::cout << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " first wait" << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " first wait" << std::endl;
 
     // TODO 要在这里从scale的daemon接收D2S 没有mq_recv
     // 先只考虑初始扩容
@@ -2452,7 +2452,7 @@ event handler::scheduleOffline() {
       char buffer[MAX_MSG_DAEMON_SIZE];
       ssize_t bytes_received = mq_receive(mq_id_program, buffer, MAX_MSG_PROGRAM_SIZE, nullptr);
       
-      std::cout << "=== handler === Process " << getpid() << " === scale mq_receive kernel_exec_infos" << std::endl;
+      HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === scale mq_receive kernel_exec_infos" << std::endl;
 
       if (bytes_received > 0) {
         std::string received_data(buffer, bytes_received);
@@ -2487,16 +2487,16 @@ event handler::scheduleOffline() {
         }
 
         for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
-          std::cout << "=== handler === Process " << getpid()
+          HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
                     << " === scale mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
                     << " exec: " << kernel_exec_info.exec
                     << " device_index: " << kernel_exec_info.device_index
                     << " num_parts: " << kernel_exec_info.num_parts
                     << " split_devices:";
           for (int DeviceIndex : kernel_exec_info.split_devices) {
-            std::cout << " " << DeviceIndex;
+            HANDLER_TRACE_STREAM << " " << DeviceIndex;
           }
-          std::cout
+          HANDLER_TRACE_STREAM
                     << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       } else {
@@ -2511,7 +2511,7 @@ event handler::scheduleOffline() {
     // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
     std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
     for (int exec_num = 0; exec_num < kernel_exec_infos.size(); exec_num++) {
-      std::cout << "=== handler === Process " << getpid() << " === scale commDepend exec_num: " << exec_num << std::endl;
+      HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === scale commDepend exec_num: " << exec_num << std::endl;
       D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
       int kernel_count = kernel_exec_info.kernel_count;
       detail::SyclKernelCg *sycl_kernel_cg =
@@ -2529,11 +2529,11 @@ event handler::scheduleOffline() {
         if (!kernel_exec_info.exec) {
           if (req_counts.size() > 0) {
             for (int i = 0; i < sycl_kernel_cg->kernel_cg->MRequirements.size(); i++) {
-              std::cout << getpid() << " === handler === scale kernel_count: " << kernel_count << " req_counts.size(): " << req_counts.size();
+              HANDLER_TRACE_STREAM << getpid() << " === handler === scale kernel_count: " << kernel_count << " req_counts.size(): " << req_counts.size();
               for (int req_count : req_counts) {
-                std::cout << " " << req_count;
+                HANDLER_TRACE_STREAM << " " << req_count;
               }
-              std::cout << std::endl;
+              HANDLER_TRACE_STREAM << std::endl;
 
               int daemon_req_count = i + 1;
               Requirement *Req = sycl_kernel_cg->kernel_cg->MRequirements[i];
@@ -2542,12 +2542,12 @@ event handler::scheduleOffline() {
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << getpid() << " === handler === test_mem ==== scale sender add host acc" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== scale sender add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << getpid() << " === handler === test_mem ==== scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== scale sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -2556,15 +2556,15 @@ event handler::scheduleOffline() {
 
                 SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
                 writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
-                std::cout << getpid() << " === handler === scale send host data" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === scale send host data" << std::endl;
 
                 waitForReadCompletion(handle);
                 cleanupSharedMemory(handle, elem_size * buff_size);
-                std::cout << getpid() << " === handler === scale waitForReadCompletion" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === scale waitForReadCompletion" << std::endl;
               }
             }
           }
-          std::cout << getpid() << " === handler === scale kernel_count: " << kernel_count << " end hostacc" << std::endl;
+          HANDLER_TRACE_STREAM << getpid() << " === handler === scale kernel_count: " << kernel_count << " end hostacc" << std::endl;
         }
         else {
           if (req_counts.size() > 0) {
@@ -2576,12 +2576,12 @@ event handler::scheduleOffline() {
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -2591,11 +2591,11 @@ event handler::scheduleOffline() {
                 std::vector<DATA_TYPE> host_data(elem_size * buff_size);
                 SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
                 readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
-                std::cout << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
                 cleanupSharedMemory(handle, elem_size * buff_size);
                 std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
 
-                std::cout << getpid() << " === handler === mem copy" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === mem copy" << std::endl;
               }
             }
           }
@@ -2613,7 +2613,7 @@ event handler::scheduleOffline() {
         std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-        std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
         kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
 
         // resubmit
@@ -2628,10 +2628,10 @@ event handler::scheduleOffline() {
         profile_events.push_back({kernel_count, ActualDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,
                                   HostEnd, last_event});
-        std::cout << "=== handler === Process " << getpid() << " === resubmit kernel: " << kernel_count << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === resubmit kernel: " << kernel_count << std::endl;
       }
       else {
-        std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
       }
     }
 #ifdef SNMD_OFFLINE
@@ -2659,7 +2659,7 @@ event handler::scheduleOffline() {
       size_t message_size = serialized_data.size();
 
       mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
-      std::cout << "=== handler === Process " << getpid() << " === mq_send kernel_req_datas" << std::endl;
+      HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === mq_send kernel_req_datas" << std::endl;
     }
 
     // DONE ====【接收daemon对每个kernel的执行决策】
@@ -2668,7 +2668,7 @@ event handler::scheduleOffline() {
       char buffer[MAX_MSG_DAEMON_SIZE];
       ssize_t bytes_received = mq_receive(mq_id_program, buffer, MAX_MSG_PROGRAM_SIZE, nullptr);
       
-      std::cout << "=== handler === Process " << getpid() << " === mq_receive kernel_exec_infos" << std::endl;
+      HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === mq_receive kernel_exec_infos" << std::endl;
 
       if (bytes_received > 0) {
         std::string received_data(buffer, bytes_received);
@@ -2705,16 +2705,16 @@ event handler::scheduleOffline() {
         }
 
         for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
-          std::cout << "=== handler === Process " << getpid()
+          HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
                     << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
                     << " exec: " << kernel_exec_info.exec
                     << " device_index: " << kernel_exec_info.device_index
                     << " num_parts: " << kernel_exec_info.num_parts
                     << " split_devices:";
           for (int DeviceIndex : kernel_exec_info.split_devices) {
-            std::cout << " " << DeviceIndex;
+            HANDLER_TRACE_STREAM << " " << DeviceIndex;
           }
-          std::cout
+          HANDLER_TRACE_STREAM
                     << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
         }
       } else {
@@ -2732,7 +2732,7 @@ event handler::scheduleOffline() {
       // 全局视图 此时通用流程的daemon不会接收到scale_count
       if (kernel_exec_infos.at(0).scale_count >= 1) {
         daemon_scale_count = kernel_exec_infos.at(0).scale_count;
-        std::cout << "=== handler === Process " << getpid() << " === kernel_exec_info scale_count: " << daemon_scale_count << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === kernel_exec_info scale_count: " << daemon_scale_count << std::endl;
       
         // 只属于被scale的daemon的流程
         // 如果wait_count与scale_count不同 说明不是从第一个wait开始scale 需要跳过第一个走skip分支流程
@@ -2743,7 +2743,7 @@ event handler::scheduleOffline() {
         // 被count==1时scale的daemon: scale_count==1时 不满足 不会执行
         // 被count>1时scale的daemon: 满足 返回跳过第一个
         if (daemon_wait_count != daemon_scale_count) {
-          std::cout << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " skip first wait" << std::endl;
+          HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === wait_count: " << daemon_wait_count << " skip first wait" << std::endl;
           detail::ProgramManager::getInstance().kernel_scale_exec_infos = kernel_exec_infos;
 
           event empty;
@@ -2757,13 +2757,13 @@ event handler::scheduleOffline() {
     // DONE ====【按kernel执行顺序 为每个kernel处理满足依赖 -> rebind -> resubmit】
     // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
     std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
-    std::cout << "=== handler === Process " << getpid() << " === kernel_exec_infos.size(): " << kernel_exec_infos.size() << std::endl;
+    HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === kernel_exec_infos.size(): " << kernel_exec_infos.size() << std::endl;
     for (int exec_num = 0; exec_num < kernel_exec_infos.size(); exec_num++) {
       D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
       int kernel_count = kernel_exec_info.kernel_count;
       detail::SyclKernelCg *sycl_kernel_cg =
           findOfflineKernelCg(kernel_cgs, kernel_count);
-      std::cout << "=== handler === Process " << getpid() << " === kernel_count: " << kernel_count << std::endl;
+      HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === kernel_count: " << kernel_count << std::endl;
 #ifdef SNMD_OFFLINE
       finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
 #endif
@@ -2774,15 +2774,15 @@ event handler::scheduleOffline() {
       // OPTI 并非前置kernel结束后就发给各个rank 因为可能新rank还没启动 暂时不考虑
       {
         auto &req_counts = kernel_exec_info.req_counts;
-        std::cout << "=== handler === Process " << getpid() << " === req_counts.size(): " << req_counts.size() << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === req_counts.size(): " << req_counts.size() << std::endl;
         for (int i = 0; i < req_counts.size(); i++) {
-          std::cout << "=== handler === Process " << getpid() << " === req_counts[" << i << "]: " << req_counts[i] << std::endl;
+          HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === req_counts[" << i << "]: " << req_counts[i] << std::endl;
         }
 
         if (!kernel_exec_info.exec) {
-          std::cout << "=== NOEXEC ===" << std::endl;
+          HANDLER_TRACE_STREAM << "=== NOEXEC ===" << std::endl;
           if (req_counts.size() > 0) {
-            std::cout << "=== NEED SEND SHMEM ===" << std::endl;
+            HANDLER_TRACE_STREAM << "=== NEED SEND SHMEM ===" << std::endl;
             for (int i = 0; i < sycl_kernel_cg->kernel_cg->MRequirements.size(); i++) {
               int daemon_req_count = i + 1;
               Requirement *Req = sycl_kernel_cg->kernel_cg->MRequirements[i];
@@ -2791,12 +2791,12 @@ event handler::scheduleOffline() {
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << getpid() << " === handler === test_mem ==== sender add host acc" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== sender add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << getpid() << " === handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== sender elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -2805,36 +2805,36 @@ event handler::scheduleOffline() {
 
                 SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
                 writeToSharedMemory(handle, DataPtr, elem_size * buff_size);
-                std::cout << getpid() << " === handler === send host data" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === send host data" << std::endl;
 
                 waitForReadCompletion(handle);
                 cleanupSharedMemory(handle, elem_size * buff_size);
-                std::cout << getpid() << " === handler === waitForReadCompletion" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === waitForReadCompletion" << std::endl;
               }
             }
           }
-          std::cout << "=== SEND SHMEM DONE ===" << std::endl;
+          HANDLER_TRACE_STREAM << "=== SEND SHMEM DONE ===" << std::endl;
         }
         else {
-          std::cout << "=== EXEC ===" << std::endl;
+          HANDLER_TRACE_STREAM << "=== EXEC ===" << std::endl;
           if (req_counts.size() > 0) {
-            std::cout << "=== NEED RECV SHMEM ===" << std::endl;
+            HANDLER_TRACE_STREAM << "=== NEED RECV SHMEM ===" << std::endl;
             for (int i = 0; i < sycl_kernel_cg->kernel_cg->MRequirements.size(); i++) {
               int daemon_req_count = i + 1;
               Requirement *Req = sycl_kernel_cg->kernel_cg->MRequirements[i];
-              std::cout << "=== handler === Process " << getpid() << " === daemon_req_count: " << daemon_req_count << " Req: " << Req << std::endl;
+              HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === daemon_req_count: " << daemon_req_count << " Req: " << Req << std::endl;
 
               if ((std::find(req_counts.begin(), req_counts.end(), daemon_req_count) != req_counts.end()) && (Req->MAccessMode == access::mode::read || Req->MAccessMode == access::mode::read_write || Req->MAccessMode == access::mode::atomic)) {
                 Requirement *hostReq = new Requirement(*Req);
                 EventImplPtr hostEvent = detail::Scheduler::getInstance().addHostAccessor(hostReq);
                 hostEvent->wait(hostEvent);
                 delete hostReq;
-                std::cout << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== receiver add host acc" << std::endl;
 
                 using DATA_TYPE = std::byte;
                 size_t elem_size = Req->MElemSize;
                 size_t buff_size = Req->MMemoryRange.size();
-                std::cout << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== receiver elem_size: " << elem_size << " buff_size: " << buff_size << std::endl;
 
                 SYCLMemObjI *MemObj = Req->MSYCLMemObj;
                 SYCLMemObjT *BufferObj = static_cast<SYCLMemObjT *>(MemObj);
@@ -2844,14 +2844,14 @@ event handler::scheduleOffline() {
                 std::vector<DATA_TYPE> host_data(elem_size * buff_size);
                 SharedMemoryHandle handle = initSharedMemory(getpid(), kernel_count, daemon_req_count, elem_size * buff_size);
                 readFromSharedMemory(handle, host_data.data(), elem_size * buff_size);
-                std::cout << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === test_mem ==== Data read successfully." << std::endl;
                 cleanupSharedMemory(handle, elem_size * buff_size);
                 std::memcpy(DataPtr, host_data.data(), elem_size * buff_size);
 
-                std::cout << getpid() << " === handler === mem copy" << std::endl;
+                HANDLER_TRACE_STREAM << getpid() << " === handler === mem copy" << std::endl;
               }
             }
-            std::cout << "=== RECV SHMEM DONE ===" << std::endl;
+            HANDLER_TRACE_STREAM << "=== RECV SHMEM DONE ===" << std::endl;
           }
         }
       }
@@ -2867,9 +2867,9 @@ event handler::scheduleOffline() {
         std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
-        std::cout << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
         kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
-        std::cout << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
 
         // resubmit
         uint64_t HostStart = offlineNowNs();
@@ -2883,12 +2883,12 @@ event handler::scheduleOffline() {
         profile_events.push_back({kernel_count, ActualDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,
                                   HostEnd, last_event});
-        std::cout << getpid() << " === handler === resubmitted kernel: " << kernel_count << std::endl;
+        HANDLER_TRACE_STREAM << getpid() << " === handler === resubmitted kernel: " << kernel_count << std::endl;
         if (exec_num == kernel_exec_infos.size() - 1)
-          std::cout << "=== handler === Process " << getpid() << " === resubmit last kernel: " << kernel_count << std::endl;
+          HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === resubmit last kernel: " << kernel_count << std::endl;
       }
       else {
-        std::cout << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === skip resubmit kernel: " << kernel_count << std::endl;
       }
     }
 #ifdef SNMD_OFFLINE

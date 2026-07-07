@@ -51,7 +51,7 @@ void Scheduler::waitForRecordToFinish(MemObjRecord *Record,
   for (Command *Cmd : Record->MReadLeaves) {
     EnqueueResultT Res;
     #ifdef PRINT_TRACE
-    std::cout << "===scheduler.cpp===1" << std::endl;
+    DAG_TRACE_STREAM << "===scheduler.cpp===1" << std::endl;
     #endif
     bool Enqueued =
         GraphProcessor::enqueueCommand(Cmd, GraphReadLock, Res, ToCleanUp, Cmd);
@@ -67,7 +67,7 @@ void Scheduler::waitForRecordToFinish(MemObjRecord *Record,
   for (Command *Cmd : Record->MWriteLeaves) {
     EnqueueResultT Res;
     #ifdef PRINT_TRACE
-    std::cout << "===scheduler.cpp===2" << std::endl;
+    DAG_TRACE_STREAM << "===scheduler.cpp===2" << std::endl;
     #endif
     bool Enqueued =
         GraphProcessor::enqueueCommand(Cmd, GraphReadLock, Res, ToCleanUp, Cmd);
@@ -83,7 +83,7 @@ void Scheduler::waitForRecordToFinish(MemObjRecord *Record,
     Command *ReleaseCmd = AllocaCmd->getReleaseCmd();
     EnqueueResultT Res;
     #ifdef PRINT_TRACE
-    std::cout << "===scheduler.cpp===3" << std::endl;
+    DAG_TRACE_STREAM << "===scheduler.cpp===3" << std::endl;
     #endif
     bool Enqueued = GraphProcessor::enqueueCommand(ReleaseCmd, GraphReadLock,
                                                    Res, ToCleanUp, ReleaseCmd);
@@ -108,7 +108,7 @@ EventImplPtr Scheduler::addCG(std::unique_ptr<detail::CG> CommandGroup,
   std::vector<StreamImplPtr> Streams;
   std::vector<std::shared_ptr<const void>> AuxiliaryResources;
   #ifdef PRINT_TRACE
-  std::cout << "======scheduler.cpp===addCG: " << Type << std::endl;
+  DAG_TRACE_STREAM << "======scheduler.cpp===addCG: " << Type << std::endl;
   #endif
 
   if (Type == CG::Kernel) {
@@ -203,7 +203,7 @@ void Scheduler::enqueueCommandForCG(EventImplPtr NewEvent,
 
     for (Command *Cmd : AuxiliaryCmds) {
       #ifdef PRINT_TRACE
-      std::cout << "===scheduler.cpp===4" << std::endl;
+      DAG_TRACE_STREAM << "===scheduler.cpp===4" << std::endl;
       #endif
       Enqueued = GraphProcessor::enqueueCommand(Cmd, Lock, Res, ToCleanUp, Cmd,
                                                 Blocking);
@@ -224,7 +224,7 @@ void Scheduler::enqueueCommandForCG(EventImplPtr NewEvent,
       EnqueueResultT Res;
       try {
         #ifdef PRINT_TRACE
-        std::cout << "===scheduler.cpp===5" << std::endl;
+        DAG_TRACE_STREAM << "===scheduler.cpp===5" << std::endl;
         #endif
         bool Enqueued = GraphProcessor::enqueueCommand(
             NewCmd, Lock, Res, ToCleanUp, NewCmd, Blocking);
@@ -254,21 +254,21 @@ void Scheduler::enqueueCommandForCG(EventImplPtr NewEvent,
   // 需要能够获取KernelCG的 DAG-AllocaCmd 或 Args-Ptr
 
   #ifdef PRINT_TRACE
-  std::cout << "\n\n\n\n\nscheduler::addCG==================================" << std::endl;
+  DAG_TRACE_STREAM << "\n\n\n\n\nscheduler::addCG==================================" << std::endl;
   Command * KCmd = static_cast<Command *>(NewEvent->getCommand());
-  std::cout << "Cmd: " << KCmd << std::endl;
+  DAG_TRACE_STREAM << "Cmd: " << KCmd << std::endl;
   for (const DepDesc Dep : KCmd->MDeps) {
-    std::cout << "DepCmd: " << Dep.MDepCommand << std::endl;
-    std::cout << "AllocCmd: " << Dep.MAllocaCmd << std::endl;
+    DAG_TRACE_STREAM << "DepCmd: " << Dep.MDepCommand << std::endl;
+    DAG_TRACE_STREAM << "AllocCmd: " << Dep.MAllocaCmd << std::endl;
     // Requirement = AccessorImplHost
-    std::cout << "Req: " << Dep.MDepRequirement << std::endl;
+    DAG_TRACE_STREAM << "Req: " << Dep.MDepRequirement << std::endl;
     // MemObjRecord 用来存内存元数据
-    std::cout << "Record for Req: " << getMemObjRecord(Dep.MDepRequirement) << std::endl;
+    DAG_TRACE_STREAM << "Record for Req: " << getMemObjRecord(Dep.MDepRequirement) << std::endl;
     // void * AllocCmd成员变量 是不是数据指针？ 应该是的
-    std::cout << "MemAllocation: " << Dep.MAllocaCmd->MMemAllocation << std::endl;
+    DAG_TRACE_STREAM << "MemAllocation: " << Dep.MAllocaCmd->MMemAllocation << std::endl;
   }
   for (const Command * User : KCmd->MUsers) {
-    std::cout << "User: " << User << std::endl;
+    DAG_TRACE_STREAM << "User: " << User << std::endl;
   }
   #endif
 
@@ -316,7 +316,7 @@ EventImplPtr Scheduler::addCopyBack(Requirement *Req) {
 
     for (Command *Cmd : AuxiliaryCmds) {
       #ifdef PRINT_TRACE
-      std::cout << "===scheduler.cpp===6" << std::endl;
+      DAG_TRACE_STREAM << "===scheduler.cpp===6" << std::endl;
       #endif
       Enqueued = GraphProcessor::enqueueCommand(Cmd, Lock, Res, ToCleanUp, Cmd);
       if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
@@ -325,7 +325,7 @@ EventImplPtr Scheduler::addCopyBack(Requirement *Req) {
     }
 
     #ifdef PRINT_TRACE
-    std::cout << "===scheduler.cpp===7" << std::endl;
+    DAG_TRACE_STREAM << "===scheduler.cpp===7" << std::endl;
     #endif
     Enqueued =
         GraphProcessor::enqueueCommand(NewCmd, Lock, Res, ToCleanUp, NewCmd);
@@ -403,7 +403,7 @@ EventImplPtr Scheduler::addHostAccessor(Requirement *Req) {
 
     for (Command *Cmd : AuxiliaryCmds) {
       #ifdef PRINT_TRACE
-      std::cout << "===scheduler.cpp===8" << std::endl;
+      DAG_TRACE_STREAM << "===scheduler.cpp===8" << std::endl;
       #endif
       Enqueued = GraphProcessor::enqueueCommand(Cmd, Lock, Res, ToCleanUp, Cmd);
       if (!Enqueued && EnqueueResultT::SyclEnqueueFailed == Res.MResult)
@@ -413,7 +413,7 @@ EventImplPtr Scheduler::addHostAccessor(Requirement *Req) {
 
     if (Command *NewCmd = static_cast<Command *>(NewCmdEvent->getCommand())) {
       #ifdef PRINT_TRACE
-      std::cout << "===scheduler.cpp===9" << std::endl;
+      DAG_TRACE_STREAM << "===scheduler.cpp===9" << std::endl;
       #endif
       Enqueued =
           GraphProcessor::enqueueCommand(NewCmd, Lock, Res, ToCleanUp, NewCmd);
@@ -446,7 +446,7 @@ EventImplPtr Scheduler::addMemoryMove(Requirement *Req,
     NewCmdEvent = NewCmd->getEvent();
   }
 
-  std::cout << "===scheduler.cpp=== after insertMemoryMove" << std::endl;
+  DAG_TRACE_STREAM << "===scheduler.cpp=== after insertMemoryMove" << std::endl;
 
   std::vector<Command *> ToCleanUp;
   {
@@ -456,7 +456,7 @@ EventImplPtr Scheduler::addMemoryMove(Requirement *Req,
 
     for (Command *Cmd : AuxiliaryCmds) {
       Enqueued = GraphProcessor::enqueueCommand(Cmd, Lock, Res, ToCleanUp, Cmd);
-      std::cout << "===scheduler.cpp=== enqueueCommand for AuxiliaryCmds: " << Cmd << std::endl;
+      DAG_TRACE_STREAM << "===scheduler.cpp=== enqueueCommand for AuxiliaryCmds: " << Cmd << std::endl;
     }
 
     if (Command *NewCmd = static_cast<Command *>(NewCmdEvent->getCommand())) {
@@ -464,7 +464,7 @@ EventImplPtr Scheduler::addMemoryMove(Requirement *Req,
     }
   }
 
-  std::cout << "===scheduler.cpp=== after enqueueCommand" << std::endl;
+  DAG_TRACE_STREAM << "===scheduler.cpp=== after enqueueCommand" << std::endl;
 
   cleanupCommands(ToCleanUp);
   return NewCmdEvent;
@@ -495,7 +495,7 @@ void Scheduler::enqueueLeavesOfReqUnlocked(const Requirement *const Req,
     for (Command *Cmd : Leaves) {
       EnqueueResultT Res;
       #ifdef PRINT_TRACE
-      std::cout << "===scheduler.cpp===10" << std::endl;
+      DAG_TRACE_STREAM << "===scheduler.cpp===10" << std::endl;
       #endif
       bool Enqueued = GraphProcessor::enqueueCommand(Cmd, GraphReadLock, Res,
                                                      ToCleanUp, Cmd);
@@ -518,7 +518,7 @@ void Scheduler::enqueueUnblockedCommands(
       continue;
     EnqueueResultT Res;
     #ifdef PRINT_TRACE
-    std::cout << "===scheduler.cpp===11" << std::endl;
+    DAG_TRACE_STREAM << "===scheduler.cpp===11" << std::endl;
     #endif
     bool Enqueued =
         GraphProcessor::enqueueCommand(Cmd, GraphReadLock, Res, ToCleanUp, Cmd);

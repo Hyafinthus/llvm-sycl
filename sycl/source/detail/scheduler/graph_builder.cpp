@@ -184,13 +184,13 @@ static void printDotRecursive(std::fstream &Stream,
   for (Command *User : Cmd->MUsers) {
     if (User) {
       #if PRINT_DAG
-      std::cout << "--- Alloca Command: " << Cmd << " User Command: " << User << std::endl;
+      DAG_TRACE_STREAM << "--- Alloca Command: " << Cmd << " User Command: " << User << std::endl;
       #endif
       printDotRecursive(Stream, Visited, User);
     }
   }
   #if PRINT_DAG
-  std::cout << "--- before --- printDot: " << Cmd << " (" << typeid(Cmd).name() << ")" << std::endl;
+  DAG_TRACE_STREAM << "--- before --- printDot: " << Cmd << " (" << typeid(Cmd).name() << ")" << std::endl;
   #endif
   Cmd->printDot(Stream);
 }
@@ -214,7 +214,7 @@ void Scheduler::GraphBuilder::printGraphAsDot(const char *ModeName) {
     // 只涉及了AllocaCmd 并没有传入ExecCmd 而是作为AllocaCmd->UserCmd使用
     for (Command *AllocaCmd : MemObject->MRecord->MAllocaCommands) {
       #if PRINT_DAG
-      std::cout << "--- before --- printDotRecursive: " << AllocaCmd << std::endl;
+      DAG_TRACE_STREAM << "--- before --- printDotRecursive: " << AllocaCmd << std::endl;
       #endif
       printDotRecursive(Stream, MVisitedCmds, AllocaCmd);
     }
@@ -236,13 +236,13 @@ MemObjRecord *Scheduler::GraphBuilder::getOrInsertMemObjRecord(
 
   if (nullptr != Record) {
 #if PRINT_TRACE
-    std::cout << "===graph_builder.cpp=== getOrInsertMemObjRecord: record already exists for mem object " << MemObject << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== getOrInsertMemObjRecord: record already exists for mem object " << MemObject << std::endl;
 #endif
     return Record;
   }
 
 #if PRINT_TRACE
-  std::cout << "===graph_builder.cpp=== getOrInsertMemObjRecord: WARNING === create record " << MemObject << std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== getOrInsertMemObjRecord: WARNING === create record " << MemObject << std::endl;
 #endif
 
   const size_t LeafLimit = 8;
@@ -329,7 +329,7 @@ UpdateHostRequirementCommand *Scheduler::GraphBuilder::insertUpdateHostReqCmd(
   AllocaCommandBase *AllocaCmd =
       findAllocaForReq(Record, Req, Queue->getContextImplPtr());
 #if PRINT_TRACE
-  std::cout << "===graph_builder.cpp=== insertUpdateHostReqCmd: Record : " << Record << " AllocaCmd: " << AllocaCmd << std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== insertUpdateHostReqCmd: Record : " << Record << " AllocaCmd: " << AllocaCmd << std::endl;
 #endif
   assert(AllocaCmd && "There must be alloca for requirement!");
   UpdateHostRequirementCommand *UpdateCommand =
@@ -348,7 +348,7 @@ UpdateHostRequirementCommand *Scheduler::GraphBuilder::insertUpdateHostReqCmd(
       ToEnqueue.push_back(ConnCmd);
   }
 #if PRINT_TRACE
-  std::cout << "===graph_builder.cpp=== insertUpdateHostReqCmd: before leaves"<< std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== insertUpdateHostReqCmd: before leaves"<< std::endl;
 #endif
   updateLeaves(Deps, Record, Req->MAccessMode, ToCleanUp);
   addNodeToLeaves(Record, UpdateCommand, Req->MAccessMode, ToEnqueue);
@@ -482,7 +482,7 @@ Command *Scheduler::GraphBuilder::insertMemoryMove(
     std::vector<Command *> &ToEnqueue) {
 
   std::vector<Command *> V1{Record->MWriteLeaves.toVector()};
-  std::cout << "===graph_builder.cpp=== findDepsForReq: MWriteLeaves size1: " << V1.size() << std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== findDepsForReq: MWriteLeaves size1: " << V1.size() << std::endl;
 
   AllocaCommandBase *AllocaCmdDst = getOrCreateAllocaForSplitReq(Record, Req, DstQueue, ToEnqueue);
 
@@ -496,7 +496,7 @@ Command *Scheduler::GraphBuilder::insertMemoryMove(
   // }
 
   std::vector<Command *> V2{Record->MWriteLeaves.toVector()};
-  std::cout << "===graph_builder.cpp=== findDepsForReq: MWriteLeaves size2: " << V2.size() << std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== findDepsForReq: MWriteLeaves size2: " << V2.size() << std::endl;
 
   // NEW: 通过SrcCtx选择源alloca 不使用原逻辑Record->MCurContext
   AllocaCommandBase *AllocaCmdSrc = findAllocaForReq(Record, Req, SrcCtx);
@@ -554,7 +554,7 @@ Command *Scheduler::GraphBuilder::insertMemoryMove(
   // addNodeToLeaves(Record, NewCmd, access::mode::read_write, ToEnqueue);
 
   // CHECKED 目前不存在cleanupCmd
-  std::cout << "===graph_builder.cpp=== ToCleanUp size: " << ToCleanUp.size() << std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== ToCleanUp size: " << ToCleanUp.size() << std::endl;
   for (Command *Cmd : ToCleanUp)
     cleanupCommand(Cmd);
 
@@ -618,7 +618,7 @@ Command *
 Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
                                      std::vector<Command *> &ToEnqueue) {
   #ifdef PRINT_TRACE
-  std::cout << "======graph_build.cpp===addCopyBack" << std::endl;
+  DAG_TRACE_STREAM << "======graph_build.cpp===addCopyBack" << std::endl;
   #endif
 
   QueueImplPtr HostQueue = Scheduler::getInstance().getDefaultHostQueue();
@@ -628,7 +628,7 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
     printGraphAsDot("before_addCopyBack");
 
   #ifdef PRINT_TRACE
-  std::cout << "\n\n\n\n\n";
+  DAG_TRACE_STREAM << "\n\n\n\n\n";
   #endif
 
   // Do nothing if there were no or only read operations with the memory object.
@@ -654,11 +654,11 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
     Command *ConnCmd = MemCpyCmd->addDep(
         DepDesc{Dep, MemCpyCmd->getRequirement(), SrcAllocaCmd}, ToCleanUp);
     #ifdef PRINT_TRACE
-    std::cout << "======graph_build.cpp======MemCpyCmd: " << MemCpyCmd << " Dep: " << Dep << std::endl;
+    DAG_TRACE_STREAM << "======graph_build.cpp======MemCpyCmd: " << MemCpyCmd << " Dep: " << Dep << std::endl;
     #endif
     if (ConnCmd) {
       #ifdef PRINT_TRACE
-      std::cout << " ConnCmd: " << ConnCmd << std::endl;
+      DAG_TRACE_STREAM << " ConnCmd: " << ConnCmd << std::endl;
       #endif
       ToEnqueue.push_back(ConnCmd);
     }
@@ -670,7 +670,7 @@ Scheduler::GraphBuilder::addCopyBack(Requirement *Req,
     cleanupCommand(Cmd);
 
   #ifdef PRINT_TRACE
-  std::cout << "\n\n\n\n\n";
+  DAG_TRACE_STREAM << "\n\n\n\n\n";
   #endif
 
   if (MPrintOptionsArray[AfterAddCopyBack])
@@ -684,7 +684,7 @@ Command *
 Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
                                          std::vector<Command *> &ToEnqueue) {
   #ifdef PRINT_TRACE
-  std::cout << "======graph_build.cpp===addHostAccessor" << std::endl;
+  DAG_TRACE_STREAM << "======graph_build.cpp===addHostAccessor" << std::endl;
   #endif
 
   const QueueImplPtr &HostQueue = getInstance().getDefaultHostQueue();
@@ -694,7 +694,7 @@ Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
     printGraphAsDot("before_addHostAccessor");
 
   #ifdef PRINT_TRACE
-  std::cout << "\n\n\n\n\n";
+  DAG_TRACE_STREAM << "\n\n\n\n\n";
   #endif
 
   markModifiedIfWrite(Record, Req);
@@ -703,17 +703,17 @@ Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
       getOrCreateAllocaForReq(Record, Req, HostQueue, ToEnqueue);
 
 #ifdef PRINT_TRACE
-  std::cout << "===graph_builder.cpp=== addHostAccessor: Record : " << Record << " HostAllocaCmd: " << HostAllocaCmd << std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== addHostAccessor: Record : " << Record << " HostAllocaCmd: " << HostAllocaCmd << std::endl;
 #endif
 
   if (sameCtx(HostAllocaCmd->getQueue()->getContextImplPtr(),
               Record->MCurContext)) {
 #ifdef PRINT_TRACE
-    std::cout << "===graph_builder.cpp=== addHostAccessor sameCtx" << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== addHostAccessor sameCtx" << std::endl;
 #endif
     if (!isAccessModeAllowed(Req->MAccessMode, Record->MHostAccess)) {
 #ifdef PRINT_TRACE
-      std::cout << "===graph_builder.cpp=== addHostAccessor: access mode Required-" << static_cast<int>(Req->MAccessMode) << " not allowed under Current-" << static_cast<int>(Record->MHostAccess) << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp=== addHostAccessor: access mode Required-" << static_cast<int>(Req->MAccessMode) << " not allowed under Current-" << static_cast<int>(Record->MHostAccess) << std::endl;
 #endif
       remapMemoryObject(Record, Req, HostAllocaCmd, ToEnqueue);
     }
@@ -731,7 +731,7 @@ Scheduler::GraphBuilder::addHostAccessor(Requirement *Req,
   Req->MBlockedCmd = EmptyCmd;
 
   #ifdef PRINT_TRACE
-  std::cout << "\n\n\n\n\n";
+  DAG_TRACE_STREAM << "\n\n\n\n\n";
   #endif
 
   if (MPrintOptionsArray[AfterAddHostAcc])
@@ -772,14 +772,14 @@ Scheduler::GraphBuilder::findDepsForReq(MemObjRecord *Record,
   if (!ReadOnlyReq) {
     std::vector<Command *> V{Record->MReadLeaves.toVector()};
 #ifdef PRINT_TRACE
-    std::cout << "===graph_builder.cpp=== findDepsForReq: ReadLeaves size: " << V.size() << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== findDepsForReq: ReadLeaves size: " << V.size() << std::endl;
 #endif
 
     ToAnalyze.insert(ToAnalyze.begin(), V.begin(), V.end());
   }
 
 #ifdef PRINT_TRACE
-  std::cout << "===graph_builder.cpp=== findDepsForReq: ToAnalyze size: " << ToAnalyze.size() << std::endl;
+  DAG_TRACE_STREAM << "===graph_builder.cpp=== findDepsForReq: ToAnalyze size: " << ToAnalyze.size() << std::endl;
 #endif
   while (!ToAnalyze.empty()) {
     Command *DepCmd = ToAnalyze.back();
@@ -884,7 +884,7 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForSplitReq(
   
   // 需要创建一个新的AllocaCmd
   if (!AllocaCmd) {
-    std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq NO ALLOCA: create alloca for req with offset: " << Req->MOffsetInBytes << " size: " << Req->MSYCLMemObj->getSizeInBytes() << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== getOrCreateAllocaForReq NO ALLOCA: create alloca for req with offset: " << Req->MOffsetInBytes << " size: " << Req->MSYCLMemObj->getSizeInBytes() << std::endl;
 
     std::vector<Command *> ToCleanUp;
     const Requirement FullReq(/*Offset*/ {0, 0, 0}, Req->MMemoryRange,
@@ -944,7 +944,7 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
 
   if (!AllocaCmd) {
 #ifdef PRINT_TRACE
-    std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: create alloca for req with offset: " << Req->MOffsetInBytes << " size: " << Req->MSYCLMemObj->getSizeInBytes() << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== getOrCreateAllocaForReq: create alloca for req with offset: " << Req->MOffsetInBytes << " size: " << Req->MSYCLMemObj->getSizeInBytes() << std::endl;
 #endif
     std::vector<Command *> ToCleanUp;
     if (IsSuitableSubReq(Req)) {
@@ -993,7 +993,7 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
           // initialized with user data.
           if (MemObj->hasUserDataPtr()) {
 #ifdef PRINT_TRACE
-            std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: create MAllocaCommands FIRST TIME" << std::endl;
+            DAG_TRACE_STREAM << "===graph_builder.cpp=== getOrCreateAllocaForReq: create MAllocaCommands FIRST TIME" << std::endl;
 #endif
             QueueImplPtr DefaultHostQueue =
                 Scheduler::getInstance().getDefaultHostQueue();
@@ -1033,7 +1033,7 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
                                  : HostUnifiedMemory;
             if (PinnedHostMemory || HostUnifiedMemoryOnNonHostDevice) {
 #ifdef PRINT_TRACE
-              std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: find LINKED AVOID MEMCPY" << std::endl;
+              DAG_TRACE_STREAM << "===graph_builder.cpp=== getOrCreateAllocaForReq: find LINKED AVOID MEMCPY" << std::endl;
 #endif
               AllocaCommandBase *LinkedAllocaCmdCand = findAllocaForReq(
                   Record, Req, Record->MCurContext, /*AllowConst=*/false);
@@ -1053,7 +1053,7 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForReq(
       // Update linked command
       if (LinkedAllocaCmd) {
 #ifdef PRINT_TRACE
-        std::cout << "===graph_builder.cpp=== getOrCreateAllocaForReq: LinkedAllocaCmd" << std::endl;
+        DAG_TRACE_STREAM << "===graph_builder.cpp=== getOrCreateAllocaForReq: LinkedAllocaCmd" << std::endl;
 #endif
         Command *ConnCmd = AllocaCmd->addDep(
             DepDesc{LinkedAllocaCmd, AllocaCmd->getRequirement(),
@@ -1205,8 +1205,8 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
   std::vector<detail::EventImplPtr> &Events = CommandGroup->MEvents;
 
   #ifdef PRINT_TRACE
-  std::cout << "======graph_build.cpp===addCG" << std::endl;
-  std::cout << "======graph_build.cpp === MEvents: " << CommandGroup->MEvents.size() << std::endl;
+  DAG_TRACE_STREAM << "======graph_build.cpp===addCG" << std::endl;
+  DAG_TRACE_STREAM << "======graph_build.cpp === MEvents: " << CommandGroup->MEvents.size() << std::endl;
   #endif
 
 #ifdef SNMD_OFFLINE
@@ -1215,7 +1215,7 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
     auto &PM = detail::ProgramManager::getInstance();
     auto *TemplateEK = static_cast<CGExecKernel *>(CommandGroup.get());
     if (PM.NumParts > 1) {
-      std::cout << "=== graph_builder.cpp === addCG: SPLIT for NumParts: " << PM.NumParts << "\n";
+      DAG_TRACE_STREAM << "=== graph_builder.cpp === addCG: SPLIT for NumParts: " << PM.NumParts << "\n";
       size_t &NumParts = PM.NumParts;
       if (NumParts == 0) throw runtime_error("NumParts == 0", PI_ERROR_INVALID_VALUE);
       if (NumParts != PM.SplitQueues_Write.size()) throw runtime_error("SplitQueues_Write != NumParts", PI_ERROR_INVALID_VALUE);
@@ -1261,7 +1261,7 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
         const size_t end0 = (p + 1 == NumParts) ? dim0 : (begin0 + chunk);
         NewNDR.GlobalOffset[0] = begin0;
         NewNDR.GlobalSize[0] = end0 - begin0;
-        std::cout << "=== graph_builder.cpp === Split CG " << p << ": begin0: " << begin0 << " end0: " << end0 << "\n";
+        DAG_TRACE_STREAM << "=== graph_builder.cpp === Split CG " << p << ": begin0: " << begin0 << " end0: " << end0 << "\n";
 
         std::unique_ptr<CGExecKernel> SplitCG = TemplateEK->cloneForSplit(NewNDR);
         auto SplitCmd = std::make_unique<ExecCGCommand>(std::move(SplitCG), PM.SplitQueues_Write[p]);
@@ -1278,12 +1278,12 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
                   Scheduler::getInstance().getMemObjRecord(Req);
               return Record && sameCtx(Record->MCurContext, SplitCtx);
             });
-        std::cout << "=== graph_builder.cpp === Split CG " << p << ": NewSplit: " << NewSplit << "\n";
+        DAG_TRACE_STREAM << "=== graph_builder.cpp === Split CG " << p << ": NewSplit: " << NewSplit << "\n";
         createGraphForSplitCommand(SplitCmdRaw, SplitCmdRaw->getCG(),
                                    isInteropHostTask(SplitCmdRaw), R, E,
                                    PM.SplitQueues_Write[p], ToEnqueue, NewSplit);
 
-        std::cout << "=== graph_builder.cpp === Split after graph part " << p
+        DAG_TRACE_STREAM << "=== graph_builder.cpp === Split after graph part " << p
                   << "\n";
         PM.SplitEvents.push_back(SplitCmdRaw->getEvent());
         SplitCmds.push_back(SplitCmdRaw);
@@ -1309,7 +1309,7 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
 
     PM.NumParts = 1;
     PM.SplitQueues_Write.clear();
-    std::cout << "=== graph_builder.cpp === addCG: RESET NumParts & SplitQueues_Write\n";
+    DAG_TRACE_STREAM << "=== graph_builder.cpp === addCG: RESET NumParts & SplitQueues_Write\n";
   }
 #endif
 
@@ -1413,7 +1413,7 @@ void Scheduler::GraphBuilder::createGraphForSplitCommand(
       Record = getOrInsertMemObjRecord(QueueForAlloca, Req, ToEnqueue);
       markModifiedIfWrite(Record, Req);
       AllocaCmd = getOrCreateAllocaForReq(Record, Req, QueueForAlloca, ToEnqueue);
-      std::cout << "===graph_builder.cpp=== createGraphForSplitCommand Req: " << Req << " MemObj: " << Req->MSYCLMemObj << " Record: " << Record << " AllocaCmd: " << AllocaCmd << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp=== createGraphForSplitCommand Req: " << Req << " MemObj: " << Req->MSYCLMemObj << " Record: " << Record << " AllocaCmd: " << AllocaCmd << std::endl;
 
       // CHECKED 删除 bool isSameCtx = sameCtx(QueueForAlloca->getContextImplPtr(), Record->MCurContext);
       // 此处跳过sameCtx判断 即不再出现insertMemMove 或各类保证正确的内存移动
@@ -1423,7 +1423,7 @@ void Scheduler::GraphBuilder::createGraphForSplitCommand(
 
     // NewCmd加入DAG是通过寻找DepCmd和增加DepDesc来保证的
     std::set<Command *> Deps = findDepsForReq(Record, Req, Queue->getContextImplPtr());
-    std::cout << "===graph_builder.cpp=== createGraphForSplitCommand->findDepsForReq Deps size: " << Deps.size() << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== createGraphForSplitCommand->findDepsForReq Deps size: " << Deps.size() << std::endl;
 
     // 完全新Split设备 完全由handler控制了Alloca
     // findDepsForReq找到的都是原始(指的是所涉及所有MemObj的Record的)设备上的DepCmd
@@ -1467,7 +1467,7 @@ void Scheduler::GraphBuilder::createGraphForSplitCommand(
   for (DepDesc &Dep : Deps) {
     const Requirement *Req = Dep.MDepRequirement;
     MemObjRecord *Record = getMemObjRecord(Req->MSYCLMemObj);
-    std::cout << "===graph_builder.cpp=== DepCmd: " << Dep.MDepCommand << " Req: " << Req << " Record: " << Record << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== DepCmd: " << Dep.MDepCommand << " Req: " << Req << " Record: " << Record << std::endl;
     updateLeaves({Dep.MDepCommand}, Record, Req->MAccessMode, ToCleanUp);
     addNodeToLeaves(Record, NewCmd, Req->MAccessMode, ToEnqueue);
   }
@@ -1536,23 +1536,23 @@ void Scheduler::GraphBuilder::createGraphForCommand(
       markModifiedIfWrite(Record, Req);
 
 #ifdef PRINT_TRACE
-      std::cout << "===graph_builder.cpp=== before getOrCreateAllocaForReq" << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp=== before getOrCreateAllocaForReq" << std::endl;
 #endif
       AllocaCmd =
           getOrCreateAllocaForReq(Record, Req, QueueForAlloca, ToEnqueue);
 #ifdef PRINT_TRACE
-      std::cout << "===graph_builder.cpp=== after getOrCreateAllocaForReq" << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp=== after getOrCreateAllocaForReq" << std::endl;
 #endif
 
       isSameCtx =
           sameCtx(QueueForAlloca->getContextImplPtr(), Record->MCurContext);
 #ifdef PRINT_TRACE
-      std::cout << "===graph_builder.cpp=== isSameCtx: " << isSameCtx << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp=== isSameCtx: " << isSameCtx << std::endl;
 #endif
     }
 
     #ifdef PRINT_DAG
-    std::cout << "--- before --- after_addCG0" << std::endl;
+    DAG_TRACE_STREAM << "--- before --- after_addCG0" << std::endl;
     if (MPrintOptionsArray[AfterAddCG])
       printGraphAsDot("after_addCG0");
     #endif
@@ -1562,7 +1562,7 @@ void Scheduler::GraphBuilder::createGraphForCommand(
     // required context.
     if (isSameCtx) {
       #ifdef PRINT_DAG
-      std::cout << "===graph_builder.cpp===isSameCtx" << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp===isSameCtx" << std::endl;
       #endif
       // If the memory is already in the required host context, check if the
       // required access mode is valid, remap if not.
@@ -1571,7 +1571,7 @@ void Scheduler::GraphBuilder::createGraphForCommand(
         remapMemoryObject(Record, Req, AllocaCmd, ToEnqueue);
     } else {
       #ifdef PRINT_DAG
-      std::cout << "===graph_builder.cpp===notSameCtx" << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp===notSameCtx" << std::endl;
       #endif
       // Cannot directly copy memory from OpenCL device to OpenCL device -
       // create two copies: device->host and host->device.
@@ -1589,7 +1589,7 @@ void Scheduler::GraphBuilder::createGraphForCommand(
         NeedMemMoveToHost = true;
         // 要执行的不在host上 且最新的在另一个不是host的地方 需要先拷回host
 #ifdef PRINT_TRACE
-      std::cout << "===graph_builder.cpp=== before host queue" << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp=== before host queue" << std::endl;
 #endif
 
       if (NeedMemMoveToHost) {
@@ -1597,17 +1597,17 @@ void Scheduler::GraphBuilder::createGraphForCommand(
                          Scheduler::getInstance().getDefaultHostQueue(),
                          ToEnqueue);
 #ifdef PRINT_TRACE
-        std::cout << "===graph_builder.cpp=== NeedMemMoveToHost" << std::endl;
+        DAG_TRACE_STREAM << "===graph_builder.cpp=== NeedMemMoveToHost" << std::endl;
 #endif
       }
       insertMemoryMove(Record, Req, MemMoveTargetQueue, ToEnqueue);
 #ifdef PRINT_TRACE
-      std::cout << "===graph_builder.cpp=== after target queue" << std::endl;
+      DAG_TRACE_STREAM << "===graph_builder.cpp=== after target queue" << std::endl;
 #endif
     }
 
     #ifdef PRINT_DAG
-    std::cout << "--- before --- after_addCG1" << std::endl;
+    DAG_TRACE_STREAM << "--- before --- after_addCG1" << std::endl;
     if (MPrintOptionsArray[AfterAddCG])
       printGraphAsDot("after_addCG1");
     #endif
@@ -1615,16 +1615,16 @@ void Scheduler::GraphBuilder::createGraphForCommand(
     // 下面是更新图的边 节点就是一个个Cmd 以Deps和Users作为遍历的边
     // 一个Cmd Users是依赖于此Cmd的 Deps是此Cmd依赖的 见commands.hpp
 #ifdef PRINT_TRACE
-    std::cout << "===graph_builder.cpp=== before createGraphForCommand->findDepsForReq" << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== before createGraphForCommand->findDepsForReq" << std::endl;
 #endif
     std::set<Command *> Deps =
         findDepsForReq(Record, Req, Queue->getContextImplPtr());
 #ifdef PRINT_TRACE
-    std::cout << "===graph_builder.cpp=== Deps for Req size: " << Deps.size() << std::endl;
+    DAG_TRACE_STREAM << "===graph_builder.cpp=== Deps for Req size: " << Deps.size() << std::endl;
 #endif
 
     #ifdef PRINT_DAG
-    std::cout << "Deps Size: " << Deps.size() << std::endl;
+    DAG_TRACE_STREAM << "Deps Size: " << Deps.size() << std::endl;
     #endif
 
     // 为图增加边 即A->B CmdA.Dep=CmdB CmdB.User=CmdA
@@ -1639,15 +1639,15 @@ void Scheduler::GraphBuilder::createGraphForCommand(
     }
 
     #ifdef PRINT_DAG
-    std::cout << "--- before --- after_addCG2" << std::endl;
+    DAG_TRACE_STREAM << "--- before --- after_addCG2" << std::endl;
     if (MPrintOptionsArray[AfterAddCG])
       printGraphAsDot("after_addCG2");
     #endif
   }
 
   #ifdef PRINT_DAG
-  std::cout << "\n\n\n\n\n";
-  std::cout << "ExecCmd: " << &NewCmd << std::endl;
+  DAG_TRACE_STREAM << "\n\n\n\n\n";
+  DAG_TRACE_STREAM << "ExecCmd: " << &NewCmd << std::endl;
   #endif
   // " AllCmd1: " << &(NewCmd->MDeps.at(0).MDepCommand)
   // << " AllCmd2: " << &(NewCmd->MDeps.at(1).MDepCommand) << std::endl;
@@ -1661,7 +1661,7 @@ void Scheduler::GraphBuilder::createGraphForCommand(
   std::vector<DepDesc> Deps = NewCmd->MDeps;
 
   #ifdef PRINT_DAG
-  std::cout << "Deps: " << &Deps << " count: " << Deps.size() << std::endl;
+  DAG_TRACE_STREAM << "Deps: " << &Deps << " count: " << Deps.size() << std::endl;
   #endif
 
   // 更新Leaves
@@ -1669,13 +1669,13 @@ void Scheduler::GraphBuilder::createGraphForCommand(
     const Requirement *Req = Dep.MDepRequirement;
     MemObjRecord *Record = getMemObjRecord(Req->MSYCLMemObj);
     #ifdef PRINT_DAG
-    std::cout << "DepCmd: " << Dep.MDepCommand << " Req: " << Req << " Record: " << Record << std::endl;
+    DAG_TRACE_STREAM << "DepCmd: " << Dep.MDepCommand << " Req: " << Req << " Record: " << Record << std::endl;
     #endif
     updateLeaves({Dep.MDepCommand}, Record, Req->MAccessMode, ToCleanUp);
     addNodeToLeaves(Record, NewCmd, Req->MAccessMode, ToEnqueue);
   }
   #ifdef PRINT_DAG
-  std::cout << "\n\n\n\n\n";
+  DAG_TRACE_STREAM << "\n\n\n\n\n";
   #endif
 
   // 不是用户显式制定的依赖 是这个CG的所有前置Event

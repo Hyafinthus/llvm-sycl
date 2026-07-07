@@ -17,6 +17,7 @@
 #include <detail/program_impl.hpp>
 #include <detail/program_manager/program_manager.hpp>
 #include <detail/queue_impl.hpp>
+#include <detail/daemon/define.hpp>
 #include <detail/sampler_impl.hpp>
 #include <detail/scheduler/commands.hpp>
 #include <detail/scheduler/scheduler.hpp>
@@ -730,7 +731,7 @@ Command *Command::addDep(DepDesc NewDep, std::vector<Command *> &ToCleanUp) {
 
   if (NewDep.MDepCommand) {
     #ifdef PRINT_TRACE
-    std::cout << "---Command---MDepCmd: " << NewDep.MDepCommand << std::endl;
+    DAG_TRACE_STREAM << "---Command---MDepCmd: " << NewDep.MDepCommand << std::endl;
     #endif
     ConnectionCmd =
         processDepEvent(NewDep.MDepCommand->getEvent(), NewDep, ToCleanUp);
@@ -743,7 +744,7 @@ Command *Command::addDep(DepDesc NewDep, std::vector<Command *> &ToCleanUp) {
   int mpi_size = GlobalHandler::instance().mpi_size;
   int mpi_rank = GlobalHandler::instance().mpi_rank;
   
-  std::cout << "---Command---addDep---Cmd: " << this << std::endl;
+  DAG_TRACE_STREAM << "---Command---addDep---Cmd: " << this << std::endl;
 
   // addDep很常用 但是有的没有DepCommand
   // 要检查这是个ExecCmd 即this为依赖于kernel2的kernel3
@@ -753,7 +754,7 @@ Command *Command::addDep(DepDesc NewDep, std::vector<Command *> &ToCleanUp) {
       if (mpi_rank == 0) {
         if (NewDep.MDepCommand->kernel_index == 2) {
           MDeps.push_back(DepDesc{nullptr, NewDep.MDepRequirement, NewDep.MAllocaCmd});
-          std::cout << "---Command---createDep---size:" << MDeps.size() << std::endl;
+          DAG_TRACE_STREAM << "---Command---createDep---size:" << MDeps.size() << std::endl;
           return ConnectionCmd;
         }
       } else {
@@ -768,11 +769,11 @@ Command *Command::addDep(DepDesc NewDep, std::vector<Command *> &ToCleanUp) {
   if (!ConnectionCmd) {
     MDeps.push_back(NewDep);
     #ifdef PRINT_TRACE
-    std::cout << "---Command---addDep---size:" << MDeps.size() << std::endl;
+    DAG_TRACE_STREAM << "---Command---addDep---size:" << MDeps.size() << std::endl;
     #endif
     if (NewDep.MDepCommand) {
       #ifdef PRINT_TRACE
-      std::cout << "---Command---addDep---addUser" << std::endl;
+      DAG_TRACE_STREAM << "---Command---addDep---addUser" << std::endl;
       #endif
       NewDep.MDepCommand->addUser(this);
     }
@@ -1091,7 +1092,7 @@ pi_int32 AllocaCommand::enqueueImp() {
   }
 
   #ifdef PRINT_TRACE
-  std::cout << "===commands.cpp===MemoryManager_allocate" << std::endl;
+  DAG_TRACE_STREAM << "===commands.cpp===MemoryManager_allocate" << std::endl;
   #endif
 
   // TODO: Check if it is correct to use std::move on stack variable and
@@ -2175,11 +2176,11 @@ static pi_result SetKernelParamsAndLaunch(
 
       RT::PiMem MemArg = (RT::PiMem)getMemAllocationFunc(Req);
       #ifdef PRINT_KERNEL
-      std::cout << "===kind_accessor" << std::endl;
-      std::cout << "Kernel: " << Kernel << std::endl;
-      std::cout << "NextTrueIndex: " << NextTrueIndex << std::endl;
-      std::cout << "Size: " << sizeof(RT::PiMem) << std::endl;
-      std::cout << "MemArg: " << MemArg << std::endl;
+      DAG_TRACE_STREAM << "===kind_accessor" << std::endl;
+      DAG_TRACE_STREAM << "Kernel: " << Kernel << std::endl;
+      DAG_TRACE_STREAM << "NextTrueIndex: " << NextTrueIndex << std::endl;
+      DAG_TRACE_STREAM << "Size: " << sizeof(RT::PiMem) << std::endl;
+      DAG_TRACE_STREAM << "MemArg: " << MemArg << std::endl;
       #endif
       if (Plugin.getBackend() == backend::opencl) {
         Plugin.call<PiApiKind::piKernelSetArg>(Kernel, NextTrueIndex,
@@ -2192,11 +2193,11 @@ static pi_result SetKernelParamsAndLaunch(
     }
     case kernel_param_kind_t::kind_std_layout: {
       #ifdef PRINT_KERNEL
-      std::cout << "===kind_std_layout" << std::endl;
-      std::cout << "Kernel: " << Kernel << std::endl;
-      std::cout << "NextTrueIndex: " << NextTrueIndex << std::endl;
-      std::cout << "MSize: " << Arg.MSize << std::endl;
-      std::cout << "MPtr: " << Arg.MPtr << std::endl;
+      DAG_TRACE_STREAM << "===kind_std_layout" << std::endl;
+      DAG_TRACE_STREAM << "Kernel: " << Kernel << std::endl;
+      DAG_TRACE_STREAM << "NextTrueIndex: " << NextTrueIndex << std::endl;
+      DAG_TRACE_STREAM << "MSize: " << Arg.MSize << std::endl;
+      DAG_TRACE_STREAM << "MPtr: " << Arg.MPtr << std::endl;
       #endif
       Plugin.call<PiApiKind::piKernelSetArg>(Kernel, NextTrueIndex, Arg.MSize,
                                              Arg.MPtr);
@@ -2264,23 +2265,23 @@ static pi_result SetKernelParamsAndLaunch(
       LocalSize = RequiredWGSize;
   }
   #ifdef PRINT_TRACE
-  std::cout << "SetKernelParamsAndLaunch" << std::endl;
+  DAG_TRACE_STREAM << "SetKernelParamsAndLaunch" << std::endl;
   #endif
   #ifdef PRINT_KERNEL
-  std::cout << "Queue->getHandleRef(): " << Queue->getHandleRef() << std::endl;
-  std::cout << "Kernel: " << Kernel << std::endl;
-  std::cout << "NDRDesc.Dims: " << NDRDesc.Dims << std::endl;
-  std::cout << "NDRDesc.GlobalOffset[0]: " << NDRDesc.GlobalOffset[0] << std::endl;
-  std::cout << "NDRDesc.GlobalSize[0]: " << NDRDesc.GlobalSize[0] << std::endl;
+  DAG_TRACE_STREAM << "Queue->getHandleRef(): " << Queue->getHandleRef() << std::endl;
+  DAG_TRACE_STREAM << "Kernel: " << Kernel << std::endl;
+  DAG_TRACE_STREAM << "NDRDesc.Dims: " << NDRDesc.Dims << std::endl;
+  DAG_TRACE_STREAM << "NDRDesc.GlobalOffset[0]: " << NDRDesc.GlobalOffset[0] << std::endl;
+  DAG_TRACE_STREAM << "NDRDesc.GlobalSize[0]: " << NDRDesc.GlobalSize[0] << std::endl;
   if (LocalSize != nullptr) {
-    std::cout << "LocalSize: " << *LocalSize << std::endl;
+    DAG_TRACE_STREAM << "LocalSize: " << *LocalSize << std::endl;
   } else {
-    std::cout << "LocalSize: nullptr" << std::endl;
+    DAG_TRACE_STREAM << "LocalSize: nullptr" << std::endl;
   }
-  std::cout << "RawEvents.size(): " << RawEvents.size() << std::endl;
-  std::cout << "RawEvents.empty() ? nullptr : &RawEvents[0]: "
+  DAG_TRACE_STREAM << "RawEvents.size(): " << RawEvents.size() << std::endl;
+  DAG_TRACE_STREAM << "RawEvents.empty() ? nullptr : &RawEvents[0]: "
             << (RawEvents.empty() ? nullptr : &RawEvents[0]) << std::endl;
-  std::cout << "OutEvent: " << OutEvent << std::endl;
+  DAG_TRACE_STREAM << "OutEvent: " << OutEvent << std::endl;
   #endif
 
   pi_result Error = Plugin.call_nocheck<PiApiKind::piEnqueueKernelLaunch>(
@@ -2344,7 +2345,7 @@ pi_int32 enqueueImpKernel(
   // they can simply be launched directly.
   if (KernelBundleImplPtr && !KernelBundleImplPtr->isInterop()) {
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp===isInterop" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp===isInterop" << std::endl;
     #endif
     kernel_id KernelID =
         detail::ProgramManager::getInstance().getSYCLKernelID(KernelName);
@@ -2352,20 +2353,20 @@ pi_int32 enqueueImpKernel(
         KernelBundleImplPtr->get_kernel(KernelID, KernelBundleImplPtr);
 
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp===get_kernel" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp===get_kernel" << std::endl;
     #endif
 
     SyclKernelImpl = detail::getSyclObjImpl(SyclKernel);
 
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp===getSyclObjImpl" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp===getSyclObjImpl" << std::endl;
     #endif
 
     Kernel = SyclKernelImpl->getHandleRef();
     DeviceImageImpl = SyclKernelImpl->getDeviceImage();
 
     #ifdef PRINT_TRACE 
-    std::cout << "===commands.cpp===getDeviceImage" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp===getDeviceImage" << std::endl;
     #endif
 
     Program = DeviceImageImpl->get_program_ref();
@@ -2376,7 +2377,7 @@ pi_int32 enqueueImpKernel(
             /*PropList=*/{}, Program);
   } else if (nullptr != MSyclKernel) {
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp===MSyclKernel" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp===MSyclKernel" << std::endl;
     #endif
     assert(MSyclKernel->get_info<info::kernel::context>() ==
            Queue->get_context());
@@ -2401,7 +2402,7 @@ pi_int32 enqueueImpKernel(
     }
   } else {
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp===Direct_Create_Kernel" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp===Direct_Create_Kernel" << std::endl;
     #endif
     std::tie(Kernel, KernelMutex, Program) =
         detail::ProgramManager::getInstance().getOrCreateKernel(
@@ -2430,7 +2431,7 @@ pi_int32 enqueueImpKernel(
   ProgramManager::KernelArgMask EliminatedArgMask;
   if (nullptr == MSyclKernel || !MSyclKernel->isCreatedFromSource()) {
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp===getEliminatedKernelArgMask" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp===getEliminatedKernelArgMask" << std::endl;
     #endif
     EliminatedArgMask =
         detail::ProgramManager::getInstance().getEliminatedKernelArgMask(
@@ -2439,7 +2440,7 @@ pi_int32 enqueueImpKernel(
   {
     assert(KernelMutex);
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp -> SetKernelParamsAndLaunch" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp -> SetKernelParamsAndLaunch" << std::endl;
     #endif
     std::lock_guard<std::mutex> Lock(*KernelMutex);
 
@@ -2454,7 +2455,7 @@ pi_int32 enqueueImpKernel(
     }
     
     #ifdef PRINT_TRACE
-    std::cout << "===commands.cpp -> SetKernelParamsAndLaunch(no lock)" << std::endl;
+    DAG_TRACE_STREAM << "===commands.cpp -> SetKernelParamsAndLaunch(no lock)" << std::endl;
     #endif
     Error = SetKernelParamsAndLaunch(Queue, Args, DeviceImageImpl, Kernel,
                                      NDRDesc, EventsWaitList, OutEvent,
@@ -2484,7 +2485,7 @@ pi_int32 ExecCGCommand::enqueueImp() {
                            ? nullptr
                            : &MEvent->getHandleRef();
   #ifdef PRINT_TRACE
-  std::cout << "======CGTYPE" << static_cast<unsigned int>(MCommandGroup->getType()) << std::endl;
+  DAG_TRACE_STREAM << "======CGTYPE" << static_cast<unsigned int>(MCommandGroup->getType()) << std::endl;
   #endif
   switch (MCommandGroup->getType()) {
 
@@ -2646,7 +2647,7 @@ pi_int32 ExecCGCommand::enqueueImp() {
     if (MQueue->is_host() || (MQueue->getPlugin().getBackend() ==
                               backend::ext_intel_esimd_emulator)) {
       #ifdef PRINT_TRACE
-      std::cout << "======commands.cpp host_queue or intel_esimd" << std::endl;
+      DAG_TRACE_STREAM << "======commands.cpp host_queue or intel_esimd" << std::endl;
       #endif
       for (ArgDesc &Arg : Args)
         if (kernel_param_kind_t::kind_accessor == Arg.MType) {
@@ -2698,7 +2699,7 @@ pi_int32 ExecCGCommand::enqueueImp() {
       }
     }
     #ifdef PRINT_TRACE
-    std::cout << "commands.cpp -> enqueueImpKernel" << std::endl;
+    DAG_TRACE_STREAM << "commands.cpp -> enqueueImpKernel" << std::endl;
     #endif
     pi_int32 ret = enqueueImpKernel(
         MQueue, NDRDesc, Args, ExecKernel->getKernelBundle(), SyclKernel,
