@@ -66,6 +66,9 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
   acc_mode req_accmode;
   int elem_size;
   int buff_size;
+  size_t range0 = 1;
+  size_t range1 = 1;
+  size_t range2 = 1;
 
   // 用于map/set/sort/priority_queue
   bool operator<(const SyclReqData &other) const {
@@ -93,7 +96,10 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
         << req_count << "\n"
         << static_cast<int>(req_accmode) << "\n"
         << elem_size << "\n"
-        << buff_size << "\n";
+        << buff_size << "\n"
+        << range0 << "\n"
+        << range1 << "\n"
+        << range2 << "\n";
     return oss.str();
   }
 
@@ -110,9 +116,14 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
     req.req_accmode = static_cast<acc_mode>(accmode);
     iss >> req.elem_size;
     iss >> req.buff_size;
+    iss >> req.range0;
+    iss >> req.range1;
+    iss >> req.range2;
     return req;
   }
 };
+
+static constexpr int SYCL_REQ_DATA_SERIALIZED_LINES = 9;
 
 inline bool profileKeyReadAccess(acc_mode mode) {
   return mode == acc_mode::read || mode == acc_mode::read_write ||
@@ -126,11 +137,16 @@ inline bool profileKeyWriteAccess(acc_mode mode) {
          mode == acc_mode::atomic;
 }
 
-inline std::string buildKernelProfileKey(const std::vector<SyclReqData> &reqs) {
+inline std::string buildKernelProfileKey(const std::vector<SyclReqData> &reqs,
+                                         int work_dim = 0,
+                                         size_t global_size0 = 1,
+                                         size_t global_size1 = 1,
+                                         size_t global_size2 = 1) {
   size_t read_bytes = 0;
   size_t write_bytes = 0;
   std::ostringstream oss;
-  oss << "reqs=" << reqs.size() << "|";
+  oss << "dims=" << work_dim << ":" << global_size0 << "x" << global_size1
+      << "x" << global_size2 << "|reqs=" << reqs.size() << "|";
   for (const SyclReqData &req : reqs) {
     const size_t bytes =
         static_cast<size_t>(req.elem_size) * static_cast<size_t>(req.buff_size);
@@ -141,7 +157,8 @@ inline std::string buildKernelProfileKey(const std::vector<SyclReqData> &reqs) {
       write_bytes += bytes;
     }
     oss << static_cast<int>(req.req_accmode) << ":" << req.elem_size << ":"
-        << req.buff_size << ";";
+        << req.buff_size << ":" << req.range0 << "x" << req.range1 << "x"
+        << req.range2 << ";";
   }
   oss << "|rb=" << read_bytes << "|wb=" << write_bytes;
   return oss.str();
@@ -152,17 +169,26 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
 
   int kernel_count;
   int req_size;
+  int work_dim = 0;
+  size_t global_size0 = 1;
+  size_t global_size1 = 1;
+  size_t global_size2 = 1;
   std::vector<SyclReqData> reqs;
 
   std::string profileKey() const {
-    return buildKernelProfileKey(reqs);
+    return buildKernelProfileKey(reqs, work_dim, global_size0, global_size1,
+                                 global_size2);
   }
 
   std::string serialize() const {
     std::ostringstream oss;
     oss << pid << "\n"
         << kernel_count << "\n"
-        << req_size << "\n";
+        << req_size << "\n"
+        << work_dim << "\n"
+        << global_size0 << "\n"
+        << global_size1 << "\n"
+        << global_size2 << "\n";
 
     oss << reqs.size() << "\n";
     for (const auto &req : reqs) {
@@ -179,6 +205,10 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
     iss >> kernel_data.pid;
     iss >> kernel_data.kernel_count;
     iss >> kernel_data.req_size;
+    iss >> kernel_data.work_dim;
+    iss >> kernel_data.global_size0;
+    iss >> kernel_data.global_size1;
+    iss >> kernel_data.global_size2;
 
     size_t req_count;
     iss >> req_count;
@@ -186,7 +216,7 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
 
     for (size_t i = 0; i < req_count; ++i) {
       std::string req_data_serialized;
-      for (int j = 0; j < 6; ++j) {
+      for (int j = 0; j < SYCL_REQ_DATA_SERIALIZED_LINES; ++j) {
         std::string line;
         std::getline(iss, line);
         req_data_serialized += line + "\n";
@@ -360,7 +390,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
 
     for (size_t i = 0; i < map_size; ++i) {
       std::string req_data_serialized;
-      for (int j = 0; j < 6; ++j) {
+      for (int j = 0; j < SYCL_REQ_DATA_SERIALIZED_LINES; ++j) {
         std::string line;
         std::getline(iss, line);
         req_data_serialized += line + "\n";
@@ -481,6 +511,10 @@ struct DAGNode { // 一个kernel的依赖关系
   int kernel_count;
   int depth = 0; // 如果没有依赖 在DAG中的深度为0
   std::vector<SyclReqData> req_data;
+  int work_dim = 0;
+  size_t global_size0 = 1;
+  size_t global_size1 = 1;
+  size_t global_size2 = 1;
 
   std::vector<DAGNode *> depend_on;
   std::vector<DAGNode *> depend_by;
@@ -503,6 +537,11 @@ struct DAGNode { // 一个kernel的依赖关系
   // bool executed = false; // online无法获取 --offline用于区别kernel是否已被调度 暂时用不上--
 
   DAGNode(int count, const std::vector<SyclReqData> &reqs) : kernel_count(count), req_data(reqs) {}
+  explicit DAGNode(const S2DKernelReqData &kernel_data)
+      : kernel_count(kernel_data.kernel_count), req_data(kernel_data.reqs),
+        work_dim(kernel_data.work_dim), global_size0(kernel_data.global_size0),
+        global_size1(kernel_data.global_size1),
+        global_size2(kernel_data.global_size2) {}
 };
 
 struct CpuTimes {

@@ -234,9 +234,9 @@ void SendD2DKernelSchedInfos(MPI_Comm comm_daemon, int master_rank, int daemon_r
       obj_data += line + "\n";  // req_rank.size()
       int map_size = std::stoi(line);
       for (int i = 0; i < map_size; ++i) {
-        for (int j = 0; j < 6; ++j) {
+        for (int j = 0; j < SYCL_REQ_DATA_SERIALIZED_LINES; ++j) {
           std::getline(stream, line);
-          obj_data += line + "\n";  // SyclReqData (6 lines)
+          obj_data += line + "\n";  // SyclReqData
         }
         std::getline(stream, line);
         obj_data += line + "\n";  // int: rank
@@ -700,7 +700,9 @@ struct NodePlacementState {
 };
 
 static std::string profileKeyForNode(const DAGNode *node) {
-  return buildKernelProfileKey(node->req_data);
+  return buildKernelProfileKey(node->req_data, node->work_dim,
+                               node->global_size0, node->global_size1,
+                               node->global_size2);
 }
 
 static double reqBytes(const SyclReqData &req) {
@@ -1500,6 +1502,39 @@ static double dependencyReadyTime(DAGNode *node, int rank, int proc) {
   return dependencyReadyTimeForDevices(node, rank, std::vector<int>{proc});
 }
 
+static bool splitWriteRangesMatchDim0(const DAGNode *node, int num_parts) {
+  if (node->global_size0 < static_cast<size_t>(num_parts) ||
+      node->global_size0 % static_cast<size_t>(num_parts) != 0) {
+    return false;
+  }
+
+  const bool kernel_splits_only_dim0 =
+      node->global_size0 > 1 && node->global_size1 <= 1 &&
+      node->global_size2 <= 1;
+
+  for (const SyclReqData &req : node->req_data) {
+    if (!isWriteAccess(req.req_accmode)) {
+      continue;
+    }
+
+    if (req.range0 < static_cast<size_t>(num_parts) ||
+        req.range0 % static_cast<size_t>(num_parts) != 0) {
+      return false;
+    }
+
+    if (kernel_splits_only_dim0 && (req.range1 > 1 || req.range2 > 1)) {
+      DAEMON_TRACE_STREAM
+          << "algorithmHEFT: Kernel " << node->kernel_count
+          << " split rejected: dim0-only kernel writes non-contiguous range "
+          << req.range0 << "x" << req.range1 << "x" << req.range2
+          << std::endl;
+      return false;
+    }
+  }
+
+  return true;
+}
+
 static bool worthConsideringSplit(DAGNode *node, int num_parts) {
   if (num_parts <= 1) {
     return false;
@@ -1511,6 +1546,9 @@ static bool worthConsideringSplit(DAGNode *node, int num_parts) {
     return false;
   }
   if (totalReqElems(node) < SPLIT_MIN_ELEMS) {
+    return false;
+  }
+  if (!splitWriteRangesMatchDim0(node, num_parts)) {
     return false;
   }
   return true;
@@ -2559,7 +2597,7 @@ void *SystemSchedulerDaemon(void *arg) {
     {
       if (daemon_rank == master_rank) {
         // [1] [rank0] 构建DAG 确定依赖的kernel 查找依赖的kernel在哪个rank执行
-        DAGNode *node = new DAGNode(kernel_req_data.kernel_count, kernel_req_data.reqs);
+        DAGNode *node = new DAGNode(kernel_req_data);
         std::map<SyclReqData, std::set<int>> req_ranks = generateDAG(kernel_dag_nodes, node);
         for (auto pair : req_ranks) {
           DAEMON_TRACE_STREAM << "Rank " << daemon_rank << " req_rank: " << pair.first.kernel_count << "-" << pair.first.req_count << " pointer: " << pair.first.mem_pointer << " rank: ";
@@ -3054,9 +3092,17 @@ static void parseOfflineKernelReqBatch(
     std::getline(stream, line);
     obj_data += line + "\n";  // req_size line
     std::getline(stream, line);
+    obj_data += line + "\n";  // work_dim line
+    std::getline(stream, line);
+    obj_data += line + "\n";  // global_size0 line
+    std::getline(stream, line);
+    obj_data += line + "\n";  // global_size1 line
+    std::getline(stream, line);
+    obj_data += line + "\n";  // global_size2 line
+    std::getline(stream, line);
     obj_data += line + "\n";  // req_count line
     int req_count = std::stoi(line);
-    for (int i = 0; i < req_count * 6; ++i) {
+    for (int i = 0; i < req_count * SYCL_REQ_DATA_SERIALIZED_LINES; ++i) {
       std::getline(stream, line);
       obj_data += line + "\n";
     }
@@ -3227,7 +3273,7 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         // 1. 构建DAG 确定依赖
         std::vector<DAGNode *> nodes; // 所有kernel对应的DAG
         for (S2DKernelReqData & kernel_req_data : kernel_req_datas) {
-          DAGNode *node = new DAGNode(kernel_req_data.kernel_count, kernel_req_data.reqs);
+          DAGNode *node = new DAGNode(kernel_req_data);
           DAEMON_TRACE_STREAM << "Rank " << daemon_rank << ": generate DAGNode for kernel_count: " << node->kernel_count << std::endl;
           nodes.push_back(node);
         }

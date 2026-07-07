@@ -304,15 +304,15 @@ public:
 #endif
 
     if (shell) {
-      std::cout << "===queue_impl.hpp=== shell queue destruct" << std::endl;
+      // std::cout << "===queue_impl.hpp=== shell queue destruct" << std::endl;
     } else {
       throw_asynchronous();
-      std::cout << "===queue_impl.hpp=== before cleanup" << std::endl;
+      // std::cout << "===queue_impl.hpp=== before cleanup" << std::endl;
       if (!MHostQueue) {
-        std::cout << "This queue_impl: " << this << " MQueues: " << &MQueues << " size: " << MQueues.size() << std::endl;
+        // std::cout << "This queue_impl: " << this << " MQueues: " << &MQueues << " size: " << MQueues.size() << std::endl;
         getPlugin().call<PiApiKind::piQueueRelease>(MQueues[0]);
       }
-      std::cout << "===queue_impl.hpp=== after cleanup" << std::endl;
+      // std::cout << "===queue_impl.hpp=== after cleanup" << std::endl;
     }
   }
 

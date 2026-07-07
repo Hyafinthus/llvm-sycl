@@ -190,6 +190,52 @@ normalizeOfflineSplitDevices(const D2SKernelExecInfo &KernelExecInfo,
   return SplitDevices;
 }
 
+static bool offlineSplitWriteAccess(access::mode Mode) {
+  return Mode == access::mode::write || Mode == access::mode::read_write ||
+         Mode == access::mode::discard_write ||
+         Mode == access::mode::discard_read_write ||
+         Mode == access::mode::atomic;
+}
+
+static bool offlineSplitCanUseDim0ContiguousWrites(
+    const detail::CGExecKernel *ExecCG, size_t NumParts) {
+  if (ExecCG == nullptr || NumParts <= 1) {
+    return false;
+  }
+
+  const detail::NDRDescT &NDR = ExecCG->MNDRDesc;
+  if (NDR.GlobalSize[0] < NumParts || NDR.GlobalSize[0] % NumParts != 0) {
+    return false;
+  }
+
+  const bool KernelSplitsOnlyDim0 =
+      NDR.GlobalSize[0] > 1 && NDR.GlobalSize[1] <= 1 &&
+      NDR.GlobalSize[2] <= 1;
+
+  for (detail::Requirement *Req : ExecCG->MRequirements) {
+    if (Req == nullptr || !offlineSplitWriteAccess(Req->MAccessMode)) {
+      continue;
+    }
+
+    if (Req->MMemoryRange[0] < NumParts ||
+        Req->MMemoryRange[0] % NumParts != 0) {
+      return false;
+    }
+
+    if (KernelSplitsOnlyDim0 &&
+        (Req->MMemoryRange[1] > 1 || Req->MMemoryRange[2] > 1)) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === Split disabled: dim0-only kernel writes "
+          << "non-contiguous memory range " << Req->MMemoryRange[0] << ","
+          << Req->MMemoryRange[1] << "," << Req->MMemoryRange[2]
+          << std::endl;
+      return false;
+    }
+  }
+
+  return true;
+}
+
 static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
                                       int ActualDeviceIndex) {
   auto &PM = detail::ProgramManager::getInstance();
@@ -251,6 +297,38 @@ static std::string findOfflineKernelProfileKey(int KernelCount) {
   }
 #endif
   return "kernel_count=" + std::to_string(KernelCount);
+}
+
+static void fillOfflineKernelReqData(
+    S2DKernelReqData &KernelReqData, pid_t Pid, int KernelCount,
+    const detail::NDRDescT &NDRDesc,
+    const std::vector<detail::Requirement *> &Requirements) {
+  KernelReqData.pid = Pid;
+  KernelReqData.kernel_count = KernelCount;
+  KernelReqData.req_size = Requirements.size();
+  KernelReqData.work_dim = NDRDesc.Dims;
+  KernelReqData.global_size0 = NDRDesc.GlobalSize[0];
+  KernelReqData.global_size1 = NDRDesc.GlobalSize[1];
+  KernelReqData.global_size2 = NDRDesc.GlobalSize[2];
+  KernelReqData.reqs.clear();
+
+  for (int I = 0; I < static_cast<int>(Requirements.size()); I++) {
+    detail::Requirement *Req = Requirements[I];
+
+    SyclReqData ReqData;
+    ReqData.mem_pointer = Req->MSYCLMemObj;
+    ReqData.kernel_count = KernelReqData.kernel_count;
+    ReqData.req_count = I + 1;
+    ReqData.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
+    // Daemon HEFT uses elem_size to infer fp32/fp64 precision.
+    ReqData.elem_size = static_cast<int>(Req->MElemSize);
+    ReqData.buff_size = static_cast<int>(Req->MMemoryRange.size());
+    ReqData.range0 = Req->MMemoryRange[0];
+    ReqData.range1 = Req->MMemoryRange[1];
+    ReqData.range2 = Req->MMemoryRange[2];
+
+    KernelReqData.reqs.push_back(ReqData);
+  }
 }
 
 static uint64_t offlineNowNs() {
@@ -497,6 +575,20 @@ static void fillOfflineProfileData(int WaitCount,
 static bool collectOfflineProfilingInfo(
     int WaitCount, const OfflineProfileEvent &ProfileEvent,
     S2DKernelProfileData &ProfileData) {
+  const uint64_t HostDuration =
+      ProfileEvent.HostEndNs > ProfileEvent.HostStartNs
+          ? ProfileEvent.HostEndNs - ProfileEvent.HostStartNs
+          : 0;
+  if (ProfileEvent.NumParts > 1 && HostDuration > 0) {
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling split wall "
+                         << "kernel_count: " << ProfileEvent.KernelCount
+                         << " device_index: " << ProfileEvent.DeviceIndex
+                         << " num_parts: " << ProfileEvent.NumParts
+                         << " duration_ns: " << HostDuration << std::endl;
+    fillOfflineProfileData(WaitCount, ProfileEvent, HostDuration, ProfileData);
+    return true;
+  }
+
   try {
     sycl::event ProfileEventCopy = ProfileEvent.Event;
     ProfileEventCopy.wait();
@@ -525,15 +617,14 @@ static bool collectOfflineProfilingInfo(
               << ProfileEvent.KernelCount << std::endl;
   }
 
-  if (ProfileEvent.HostEndNs > ProfileEvent.HostStartNs) {
-    uint64_t Duration = ProfileEvent.HostEndNs - ProfileEvent.HostStartNs;
+  if (HostDuration > 0) {
     HANDLER_TRACE_STREAM << "=== handler === Offline profiling host fallback kernel_count: "
               << ProfileEvent.KernelCount << " device_index: "
               << ProfileEvent.DeviceIndex << " num_parts: "
-              << ProfileEvent.NumParts << " duration_ns: " << Duration
+              << ProfileEvent.NumParts << " duration_ns: " << HostDuration
               << std::endl;
-    fillOfflineProfileData(WaitCount, ProfileEvent, Duration, ProfileData);
-    return Duration > 0;
+    fillOfflineProfileData(WaitCount, ProfileEvent, HostDuration, ProfileData);
+    return true;
   }
 
   return false;
@@ -671,24 +762,9 @@ event handler::finalize() {
         {
           detail::combineAccessModesOfReqs(MRequirements);
 
-          kernel_req_data.pid = getpid();
-          kernel_req_data.kernel_count = daemon_kernel_count;
-          kernel_req_data.req_size = MRequirements.size();
-
-          for (int i = 0; i < MRequirements.size(); i++) {
-            Requirement *Req = MRequirements[i];
-
-            SyclReqData req_data;
-            req_data.mem_pointer = Req->MSYCLMemObj;
-            req_data.kernel_count = kernel_req_data.kernel_count;
-            req_data.req_count = i + 1;
-            req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
-            // Daemon HEFT uses elem_size to infer fp32/fp64 precision.
-            req_data.elem_size = static_cast<int>(Req->MElemSize);
-            req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
-
-            kernel_req_data.reqs.push_back(req_data);
-          }
+          fillOfflineKernelReqData(kernel_req_data, getpid(),
+                                   daemon_kernel_count, MNDRDesc,
+                                   MRequirements);
 
           std::string serialized_data = kernel_req_data.serialize();
           size_t message_size = serialized_data.size();
@@ -748,24 +824,9 @@ event handler::finalize() {
       {
         detail::combineAccessModesOfReqs(MRequirements);
 
-        kernel_req_data.pid = getpid();
-        kernel_req_data.kernel_count = daemon_kernel_count;
-        kernel_req_data.req_size = MRequirements.size();
-
-        for (int i = 0; i < MRequirements.size(); i++) {
-          Requirement *Req = MRequirements[i];
-
-          SyclReqData req_data;
-          req_data.mem_pointer = Req->MSYCLMemObj;
-          req_data.kernel_count = kernel_req_data.kernel_count;
-          req_data.req_count = i + 1;
-          req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
-          // Daemon HEFT uses elem_size to infer fp32/fp64 precision.
-          req_data.elem_size = static_cast<int>(Req->MElemSize);
-          req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
-
-          kernel_req_data.reqs.push_back(req_data);
-        }
+        fillOfflineKernelReqData(kernel_req_data, getpid(),
+                                 daemon_kernel_count, MNDRDesc,
+                                 MRequirements);
 
         std::string serialized_data = kernel_req_data.serialize();
         size_t message_size = serialized_data.size();
@@ -940,24 +1001,8 @@ event handler::finalize() {
     {
       detail::combineAccessModesOfReqs(MRequirements);
 
-      kernel_req_data.pid = getpid();
-      kernel_req_data.kernel_count = daemon_kernel_count;
-      kernel_req_data.req_size = MRequirements.size();
-
-      for (int i = 0; i < MRequirements.size(); i++) {
-        Requirement *Req = MRequirements[i];
-
-        SyclReqData req_data;
-        req_data.mem_pointer = Req->MSYCLMemObj;
-        req_data.kernel_count = kernel_req_data.kernel_count;
-        req_data.req_count = i + 1;
-        req_data.req_accmode = static_cast<acc_mode>(Req->MAccessMode);
-        // Daemon HEFT uses elem_size to infer fp32/fp64 precision.
-        req_data.elem_size = static_cast<int>(Req->MElemSize);
-        req_data.buff_size = static_cast<int>(Req->MMemoryRange.size());
-
-        kernel_req_data.reqs.push_back(req_data);
-      }
+      fillOfflineKernelReqData(kernel_req_data, getpid(),
+                               daemon_kernel_count, MNDRDesc, MRequirements);
     }
     kernel_reqs.push_back(kernel_req_data);
 
@@ -2174,6 +2219,15 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       NumParts = 1;
       SplitDevices.clear();
     }
+  }
+
+  if (NumParts > 1 &&
+      !offlineSplitCanUseDim0ContiguousWrites(ExecCG, NumParts)) {
+    HANDLER_TRACE_STREAM << "=== handler === Split NumParts disabled for "
+                         << "non-contiguous or indivisible write range"
+                         << std::endl;
+    NumParts = 1;
+    SplitDevices.clear();
   }
 
   if (NumParts > 1) {
