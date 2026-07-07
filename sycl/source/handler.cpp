@@ -2152,6 +2152,31 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   }
 
   if (NumParts > 1) {
+    const size_t SplitDim0 = ExecCG->MNDRDesc.GlobalSize[0];
+    size_t AdjustedParts = NumParts;
+    while (AdjustedParts > 1 &&
+           (AdjustedParts % 2 != 0 || SplitDim0 < AdjustedParts ||
+            SplitDim0 % AdjustedParts != 0)) {
+      --AdjustedParts;
+    }
+
+    if (AdjustedParts != NumParts) {
+      std::cout << "=== handler === Split NumParts adjusted from "
+                << NumParts << " to " << AdjustedParts
+                << " for global_size0: " << SplitDim0 << std::endl;
+      NumParts = AdjustedParts;
+      if (SplitDevices.size() > NumParts) {
+        SplitDevices.resize(NumParts);
+      }
+    }
+
+    if (NumParts <= 1 || SplitDevices.size() <= 1) {
+      NumParts = 1;
+      SplitDevices.clear();
+    }
+  }
+
+  if (NumParts > 1) {
     std::cout << "=== handler === Split NumParts: " << NumParts << std::endl;
 
     // 1

@@ -1503,6 +1503,9 @@ static bool worthConsideringSplit(DAGNode *node, int num_parts) {
   if (num_parts <= 1) {
     return false;
   }
+  if (num_parts % 2 != 0) {
+    return false;
+  }
   if (totalWriteElems(node) == 0.0) {
     return false;
   }
@@ -1987,6 +1990,9 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
       const int max_split_parts =
           std::min<int>(4, static_cast<int>(gpu_available_time[rank].size()) - 1);
       for (int num_parts = 2; num_parts <= max_split_parts; ++num_parts) {
+        if (num_parts % 2 != 0) {
+          continue;
+        }
         TaskCandidate candidate = makeSplitCandidate(node, rank, num_parts);
         if (candidate.finish_time < best_candidate.finish_time) {
           best_candidate = candidate;
