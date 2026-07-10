@@ -5,7 +5,68 @@
 #include(AddLLVM)
 
 find_package(MPI REQUIRED)
-find_package(CUDAToolkit REQUIRED)
+
+set(SYCL_BUILD_PI_HIP_ROCM_DIR "/opt/rocm" CACHE STRING "ROCm installation dir")
+if(NOT EXISTS "${SYCL_BUILD_PI_HIP_ROCM_DIR}")
+  message(FATAL_ERROR "Couldn't find ROCm installation in '${SYCL_BUILD_PI_HIP_ROCM_DIR}',"
+                      " please set SYCL_BUILD_PI_HIP_ROCM_DIR to the path of the ROCm installation.")
+endif()
+
+find_path(SYCL_DAEMON_HIP_INCLUDE_DIR
+  NAMES hip/hip_runtime_api.h
+  PATHS
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/hip/include"
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/include"
+  NO_DEFAULT_PATH
+)
+if(NOT SYCL_DAEMON_HIP_INCLUDE_DIR)
+  message(FATAL_ERROR "Couldn't find HIP headers under '${SYCL_BUILD_PI_HIP_ROCM_DIR}'.")
+endif()
+
+find_path(SYCL_DAEMON_ROCM_SMI_INCLUDE_DIR
+  NAMES rocm_smi/rocm_smi.h
+  PATHS
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/include"
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/rocm_smi/include"
+  NO_DEFAULT_PATH
+)
+if(NOT SYCL_DAEMON_ROCM_SMI_INCLUDE_DIR)
+  message(FATAL_ERROR "Couldn't find ROCm SMI headers under '${SYCL_BUILD_PI_HIP_ROCM_DIR}'.")
+endif()
+
+find_library(SYCL_DAEMON_AMDHIP64_LIBRARY
+  NAMES amdhip64
+  PATHS
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/hip/lib"
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/lib"
+  NO_DEFAULT_PATH
+)
+if(NOT SYCL_DAEMON_AMDHIP64_LIBRARY)
+  message(FATAL_ERROR "Couldn't find libamdhip64 under '${SYCL_BUILD_PI_HIP_ROCM_DIR}'.")
+endif()
+
+find_library(SYCL_DAEMON_ROCM_SMI_LIBRARY
+  NAMES rocm_smi64
+  PATHS
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/lib"
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/rocm_smi/lib"
+  NO_DEFAULT_PATH
+)
+if(NOT SYCL_DAEMON_ROCM_SMI_LIBRARY)
+  message(FATAL_ERROR "Couldn't find librocm_smi64 under '${SYCL_BUILD_PI_HIP_ROCM_DIR}'.")
+endif()
+
+add_library(sycl_daemon_amdhip64 SHARED IMPORTED)
+set_target_properties(sycl_daemon_amdhip64 PROPERTIES
+  IMPORTED_LOCATION "${SYCL_DAEMON_AMDHIP64_LIBRARY}"
+  INTERFACE_INCLUDE_DIRECTORIES "${SYCL_DAEMON_HIP_INCLUDE_DIR}"
+)
+
+add_library(sycl_daemon_rocm_smi SHARED IMPORTED)
+set_target_properties(sycl_daemon_rocm_smi PROPERTIES
+  IMPORTED_LOCATION "${SYCL_DAEMON_ROCM_SMI_LIBRARY}"
+  INTERFACE_INCLUDE_DIRECTORIES "${SYCL_DAEMON_ROCM_SMI_INCLUDE_DIR}"
+)
 
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/version.rc.in
@@ -294,15 +355,17 @@ add_dependencies(sycl-daemon sycl)
 
 target_include_directories(sycl-daemon PRIVATE
   ${sycl_inc_dir}
-  ${CUDAToolkit_INCLUDE_DIRS}
+  ${SYCL_DAEMON_HIP_INCLUDE_DIR}
+  ${SYCL_DAEMON_ROCM_SMI_INCLUDE_DIR}
   ${MPI_CXX_INCLUDE_PATH}
 )
+target_compile_definitions(sycl-daemon PRIVATE __HIP_PLATFORM_AMD__)
 target_link_libraries(sycl-daemon
   sycl
   rt
   pthread
-  CUDA::cudart
-  CUDA::nvml
+  sycl_daemon_amdhip64
+  sycl_daemon_rocm_smi
   ${MPI_CXX_LIBRARIES}
 )
 

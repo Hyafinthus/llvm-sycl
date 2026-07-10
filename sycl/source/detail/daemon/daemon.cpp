@@ -13,16 +13,19 @@
 #include <cctype>
 #include <cstdlib>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <map>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_set>
-#include <cuda_runtime_api.h>
-#include <nvml.h>
+#include <hip/hip_runtime_api.h>
+#include <rocm_smi/rocm_smi.h>
 
 #include "daemon.hpp"
 #include "define.hpp"
 #include <sycl/device.hpp>
+#include <sycl/ext/oneapi/backend/hip.hpp>
 // #include <sycl/access/access.hpp>
 
 volatile bool is_interrupted = false;
@@ -50,8 +53,8 @@ struct ComputeCapability {
   double fp32 = 1.0;
   double fp64 = 0.5;
 };
-std::map<int, int> index_sycl_nvml; // 根据busid确定sycl::device到gpu映射
-std::map<int, int> index_nvml_sycl;
+std::map<int, int> index_sycl_rsmi; // 根据busid确定sycl::device到gpu映射
+std::map<int, int> index_rsmi_sycl;
 std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
 std::vector<ComputeCapability> device_capability(1); // 本rank设备原始能力, 编号与handler的globalDevices一致
 std::vector<std::vector<MonitorInfo>> cluster_monitor_info;
@@ -641,10 +644,10 @@ static const std::map<std::string, NodeCommProfile> &nodeCommProfiles() {
           1,         // profile id: the compact value exchanged by MPI_Allgather
           "4090-01", // profile key: used by crossNodeCommProfiles lookup
           18.5,      // shm_bw_gib: test_host_shm_memcpy_bandwidth, large-size host<->shm
-          5.5,       // same_node_staged_bw_gib: mpirun -n 2 test_mpi_cuda_staged_bandwidth on 4090 node
-          {0.0, 24.0, 22.0}, // h2d_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_H2D, index 0 CPU, 1..N GPU
-          {0.0, 25.0, 12.6}, // d2h_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_D2H, index 0 CPU, 1..N GPU
-          {// d2d_bw_gib: test_cuda_p2p_bandwidth; daemon proc id, so CUDA0->CUDA1 is 1->2
+          5.5,       // same_node_staged_bw_gib: mpirun -n 2 test_mpi_hip_staged_bandwidth on 4090 node
+          {0.0, 24.0, 22.0}, // h2d_bw_gib: test_hip_h2d_d2h_bandwidth pinned_H2D, index 0 CPU, 1..N GPU
+          {0.0, 25.0, 12.6}, // d2h_bw_gib: test_hip_h2d_d2h_bandwidth pinned_D2H, index 0 CPU, 1..N GPU
+          {// d2d_bw_gib: test_hip_p2p_bandwidth; daemon proc id, so GPU0->GPU1 is 1->2
            {{1, 2}, 20.7}, // GPU proc 1 -> GPU proc 2
            {{2, 1}, 7.5}}}}, // GPU proc 2 -> GPU proc 1
       {"a6000-01", // profile map key: hostname/env/device detection result
@@ -652,10 +655,10 @@ static const std::map<std::string, NodeCommProfile> &nodeCommProfiles() {
           2,          // profile id: the compact value exchanged by MPI_Allgather
           "a6000-01", // profile key: used by crossNodeCommProfiles lookup
           12.5,       // shm_bw_gib: test_host_shm_memcpy_bandwidth, large-size host<->shm
-          4.5,        // same_node_staged_bw_gib: mpirun -n 2 test_mpi_cuda_staged_bandwidth on a6000 node
-          {0.0, 25.1, 25.1, 25.1, 25.0}, // h2d_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_H2D
-          {0.0, 24.5, 24.5, 24.5, 23.3}, // d2h_bw_gib: test_cuda_h2d_d2h_bandwidth pinned_D2H
-          {// d2d_bw_gib: test_cuda_p2p_bandwidth; daemon proc id, GPU procs are 1..4
+          4.5,        // same_node_staged_bw_gib: mpirun -n 2 test_mpi_hip_staged_bandwidth on a6000 node
+          {0.0, 25.1, 25.1, 25.1, 25.0}, // h2d_bw_gib: test_hip_h2d_d2h_bandwidth pinned_H2D
+          {0.0, 24.5, 24.5, 24.5, 23.3}, // d2h_bw_gib: test_hip_h2d_d2h_bandwidth pinned_D2H
+          {// d2d_bw_gib: test_hip_p2p_bandwidth; daemon proc id, GPU procs are 1..4
            {{1, 2}, 24.58}, // GPU proc 1 -> GPU proc 2
            {{2, 1}, 24.58}, // GPU proc 2 -> GPU proc 1
            {{1, 3}, 21.22}, // GPU proc 1 -> GPU proc 3
@@ -675,8 +678,8 @@ static const std::map<std::string, NodeCommProfile> &nodeCommProfiles() {
 static const std::map<std::pair<std::string, std::string>, double> &
 crossNodeCommProfiles() {
   static const std::map<std::pair<std::string, std::string>, double> profiles = {
-      {{"4090-01", "a6000-01"}, 0.106}, // hostfile cross-node test_mpi_cuda_staged_bandwidth
-      {{"a6000-01", "4090-01"}, 0.106}, // hostfile cross-node test_mpi_cuda_staged_bandwidth
+      {{"4090-01", "a6000-01"}, 0.106}, // hostfile cross-node test_mpi_hip_staged_bandwidth
+      {{"a6000-01", "4090-01"}, 0.106}, // hostfile cross-node test_mpi_hip_staged_bandwidth
   };
   return profiles;
 }
@@ -2161,19 +2164,33 @@ void CPUMonitor() {
   device_monitor_info[0] = MonitorInfo{"CPU", utilization, mem_available};
 }
 
-int getCudaPciBusId(const sycl::device &device) {
-  if (device.get_backend() != sycl::backend::ext_oneapi_cuda) {
-      return -1;
+static std::string rsmiErrorString(rsmi_status_t status) {
+  const char *status_string = nullptr;
+  if (rsmi_status_string(status, &status_string) == RSMI_STATUS_SUCCESS &&
+      status_string != nullptr) {
+    return status_string;
   }
-  int cudaDevice;
-  cudaError_t err = cudaGetDevice(&cudaDevice);
-  if (err != cudaSuccess) {
-      throw std::runtime_error("Failed to get current CUDA device.");
+  return "ROCm SMI error " +
+         std::to_string(static_cast<uint32_t>(status));
+}
+
+static int rsmiBusIdFromBdf(uint64_t bdfid) {
+  return static_cast<int>((bdfid >> 8) & 0xff);
+}
+
+int getHipPciBusId(const sycl::device &device) {
+  if (device.get_backend() != sycl::backend::ext_oneapi_hip) {
+    return -1;
   }
-  int busId;
-  err = cudaDeviceGetAttribute(&busId, cudaDevAttrPciBusId, cudaDevice);
-  if (err != cudaSuccess) {
-      throw std::runtime_error("Failed to get PCI Bus ID for the CUDA device.");
+
+  const int hipDevice =
+      sycl::get_native<sycl::backend::ext_oneapi_hip>(device);
+  int busId = -1;
+  hipError_t err =
+      hipDeviceGetAttribute(&busId, hipDeviceAttributePciBusId, hipDevice);
+  if (err != hipSuccess) {
+    throw std::runtime_error("Failed to get PCI Bus ID for the HIP device: " +
+                             std::string(hipGetErrorString(err)));
   }
   return busId;
 }
@@ -2182,63 +2199,54 @@ int MonitorInit() {
   device_capability.resize(1);
   device_capability[0] = inferCpuCapabilityFromName(readCpuModelName());
 
-  nvmlReturn_t result;
-  result = nvmlInit();
-  if (result != NVML_SUCCESS) {
-    std::string errorMsg = "Failed to initialize NVML: " + std::string(nvmlErrorString(result));
-    perror(errorMsg.c_str());
+  rsmi_status_t result = rsmi_init(0);
+  if (result != RSMI_STATUS_SUCCESS) {
+    std::cerr << "Failed to initialize ROCm SMI: "
+              << rsmiErrorString(result) << std::endl;
     return -1;
   }
-  
-  unsigned int device_count = 0;
-  result = nvmlDeviceGetCount(&device_count);
-  if (result != NVML_SUCCESS) {
-      std::string errorMsg = "Failed to get device count: " + std::string(nvmlErrorString(result));
-      perror(errorMsg.c_str());
-      nvmlShutdown();
-      return -1;
+
+  uint32_t device_count = 0;
+  result = rsmi_num_monitor_devices(&device_count);
+  if (result != RSMI_STATUS_SUCCESS) {
+    std::cerr << "Failed to get ROCm SMI device count: "
+              << rsmiErrorString(result) << std::endl;
+    rsmi_shut_down();
+    return -1;
   }
   DAEMON_TRACE_STREAM << "Number of GPUs: " << device_count << std::endl;
   device_capability.resize(device_count + 1, fallbackCapabilityForProc(1));
-  
-  std::vector<int> nvmlBusIds;
-  for (int i = 0; i < device_count; ++i) {
-    nvmlDevice_t device;
-    result = nvmlDeviceGetHandleByIndex(i, &device);
-    if (result != NVML_SUCCESS) {
-      std::string errorMsg = "Failed to get device handle for device " + std::to_string(i) + ": " + std::string(nvmlErrorString(result));
-      perror(errorMsg.c_str());
+
+  std::vector<int> rsmiBusIds(device_count, -1);
+  for (uint32_t i = 0; i < device_count; ++i) {
+    uint64_t bdfid = 0;
+    result = rsmi_dev_pci_id_get(i, &bdfid);
+    if (result != RSMI_STATUS_SUCCESS) {
+      std::cerr << "Failed to get PCI info for GPU " << i << ": "
+                << rsmiErrorString(result) << std::endl;
       continue;
     }
 
-    nvmlPciInfo_t pciInfo;
-    result = nvmlDeviceGetPciInfo(device, &pciInfo);
-    if (result != NVML_SUCCESS) {
-      std::string errorMsg = "Failed to get PCI info for device " + std::to_string(i) + ": " + std::string(nvmlErrorString(result));
-      perror(errorMsg.c_str());
-      continue;
-    }
-
-    int nvmlBusId = std::stoi(std::string(pciInfo.busId).substr(9, 2), nullptr, 16);
-    DAEMON_TRACE_STREAM << "GPU " << i << ": PCI Bus ID: " << pciInfo.busId << " int: " << nvmlBusId << std::endl;
-    nvmlBusIds.push_back(nvmlBusId);
+    const int rsmiBusId = rsmiBusIdFromBdf(bdfid);
+    DAEMON_TRACE_STREAM << "GPU " << i << ": PCI BDF ID: 0x" << std::hex
+              << bdfid << std::dec << " Bus ID: " << rsmiBusId << std::endl;
+    rsmiBusIds[i] = rsmiBusId;
   }
 
   std::vector<sycl::device> globalDevices = sycl::device::get_devices();
   globalDevices.erase(
     std::remove_if(
-      globalDevices.begin(), 
+      globalDevices.begin(),
       globalDevices.end(),
       [](const sycl::device& d) { return d.is_accelerator(); }
     ),
     globalDevices.end()
   );
-  for (int i = 0; i < globalDevices.size(); i++) {
+  for (int i = 0; i < static_cast<int>(globalDevices.size()); i++) {
     sycl::device device = globalDevices[i];
     if (i >= static_cast<int>(device_capability.size())) {
       device_capability.resize(i + 1, fallbackCapabilityForProc(i));
     }
-    // **注意** 获取device::name必不可少 不然无法切换cuda上下文
     std::string sycl_device_name =
         device.get_info<sycl::info::device::name>();
     if (device.is_cpu()) {
@@ -2246,21 +2254,28 @@ int MonitorInit() {
           maxCapability(device_capability[0],
                         inferDeviceCapabilityFromName(sycl_device_name, true));
     }
-    int busId = getCudaPciBusId(device);
+
+    int busId = -1;
+    try {
+      busId = getHipPciBusId(device);
+    } catch (const std::exception &e) {
+      std::cerr << e.what() << std::endl;
+      continue;
+    }
     DAEMON_TRACE_STREAM << "SYCL Device " << i << " (" << sycl_device_name
               << "): PCI Bus ID: " << busId << std::endl;
 
     if (busId != -1) {
-      auto it = std::find(nvmlBusIds.begin(), nvmlBusIds.end(), busId);
-      if (it != nvmlBusIds.end()) {
-        index_sycl_nvml[i] = std::distance(nvmlBusIds.begin(), it) + 1;
-        index_nvml_sycl[index_sycl_nvml[i]] = i;
+      auto it = std::find(rsmiBusIds.begin(), rsmiBusIds.end(), busId);
+      if (it != rsmiBusIds.end()) {
+        index_sycl_rsmi[i] = std::distance(rsmiBusIds.begin(), it) + 1;
+        index_rsmi_sycl[index_sycl_rsmi[i]] = i;
         device_capability[i] =
             inferDeviceCapabilityFromName(sycl_device_name, false);
       }
     }
   }
-  for (auto pair : index_sycl_nvml) {
+  for (auto pair : index_sycl_rsmi) {
     DAEMON_TRACE_STREAM << "SYCL Device " << pair.first << " mapped to GPU "
               << pair.second << " fp32 capability "
               << device_capability[pair.first].fp32
@@ -2268,72 +2283,68 @@ int MonitorInit() {
               << device_capability[pair.first].fp64 << std::endl;
   }
 
-  return device_count;
+  return static_cast<int>(device_count);
   // return 2; // scale测试用
 }
 
-void CudaMonitor(int device_count) {
-  nvmlReturn_t result;
+void AmdGpuMonitor(int device_count) {
+  for (uint32_t i = 0; i < static_cast<uint32_t>(device_count); ++i) {
+    char name_buffer[256] = {};
+    rsmi_status_t result =
+        rsmi_dev_name_get(i, name_buffer, sizeof(name_buffer));
+    std::string name = "AMDGPU " + std::to_string(i);
+    if (result == RSMI_STATUS_SUCCESS && name_buffer[0] != '\0') {
+      name = name_buffer;
+    } else {
+      std::cerr << "Failed to get name for GPU " << i << ": "
+                << rsmiErrorString(result) << std::endl;
+    }
 
-  for (unsigned int i = 0; i < device_count; ++i) {
-      nvmlDevice_t device;
-      char name[NVML_DEVICE_NAME_BUFFER_SIZE];
-      nvmlUtilization_t utilization;
-      nvmlMemory_t memoryInfo;
+    uint32_t utilization = 0;
+    result = rsmi_dev_busy_percent_get(i, &utilization);
+    if (result != RSMI_STATUS_SUCCESS) {
+      std::cerr << "Failed to get utilization for GPU " << i << ": "
+                << rsmiErrorString(result) << std::endl;
+      continue;
+    }
 
-      result = nvmlDeviceGetHandleByIndex(i, &device);
-      if (result != NVML_SUCCESS) {
-        std::string errorMsg = "Failed to get handle for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
-        perror(errorMsg.c_str());
-        continue;
-      }
+    uint64_t memoryTotal = 0;
+    result = rsmi_dev_memory_total_get(i, RSMI_MEM_TYPE_VRAM, &memoryTotal);
+    if (result != RSMI_STATUS_SUCCESS) {
+      std::cerr << "Failed to get memory total for GPU " << i << ": "
+                << rsmiErrorString(result) << std::endl;
+      continue;
+    }
 
-      result = nvmlDeviceGetName(device, name, NVML_DEVICE_NAME_BUFFER_SIZE);
-      if (result != NVML_SUCCESS) {
-        std::string errorMsg = "Failed to get name for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
-        perror(errorMsg.c_str());
-        continue;
-      }
+    uint64_t memoryUsed = 0;
+    result = rsmi_dev_memory_usage_get(i, RSMI_MEM_TYPE_VRAM, &memoryUsed);
+    if (result != RSMI_STATUS_SUCCESS) {
+      std::cerr << "Failed to get memory usage for GPU " << i << ": "
+                << rsmiErrorString(result) << std::endl;
+      continue;
+    }
 
-      result = nvmlDeviceGetUtilizationRates(device, &utilization);
-      if (result != NVML_SUCCESS) {
-        std::string errorMsg = "Failed to get utilization for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
-        perror(errorMsg.c_str());
-        continue;
-      }
+    const uint64_t memoryFree =
+        memoryTotal > memoryUsed ? memoryTotal - memoryUsed : 0;
 
-      // std::cout << "GPU " << i << " (" << name << "):" << std::endl;
-      // std::cout << "  GPU Utilization: " << utilization.gpu << "%" << std::endl;
-      // std::cout << "  Memory Utilization: " << utilization.memory << "%" << std::endl;
-
-      result = nvmlDeviceGetMemoryInfo(device, &memoryInfo);
-      if (result != NVML_SUCCESS) {
-        std::string errorMsg = "Failed to get memory info for GPU " + std::to_string(i) + ": " + nvmlErrorString(result);
-        perror(errorMsg.c_str());
-        continue;
-      }
-
-      // std::cout << "GPU " << i << " (" << name << "):" << std::endl;
-      // std::cout << "  Memory Total: " << memoryInfo.total / 1024.0 << " kB" << std::endl;
-      // std::cout << "  Memory Used: " << memoryInfo.used / 1024.0 << " kB" << std::endl;
-      // std::cout << "  Memory Free: " << memoryInfo.free / 1024.0 << " kB" << std::endl;
-
-      int device_index = i + 1;
-      auto sycl_it = index_nvml_sycl.find(device_index);
-      if (sycl_it != index_nvml_sycl.end()) {
-        device_index = sycl_it->second;
-      }
-      if (device_index >= static_cast<int>(device_monitor_info.size())) {
-        device_monitor_info.resize(device_index + 1);
-      }
-      if (device_index >= static_cast<int>(device_capability.size())) {
-        device_capability.resize(device_index + 1,
-                                 fallbackCapabilityForProc(device_index));
-      }
-      device_monitor_info[device_index] =
-          MonitorInfo{name, utilization.gpu, memoryInfo.free / 1024.0};
-      device_capability[device_index] =
-          inferDeviceCapabilityFromName(name, false);
+    int device_index = i + 1;
+    auto sycl_it = index_rsmi_sycl.find(device_index);
+    if (sycl_it != index_rsmi_sycl.end()) {
+      device_index = sycl_it->second;
+    }
+    if (device_index >= static_cast<int>(device_monitor_info.size())) {
+      device_monitor_info.resize(device_index + 1);
+    }
+    if (device_index >= static_cast<int>(device_capability.size())) {
+      device_capability.resize(device_index + 1,
+                               fallbackCapabilityForProc(device_index));
+    }
+    device_monitor_info[device_index] =
+        MonitorInfo{name, static_cast<double>(utilization),
+                    static_cast<size_t>(memoryFree / 1024)};
+    device_capability[device_index] =
+        maxCapability(device_capability[device_index],
+                      inferDeviceCapabilityFromName(name, false));
   }
 }
 
@@ -2348,7 +2359,7 @@ void *SystemMonitor(void *arg) {
     CPUMonitor();
     
     if(device_count != -1) {
-      CudaMonitor(device_count);
+      AmdGpuMonitor(device_count);
     }
 
     // for(int i = 0; i < device_monitor_info.size(); i++) {

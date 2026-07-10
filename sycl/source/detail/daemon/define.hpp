@@ -6,7 +6,7 @@
 // #define PRINT_KERNEL 1 // commands.cpp中kernel所有参数
 // #define PRINT_TRACE 1 // 整个运行时trace
 // #define MODIFY 1 // DAG和MPI相关 暂时弃用
-// #define CUDA_RT 1 // pi_cuda.cpp中调用cuda运行时
+// #define HIP_RT 1 // pi_hip.cpp中调用HIP运行时
 // #define PRINT_DAEMON_TRACE 1 // daemon.cpp调度/通信trace
 // #define PRINT_HANDLER_TRACE 1 // handler.cpp离线调度trace
 // #define PRINT_DAG_TRACE 1 // scheduler/graph_builder/commands DAG trace
