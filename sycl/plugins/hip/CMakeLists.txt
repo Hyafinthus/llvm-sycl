@@ -5,7 +5,20 @@ set(SYCL_BUILD_PI_HIP_PLATFORM "AMD" CACHE STRING "PI HIP platform, AMD or NVIDI
 message(STATUS "Including the PI API HIP backend for ${SYCL_BUILD_PI_HIP_PLATFORM}.")
 
 # Set default ROCm installation directory
-set(SYCL_BUILD_PI_HIP_ROCM_DIR "/opt/rocm" CACHE STRING "ROCm installation dir")
+set(SYCL_DEFAULT_ROCM_DIR "/opt/rocm")
+if(DEFINED ENV{ROCM_PATH} AND NOT "$ENV{ROCM_PATH}" STREQUAL "")
+  set(SYCL_DEFAULT_ROCM_DIR "$ENV{ROCM_PATH}")
+elseif(DEFINED ENV{ACPP_ROCM_PATH} AND NOT "$ENV{ACPP_ROCM_PATH}" STREQUAL "")
+  set(SYCL_DEFAULT_ROCM_DIR "$ENV{ACPP_ROCM_PATH}")
+elseif(DEFINED ENV{HIP_PATH} AND NOT "$ENV{HIP_PATH}" STREQUAL "")
+  get_filename_component(SYCL_DEFAULT_ROCM_DIR "$ENV{HIP_PATH}/.." ABSOLUTE)
+endif()
+
+set(SYCL_BUILD_PI_HIP_ROCM_DIR "${SYCL_DEFAULT_ROCM_DIR}" CACHE STRING "ROCm installation dir")
+if(SYCL_BUILD_PI_HIP_ROCM_DIR STREQUAL "/opt/rocm" AND
+   NOT SYCL_DEFAULT_ROCM_DIR STREQUAL "/opt/rocm")
+  set(SYCL_BUILD_PI_HIP_ROCM_DIR "${SYCL_DEFAULT_ROCM_DIR}" CACHE STRING "ROCm installation dir" FORCE)
+endif()
 
 if(NOT EXISTS "${SYCL_BUILD_PI_HIP_ROCM_DIR}")
   message(FATAL_ERROR "Couldn't find ROCm installation in '${SYCL_BUILD_PI_HIP_ROCM_DIR}',"
@@ -73,4 +86,3 @@ elseif("${SYCL_BUILD_PI_HIP_PLATFORM}" STREQUAL "NVIDIA")
 else()
   message(FATAL_ERROR "Unspecified PI HIP platform please set SYCL_BUILD_PI_HIP_PLATFORM to 'AMD' or 'NVIDIA'")
 endif()
-
