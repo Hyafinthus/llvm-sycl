@@ -376,15 +376,21 @@ target_include_directories(sycl-daemon PRIVATE
   ${SYCL_DAEMON_ROCM_SMI_INCLUDE_DIR}
   ${MPI_CXX_INCLUDE_PATH}
 )
-target_compile_definitions(sycl-daemon PRIVATE __HIP_PLATFORM_AMD__)
+target_compile_definitions(sycl-daemon PRIVATE
+  __HIP_PLATFORM_AMD__
+  __HIP_PLATFORM_HCC__
+)
 target_link_libraries(sycl-daemon
   sycl
+  OpenCL-Headers
   rt
   pthread
   sycl_daemon_amdhip64
   sycl_daemon_rocm_smi
   ${MPI_CXX_LIBRARIES}
 )
+
+target_link_libraries(sycl-submit PRIVATE rt)
 
 install(TARGETS ${SYCL_RT_LIBS} sycl-daemon sycl-submit
   ARCHIVE DESTINATION "lib${LLVM_LIBDIR_SUFFIX}" COMPONENT sycl

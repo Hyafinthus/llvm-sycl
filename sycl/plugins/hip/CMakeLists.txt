@@ -55,7 +55,10 @@ if("${SYCL_BUILD_PI_HIP_PLATFORM}" STREQUAL "AMD")
   target_link_libraries(pi_hip PUBLIC rocmdrv)
 
   # Set HIP define to select AMD platform
-  target_compile_definitions(pi_hip PRIVATE __HIP_PLATFORM_AMD__)
+  target_compile_definitions(pi_hip PRIVATE
+    __HIP_PLATFORM_AMD__
+    __HIP_PLATFORM_HCC__
+  )
 elseif("${SYCL_BUILD_PI_HIP_PLATFORM}" STREQUAL "NVIDIA")
   # Import CUDA libraries
   find_package(CUDA REQUIRED)
