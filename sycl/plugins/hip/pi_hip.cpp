@@ -606,7 +606,9 @@ pi_uint64 _pi_event::get_start_time() const {
   assert(is_started());
 
   PI_CHECK_ERROR(
-      hipEventElapsedTime(&miliSeconds, _pi_platform::evBase_, evStart_));
+      hipEventElapsedTime(&miliSeconds,
+                          context_->get_device()->get_platform()->evBase_,
+                          evStart_));
   return static_cast<pi_uint64>(miliSeconds * 1.0e6);
 }
 
@@ -615,7 +617,9 @@ pi_uint64 _pi_event::get_end_time() const {
   assert(is_started() && is_recorded());
 
   PI_CHECK_ERROR(
-      hipEventElapsedTime(&miliSeconds, _pi_platform::evBase_, evEnd_));
+      hipEventElapsedTime(&miliSeconds,
+                          context_->get_device()->get_platform()->evBase_,
+                          evEnd_));
   return static_cast<pi_uint64>(miliSeconds * 1.0e6);
 }
 
@@ -2053,16 +2057,14 @@ pi_result hip_piContextCreate(const pi_context_properties *properties,
           _pi_context::kind::user_defined, newContext, *devices});
     }
 
-    static std::once_flag initFlag;
-    std::call_once(
-        initFlag,
-        [](pi_result &err) {
-          // Use default stream to record base event counter
-          PI_CHECK_ERROR(
-              hipEventCreateWithFlags(&_pi_platform::evBase_, hipEventDefault));
-          PI_CHECK_ERROR(hipEventRecord(_pi_platform::evBase_, 0));
-        },
-        errcode_ret);
+    // Use one base event per HIP platform/device. HIP events from different
+    // contexts/devices cannot be mixed in hipEventElapsedTime.
+    pi_platform Platform = devices[0]->get_platform();
+    if (Platform->evBase_ == nullptr) {
+      PI_CHECK_ERROR(hipEventCreateWithFlags(&Platform->evBase_,
+                                             hipEventDefault));
+      PI_CHECK_ERROR(hipEventRecord(Platform->evBase_, 0));
+    }
 
     // For non-primary scoped contexts keep the last active on top of the stack
     // as `cuCtxCreate` replaces it implicitly otherwise.
@@ -5413,7 +5415,8 @@ pi_result hip_piGetDeviceAndHostTimer(pi_device Device, uint64_t *DeviceTime,
 
     float elapsedTime = 0.0f;
     PI_CHECK_ERROR(
-        hipEventElapsedTime(&elapsedTime, _pi_platform::evBase_, event));
+        hipEventElapsedTime(&elapsedTime, Device->get_platform()->evBase_,
+                            event));
     *DeviceTime = (uint64_t)(elapsedTime * (double)1e6);
   }
   return PI_SUCCESS;
@@ -5580,5 +5583,3 @@ pi_result piPluginInit(pi_plugin *PluginInit) {
 #endif
 
 } // extern "C"
-
-hipEvent_t _pi_platform::evBase_{nullptr};
