@@ -47,6 +47,17 @@ if(NOT SYCL_DAEMON_ROCM_SMI_INCLUDE_DIR)
   message(FATAL_ERROR "Couldn't find ROCm SMI headers under '${SYCL_BUILD_PI_HIP_ROCM_DIR}'.")
 endif()
 
+find_path(SYCL_DAEMON_HSA_INCLUDE_DIR
+  NAMES hsa/hsa.h
+  PATHS
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/hsa/include"
+    "${SYCL_BUILD_PI_HIP_ROCM_DIR}/include"
+  NO_DEFAULT_PATH
+)
+if(NOT SYCL_DAEMON_HSA_INCLUDE_DIR)
+  message(FATAL_ERROR "Couldn't find HSA headers under '${SYCL_BUILD_PI_HIP_ROCM_DIR}'.")
+endif()
+
 find_library(SYCL_DAEMON_AMDHIP64_LIBRARY
   NAMES amdhip64
   PATHS
@@ -76,7 +87,7 @@ endif()
 add_library(sycl_daemon_amdhip64 SHARED IMPORTED)
 set_target_properties(sycl_daemon_amdhip64 PROPERTIES
   IMPORTED_LOCATION "${SYCL_DAEMON_AMDHIP64_LIBRARY}"
-  INTERFACE_INCLUDE_DIRECTORIES "${SYCL_DAEMON_HIP_INCLUDE_DIR}"
+  INTERFACE_INCLUDE_DIRECTORIES "${SYCL_DAEMON_HIP_INCLUDE_DIR};${SYCL_DAEMON_HSA_INCLUDE_DIR}"
 )
 
 add_library(sycl_daemon_rocm_smi SHARED IMPORTED)
@@ -373,6 +384,7 @@ add_dependencies(sycl-daemon sycl)
 target_include_directories(sycl-daemon PRIVATE
   ${sycl_inc_dir}
   ${SYCL_DAEMON_HIP_INCLUDE_DIR}
+  ${SYCL_DAEMON_HSA_INCLUDE_DIR}
   ${SYCL_DAEMON_ROCM_SMI_INCLUDE_DIR}
   ${MPI_CXX_INCLUDE_PATH}
 )
