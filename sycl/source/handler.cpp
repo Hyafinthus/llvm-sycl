@@ -2204,9 +2204,14 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   if (NumParts > 1) {
     std::vector<int> ValidSplitDevices;
     for (int DeviceIndex : SplitDevices) {
-      if (DeviceIndex <= 0 ||
+      if (DeviceIndex < 0 ||
           DeviceIndex >= static_cast<int>(PM.globalDevices.size())) {
         HANDLER_TRACE_STREAM << "=== handler === Split device_index out of range: "
+                  << DeviceIndex << std::endl;
+        continue;
+      }
+      if (PM.globalDevices[DeviceIndex].is_cpu()) {
+        HANDLER_TRACE_STREAM << "=== handler === Split device_index is CPU: "
                   << DeviceIndex << std::endl;
         continue;
       }
