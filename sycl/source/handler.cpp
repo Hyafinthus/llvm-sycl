@@ -129,6 +129,31 @@ findOfflineKernelCg(std::vector<detail::SyclKernelCg *> &KernelCgs,
   return *It;
 }
 
+static bool offlineDeviceListHasDaemonCpuSlot() {
+  const auto &Devices = detail::ProgramManager::getInstance().globalDevices;
+  return !Devices.empty() && Devices.front().is_cpu();
+}
+
+static int offlineSchedulerToLocalDeviceIndex(int SchedulerDeviceIndex) {
+  if (offlineDeviceListHasDaemonCpuSlot()) {
+    return SchedulerDeviceIndex;
+  }
+
+  // The daemon model reserves proc 0 for CPU and numbers GPUs as 1..N.
+  // HIP-only SYCL device lists usually contain only GPUs indexed as 0..N-1.
+  if (SchedulerDeviceIndex > 0) {
+    return SchedulerDeviceIndex - 1;
+  }
+  return SchedulerDeviceIndex;
+}
+
+static int offlineLocalToSchedulerDeviceIndex(int LocalDeviceIndex) {
+  if (offlineDeviceListHasDaemonCpuSlot()) {
+    return LocalDeviceIndex;
+  }
+  return LocalDeviceIndex + 1;
+}
+
 static int clampOfflineDeviceIndex(int RequestedDeviceIndex) {
   const auto &Devices = detail::ProgramManager::getInstance().globalDevices;
   if (Devices.empty()) {
@@ -137,17 +162,21 @@ static int clampOfflineDeviceIndex(int RequestedDeviceIndex) {
         PI_ERROR_INVALID_OPERATION);
   }
 
-  if (RequestedDeviceIndex >= 0 &&
-      RequestedDeviceIndex < static_cast<int>(Devices.size())) {
-    return RequestedDeviceIndex;
+  const int LocalDeviceIndex =
+      offlineSchedulerToLocalDeviceIndex(RequestedDeviceIndex);
+  if (LocalDeviceIndex >= 0 &&
+      LocalDeviceIndex < static_cast<int>(Devices.size())) {
+    return LocalDeviceIndex;
   }
 
   const int ClampedDeviceIndex =
-      std::min(std::max(RequestedDeviceIndex, 0),
+      std::min(std::max(LocalDeviceIndex, 0),
                static_cast<int>(Devices.size()) - 1);
-  HANDLER_TRACE_STREAM << "=== handler === Offline device_index out of range: requested "
-            << RequestedDeviceIndex << " available " << Devices.size()
-            << ", use " << ClampedDeviceIndex << std::endl;
+  HANDLER_TRACE_STREAM
+      << "=== handler === Offline device_index out of range: scheduler "
+      << RequestedDeviceIndex << " local " << LocalDeviceIndex
+      << " available " << Devices.size() << ", use " << ClampedDeviceIndex
+      << std::endl;
   return ClampedDeviceIndex;
 }
 
@@ -159,9 +188,11 @@ normalizeOfflineSplitDevices(const D2SKernelExecInfo &KernelExecInfo,
   std::vector<int> SplitDevices;
   const int RequestedParts = std::max(1, KernelExecInfo.num_parts);
 
-  auto addDevice = [&](int DeviceIndex) {
-    if (DeviceIndex <= 0 ||
-        DeviceIndex >= static_cast<int>(Devices.size())) {
+  auto addLocalDevice = [&](int DeviceIndex) {
+    if (DeviceIndex < 0 || DeviceIndex >= static_cast<int>(Devices.size())) {
+      return;
+    }
+    if (Devices[DeviceIndex].is_cpu()) {
       return;
     }
     if (std::find(SplitDevices.begin(), SplitDevices.end(), DeviceIndex) !=
@@ -173,14 +204,15 @@ normalizeOfflineSplitDevices(const D2SKernelExecInfo &KernelExecInfo,
 
   if (RequestedParts > 1) {
     for (int DeviceIndex : KernelExecInfo.split_devices) {
-      addDevice(DeviceIndex);
+      addLocalDevice(offlineSchedulerToLocalDeviceIndex(DeviceIndex));
     }
-    addDevice(ActualDeviceIndex);
-    for (int DeviceIndex = 1;
+    addLocalDevice(ActualDeviceIndex);
+    const int FirstGpuDeviceIndex = offlineDeviceListHasDaemonCpuSlot() ? 1 : 0;
+    for (int DeviceIndex = FirstGpuDeviceIndex;
          DeviceIndex < static_cast<int>(Devices.size()) &&
          static_cast<int>(SplitDevices.size()) < RequestedParts;
          ++DeviceIndex) {
-      addDevice(DeviceIndex);
+      addLocalDevice(DeviceIndex);
     }
   }
 
@@ -2679,7 +2711,9 @@ event handler::scheduleOffline() {
         ProfileNumParts =
             static_cast<int>(detail::ProgramManager::getInstance().NumParts);
 #endif
-        profile_events.push_back({kernel_count, ActualDeviceIndex,
+        const int ProfileDeviceIndex =
+            offlineLocalToSchedulerDeviceIndex(ActualDeviceIndex);
+        profile_events.push_back({kernel_count, ProfileDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,
                                   HostEnd, last_event});
         HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === resubmit kernel: " << kernel_count << std::endl;
@@ -2934,7 +2968,9 @@ event handler::scheduleOffline() {
         ProfileNumParts =
             static_cast<int>(detail::ProgramManager::getInstance().NumParts);
 #endif
-        profile_events.push_back({kernel_count, ActualDeviceIndex,
+        const int ProfileDeviceIndex =
+            offlineLocalToSchedulerDeviceIndex(ActualDeviceIndex);
+        profile_events.push_back({kernel_count, ProfileDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,
                                   HostEnd, last_event});
         HANDLER_TRACE_STREAM << getpid() << " === handler === resubmitted kernel: " << kernel_count << std::endl;
