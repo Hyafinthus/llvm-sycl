@@ -16,16 +16,13 @@
 #include <cstdint>
 #include <limits>
 #include <map>
-#include <stdexcept>
 #include <tuple>
 #include <unordered_set>
-#include <hip/hip_runtime_api.h>
 #include <rocm_smi/rocm_smi.h>
 
 #include "daemon.hpp"
 #include "define.hpp"
 #include <sycl/device.hpp>
-#include <sycl/ext/oneapi/backend/hip.hpp>
 // #include <sycl/access/access.hpp>
 
 volatile bool is_interrupted = false;
@@ -53,8 +50,7 @@ struct ComputeCapability {
   double fp32 = 1.0;
   double fp64 = 0.5;
 };
-std::map<int, int> index_sycl_rsmi; // 根据busid确定sycl::device到gpu映射
-std::map<int, int> index_rsmi_sycl;
+std::map<int, int> index_sycl_rsmi; // sycl::device index -> daemon GPU proc index
 std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
 std::vector<ComputeCapability> device_capability(1); // 本rank设备原始能力, 编号与handler的globalDevices一致
 std::vector<std::vector<MonitorInfo>> cluster_monitor_info;
@@ -2178,23 +2174,6 @@ static int rsmiBusIdFromBdf(uint64_t bdfid) {
   return static_cast<int>((bdfid >> 8) & 0xff);
 }
 
-int getHipPciBusId(const sycl::device &device) {
-  if (device.get_backend() != sycl::backend::ext_oneapi_hip) {
-    return -1;
-  }
-
-  const int hipDevice =
-      sycl::get_native<sycl::backend::ext_oneapi_hip>(device);
-  int busId = -1;
-  hipError_t err =
-      hipDeviceGetAttribute(&busId, hipDeviceAttributePciBusId, hipDevice);
-  if (err != hipSuccess) {
-    throw std::runtime_error("Failed to get PCI Bus ID for the HIP device: " +
-                             std::string(hipGetErrorString(err)));
-  }
-  return busId;
-}
-
 int MonitorInit() {
   device_capability.resize(1);
   device_capability[0] = inferCpuCapabilityFromName(readCpuModelName());
@@ -2217,7 +2196,7 @@ int MonitorInit() {
   DAEMON_TRACE_STREAM << "Number of GPUs: " << device_count << std::endl;
   device_capability.resize(device_count + 1, fallbackCapabilityForProc(1));
 
-  std::vector<int> rsmiBusIds(device_count, -1);
+  std::vector<uint64_t> rsmiBdfIds(device_count, 0);
   for (uint32_t i = 0; i < device_count; ++i) {
     uint64_t bdfid = 0;
     result = rsmi_dev_pci_id_get(i, &bdfid);
@@ -2230,7 +2209,7 @@ int MonitorInit() {
     const int rsmiBusId = rsmiBusIdFromBdf(bdfid);
     DAEMON_TRACE_STREAM << "GPU " << i << ": PCI BDF ID: 0x" << std::hex
               << bdfid << std::dec << " Bus ID: " << rsmiBusId << std::endl;
-    rsmiBusIds[i] = rsmiBusId;
+    rsmiBdfIds[i] = bdfid;
   }
 
   std::vector<sycl::device> globalDevices = sycl::device::get_devices();
@@ -2242,45 +2221,61 @@ int MonitorInit() {
     ),
     globalDevices.end()
   );
+  int hip_gpu_count = 0;
   for (int i = 0; i < static_cast<int>(globalDevices.size()); i++) {
     sycl::device device = globalDevices[i];
-    if (i >= static_cast<int>(device_capability.size())) {
-      device_capability.resize(i + 1, fallbackCapabilityForProc(i));
-    }
     std::string sycl_device_name =
         device.get_info<sycl::info::device::name>();
     if (device.is_cpu()) {
       device_capability[0] =
           maxCapability(device_capability[0],
                         inferDeviceCapabilityFromName(sycl_device_name, true));
-    }
-
-    int busId = -1;
-    try {
-      busId = getHipPciBusId(device);
-    } catch (const std::exception &e) {
-      std::cerr << e.what() << std::endl;
+      DAEMON_TRACE_STREAM << "SYCL Device " << i << " (" << sycl_device_name
+                << ") mapped to daemon CPU proc 0" << std::endl;
       continue;
     }
-    DAEMON_TRACE_STREAM << "SYCL Device " << i << " (" << sycl_device_name
-              << "): PCI Bus ID: " << busId << std::endl;
 
-    if (busId != -1) {
-      auto it = std::find(rsmiBusIds.begin(), rsmiBusIds.end(), busId);
-      if (it != rsmiBusIds.end()) {
-        index_sycl_rsmi[i] = std::distance(rsmiBusIds.begin(), it) + 1;
-        index_rsmi_sycl[index_sycl_rsmi[i]] = i;
-        device_capability[i] =
-            inferDeviceCapabilityFromName(sycl_device_name, false);
-      }
+    if (device.get_backend() != sycl::backend::ext_oneapi_hip ||
+        !device.is_gpu()) {
+      DAEMON_TRACE_STREAM << "SYCL Device " << i << " (" << sycl_device_name
+                << ") skipped for AMDGPU monitor mapping" << std::endl;
+      continue;
     }
+
+    const int proc_index = hip_gpu_count + 1;
+    if (proc_index >= static_cast<int>(device_capability.size())) {
+      device_capability.resize(proc_index + 1,
+                               fallbackCapabilityForProc(proc_index));
+    }
+    index_sycl_rsmi[i] = proc_index;
+    device_capability[proc_index] =
+        inferDeviceCapabilityFromName(sycl_device_name, false);
+
+    const uint64_t bdfid =
+        hip_gpu_count < static_cast<int>(rsmiBdfIds.size())
+            ? rsmiBdfIds[hip_gpu_count]
+            : 0;
+    DAEMON_TRACE_STREAM << "SYCL Device " << i << " (" << sycl_device_name
+              << ") mapped to daemon GPU proc " << proc_index;
+    if (bdfid != 0) {
+      DAEMON_TRACE_STREAM << " RSMI GPU " << hip_gpu_count
+                << " PCI BDF ID: 0x" << std::hex << bdfid << std::dec
+                << " Bus ID: " << rsmiBusIdFromBdf(bdfid);
+    }
+    DAEMON_TRACE_STREAM << std::endl;
+    hip_gpu_count++;
+  }
+  if (hip_gpu_count != static_cast<int>(device_count)) {
+    std::cerr << "AMDGPU monitor mapping warning: SYCL HIP GPU count "
+              << hip_gpu_count << " differs from ROCm SMI GPU count "
+              << device_count << std::endl;
   }
   for (auto pair : index_sycl_rsmi) {
     DAEMON_TRACE_STREAM << "SYCL Device " << pair.first << " mapped to GPU "
               << pair.second << " fp32 capability "
-              << device_capability[pair.first].fp32
+              << device_capability[pair.second].fp32
               << " fp64 capability "
-              << device_capability[pair.first].fp64 << std::endl;
+              << device_capability[pair.second].fp64 << std::endl;
   }
 
   return static_cast<int>(device_count);
@@ -2328,10 +2323,6 @@ void AmdGpuMonitor(int device_count) {
         memoryTotal > memoryUsed ? memoryTotal - memoryUsed : 0;
 
     int device_index = i + 1;
-    auto sycl_it = index_rsmi_sycl.find(device_index);
-    if (sycl_it != index_rsmi_sycl.end()) {
-      device_index = sycl_it->second;
-    }
     if (device_index >= static_cast<int>(device_monitor_info.size())) {
       device_monitor_info.resize(device_index + 1);
     }
