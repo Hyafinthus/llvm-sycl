@@ -1259,7 +1259,7 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
         NDRDescT NewNDR = OldNDR;
         const size_t begin0 = p * chunk;
         const size_t end0 = (p + 1 == NumParts) ? dim0 : (begin0 + chunk);
-        NewNDR.GlobalOffset[0] = begin0;
+        NewNDR.GlobalOffset[0] = OldNDR.GlobalOffset[0] + begin0;
         NewNDR.GlobalSize[0] = end0 - begin0;
         DAG_TRACE_STREAM << "=== graph_builder.cpp === Split CG " << p << ": begin0: " << begin0 << " end0: " << end0 << "\n";
 

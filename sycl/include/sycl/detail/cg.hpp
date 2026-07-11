@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace sycl {
@@ -177,15 +178,72 @@ public:
 // #define SNMD_OFFLINE
 #ifdef SNMD_OFFLINE
   std::unique_ptr<CGExecKernel> cloneForSplit(const NDRDescT &NewNDR) const {
-    // CG基类里有 MArgsStorage MAccStorage MSharedPtrStorage MRequirements MEvents
-    // 复制 保证新CG生命周期独立
+    // CG base owns accessor implementations through MAccStorage, while MArgs
+    // stores raw pointers to each accessor and its layout fields.  Split CGs
+    // must not share those raw pointers because each split command may be
+    // wired to a different allocation and context.
     auto ArgsStorageCopy = MArgsStorage; // vector<vector<char>>
-    auto AccStorageCopy = MAccStorage; // vector<AccessorImplPtr>
+    std::vector<detail::AccessorImplPtr> AccStorageCopy;
+    AccStorageCopy.reserve(MAccStorage.size() + MRequirements.size());
+    std::vector<std::pair<AccessorImplHost *, AccessorImplHost *>> ReqMap;
+
+    auto FindMappedReq = [&ReqMap](AccessorImplHost *OldReq) {
+      for (const auto &Entry : ReqMap) {
+        if (Entry.first == OldReq)
+          return Entry.second;
+      }
+      return static_cast<AccessorImplHost *>(nullptr);
+    };
+
+    for (const detail::AccessorImplPtr &Acc : MAccStorage) {
+      if (!Acc) {
+        AccStorageCopy.push_back(nullptr);
+        continue;
+      }
+      auto AccCopy = std::make_shared<AccessorImplHost>(*Acc);
+      ReqMap.push_back({Acc.get(), AccCopy.get()});
+      AccStorageCopy.push_back(std::move(AccCopy));
+    }
+
+    for (AccessorImplHost *Req : MRequirements) {
+      if (Req == nullptr || FindMappedReq(Req) != nullptr)
+        continue;
+      auto ReqCopy = std::make_shared<AccessorImplHost>(*Req);
+      ReqMap.push_back({Req, ReqCopy.get()});
+      AccStorageCopy.push_back(std::move(ReqCopy));
+    }
+
     auto SharedPtrStorageCopy = MSharedPtrStorage;
     auto EventsCopy = MEvents;
 
     auto ReqsCopy = MRequirements; // vector<AccessorImplHost *>
+    for (AccessorImplHost *&Req : ReqsCopy) {
+      if (AccessorImplHost *MappedReq = FindMappedReq(Req))
+        Req = MappedReq;
+    }
+
     auto ArgsCopy = MArgs; // vector<ArgDesc>
+    auto RemapReqArgPtr = [&ReqMap](void *Ptr) -> void * {
+      for (const auto &Entry : ReqMap) {
+        AccessorImplHost *OldReq = Entry.first;
+        AccessorImplHost *NewReq = Entry.second;
+        if (Ptr == OldReq)
+          return NewReq;
+        if (Ptr == static_cast<void *>(&OldReq->MAccessRange[0]))
+          return &NewReq->MAccessRange[0];
+        if (Ptr == static_cast<void *>(&OldReq->MMemoryRange[0]))
+          return &NewReq->MMemoryRange[0];
+        if (Ptr == static_cast<void *>(&OldReq->MOffset[0]))
+          return &NewReq->MOffset[0];
+      }
+      return Ptr;
+    };
+    for (ArgDesc &Arg : ArgsCopy) {
+      if (Arg.MType == kernel_param_kind_t::kind_accessor ||
+          Arg.MType == kernel_param_kind_t::kind_std_layout) {
+        Arg.MPtr = RemapReqArgPtr(Arg.MPtr);
+      }
+    }
 
     return std::make_unique<CGExecKernel>(
         NewNDR,
