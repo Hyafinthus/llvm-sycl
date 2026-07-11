@@ -8,6 +8,7 @@
 
 #include <detail/event_impl.hpp>
 #include <detail/memory_manager.hpp>
+#include <detail/program_manager/program_manager.hpp>
 #include <detail/queue_impl.hpp>
 #include <sycl/context.hpp>
 #include <sycl/detail/common.hpp>
@@ -468,6 +469,21 @@ void queue_impl::wait(const detail::code_location &CodeLoc) {
   std::string Name;
   int32_t StreamID = xptiRegisterStream(SYCL_STREAM_NAME);
   TelemetryEvent = instrumentationProlog(CodeLoc, Name, StreamID, IId);
+#endif
+
+#if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+  {
+    auto &PM = ProgramManager::getInstance();
+    if (!PM.kernel_cgs.empty()) {
+      QueueImplPtr FlushQueue = PM.kernel_cgs.front()->kernel_queue;
+      if (FlushQueue) {
+        handler OfflineFlushHandler(FlushQueue, FlushQueue, nullptr,
+                                    FlushQueue->is_host());
+        event LastEvent = OfflineFlushHandler.scheduleOffline();
+        LastEvent.wait();
+      }
+    }
+  }
 #endif
 
   std::vector<std::weak_ptr<event_impl>> WeakEvents;

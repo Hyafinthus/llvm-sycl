@@ -7,7 +7,10 @@
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <iostream>
+#include <sstream>
 #include <utility>
 
 #include <detail/config.hpp>
@@ -71,6 +74,161 @@ handler::handler(std::shared_ptr<detail::queue_impl> Queue,
       MQueue(std::move(Queue)), MIsHost(IsHost) {}
 
 #if defined(SCHEDULE) || defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+static constexpr const char *OfflineMqMultipartTag =
+    "SYCL_OFFLINE_MQ_MULTIPART_V1";
+
+static void sendOfflineMqPayload(mqd_t Queue, const std::string &Payload,
+                                 size_t MaxMessageSize,
+                                 const char *Description) {
+  if (Payload.size() <= MaxMessageSize) {
+    if (mq_send(Queue, Payload.c_str(), Payload.size(), 0) == -1) {
+      std::string ErrorMsg =
+          std::string("Error: ") + Description + " mq_send failed";
+      perror(ErrorMsg.c_str());
+      exit(1);
+    }
+    return;
+  }
+
+  const size_t ChunkPayloadSize = MaxMessageSize;
+  const size_t ChunkCount =
+      (Payload.size() + ChunkPayloadSize - 1) / ChunkPayloadSize;
+  std::ostringstream Header;
+  Header << OfflineMqMultipartTag << "\n" << Payload.size() << "\n"
+         << ChunkCount << "\n";
+  std::string HeaderPayload = Header.str();
+  if (HeaderPayload.size() > MaxMessageSize) {
+    std::cerr << "Error: " << Description
+              << " multipart header exceeds mq message size" << std::endl;
+    exit(1);
+  }
+
+  if (mq_send(Queue, HeaderPayload.c_str(), HeaderPayload.size(), 0) == -1) {
+    std::string ErrorMsg =
+        std::string("Error: ") + Description + " multipart header mq_send failed";
+    perror(ErrorMsg.c_str());
+    exit(1);
+  }
+
+  for (size_t Offset = 0; Offset < Payload.size();
+       Offset += ChunkPayloadSize) {
+    const size_t ChunkSize =
+        std::min(ChunkPayloadSize, Payload.size() - Offset);
+    if (mq_send(Queue, Payload.data() + Offset, ChunkSize, 0) == -1) {
+      std::string ErrorMsg =
+          std::string("Error: ") + Description + " multipart chunk mq_send failed";
+      perror(ErrorMsg.c_str());
+      exit(1);
+    }
+  }
+
+  HANDLER_TRACE_STREAM << "=== handler === " << Description
+                       << " multipart mq_send payload_size: "
+                       << Payload.size() << " chunks: " << ChunkCount
+                       << std::endl;
+}
+
+static bool parseOfflineMqMultipartHeader(const std::string &Message,
+                                          size_t &PayloadSize,
+                                          size_t &ChunkCount) {
+  std::istringstream Stream(Message);
+  std::string Tag;
+  std::getline(Stream, Tag);
+  if (Tag != OfflineMqMultipartTag) {
+    return false;
+  }
+  Stream >> PayloadSize;
+  Stream >> ChunkCount;
+  return Stream.good() || Stream.eof();
+}
+
+static std::string receiveOfflineMqPayload(mqd_t Queue, size_t MaxMessageSize,
+                                           const char *Description) {
+  std::vector<char> Buffer(MaxMessageSize);
+  ssize_t BytesReceived =
+      mq_receive(Queue, Buffer.data(), MaxMessageSize, nullptr);
+  if (BytesReceived <= 0) {
+    std::string ErrorMsg =
+        std::string("Error: ") + Description + " mq_receive failed";
+    perror(ErrorMsg.c_str());
+    exit(1);
+  }
+
+  std::string Message(Buffer.data(), static_cast<size_t>(BytesReceived));
+  size_t PayloadSize = 0;
+  size_t ChunkCount = 0;
+  if (!parseOfflineMqMultipartHeader(Message, PayloadSize, ChunkCount)) {
+    return Message;
+  }
+
+  std::string Payload;
+  Payload.reserve(PayloadSize);
+  for (size_t I = 0; I < ChunkCount; ++I) {
+    BytesReceived = mq_receive(Queue, Buffer.data(), MaxMessageSize, nullptr);
+    if (BytesReceived <= 0) {
+      std::string ErrorMsg = std::string("Error: ") + Description +
+                             " multipart chunk mq_receive failed";
+      perror(ErrorMsg.c_str());
+      exit(1);
+    }
+    Payload.append(Buffer.data(), static_cast<size_t>(BytesReceived));
+  }
+
+  if (Payload.size() != PayloadSize) {
+    std::cerr << "Error: " << Description
+              << " multipart payload size mismatch, expected " << PayloadSize
+              << " got " << Payload.size() << std::endl;
+    exit(1);
+  }
+
+  HANDLER_TRACE_STREAM << "=== handler === " << Description
+                       << " multipart mq_receive payload_size: "
+                       << Payload.size() << " chunks: " << ChunkCount
+                       << std::endl;
+  return Payload;
+}
+
+static std::vector<D2SKernelExecInfo>
+parseOfflineKernelExecInfos(const std::string &ReceivedData) {
+  std::vector<D2SKernelExecInfo> KernelExecInfos;
+  std::istringstream Stream(ReceivedData);
+  std::string Line;
+
+  while (std::getline(Stream, Line)) {
+    if (Line.empty()) {
+      continue;
+    }
+
+    std::string ObjData = Line + "\n"; // kernel_count
+    std::getline(Stream, Line);
+    ObjData += Line + "\n"; // exec
+    std::getline(Stream, Line);
+    ObjData += Line + "\n"; // device_index
+    std::getline(Stream, Line);
+    ObjData += Line + "\n"; // num_parts
+    std::getline(Stream, Line);
+    ObjData += Line + "\n"; // split_devices.size()
+    int SplitDeviceCount = std::stoi(Line);
+    for (int I = 0; I < SplitDeviceCount; ++I) {
+      std::getline(Stream, Line);
+      ObjData += Line + "\n"; // split device index
+    }
+    std::getline(Stream, Line);
+    ObjData += Line + "\n"; // scale_count
+    std::getline(Stream, Line);
+    ObjData += Line + "\n"; // req_counts.size()
+    int ReqCount = std::stoi(Line);
+    for (int I = 0; I < ReqCount; ++I) {
+      std::getline(Stream, Line);
+      ObjData += Line + "\n";
+    }
+
+    KernelExecInfos.push_back(D2SKernelExecInfo::deserialize(ObjData));
+  }
+
+  return KernelExecInfos;
+}
+
 static property_list
 getOfflineProfilingPropertyList(const detail::QueueImplPtr &Queue) {
   const property_list &Props = Queue->getPropertyList();
@@ -643,18 +801,10 @@ static void processOfflineProfilingBatch(
 #ifdef SCHEDULE_OFFLINE
   if (!Batch.profiles.empty()) {
     std::string SerializedData = Batch.serialize();
-    if (SerializedData.size() <= MAX_MSG_DAEMON_SIZE) {
-      if (mq_send(mq_id_daemon, SerializedData.c_str(), SerializedData.size(),
-                  0) == -1) {
-        perror("Error: Offline profiling mq_send failed");
-      } else {
-        HANDLER_TRACE_STREAM << "=== handler === Offline profiling sent samples: "
-                  << Batch.profiles.size() << std::endl;
-      }
-    } else {
-      HANDLER_TRACE_STREAM << "=== handler === Offline profiling message too large: "
-                << SerializedData.size() << std::endl;
-    }
+    sendOfflineMqPayload(mq_id_daemon, SerializedData, MAX_MSG_DAEMON_SIZE,
+                         "Offline profiling");
+    HANDLER_TRACE_STREAM << "=== handler === Offline profiling sent samples: "
+                         << Batch.profiles.size() << std::endl;
   }
 #endif
 }
@@ -2503,60 +2653,28 @@ event handler::scheduleOffline() {
     // std::vector<D2SKernelExecInfo> &kernel_exec_infos = detail::ProgramManager::getInstance().kernel_scale_exec_infos;
     std::vector<D2SKernelExecInfo> kernel_exec_infos;
     {
-      char buffer[MAX_MSG_DAEMON_SIZE];
-      ssize_t bytes_received = mq_receive(mq_id_program, buffer, MAX_MSG_PROGRAM_SIZE, nullptr);
-      
+      std::string received_data = receiveOfflineMqPayload(
+          mq_id_program, MAX_MSG_PROGRAM_SIZE, "scale kernel_exec_infos");
       HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === scale mq_receive kernel_exec_infos" << std::endl;
 
-      if (bytes_received > 0) {
-        std::string received_data(buffer, bytes_received);
-        std::istringstream stream(received_data);
-        std::string line;
-
-        while (std::getline(stream, line)) {
-          std::string obj_data = line + "\n";  // kernel_count
-          std::getline(stream, line);
-          obj_data += line + "\n";             // exec
-          std::getline(stream, line);
-          obj_data += line + "\n";             // device_index
-          std::getline(stream, line);
-          obj_data += line + "\n";             // num_parts
-          std::getline(stream, line);
-          obj_data += line + "\n";             // split_devices.size()
-          int split_device_count = std::stoi(line);
-          for (int i = 0; i < split_device_count; ++i) {
-            std::getline(stream, line);
-            obj_data += line + "\n";           // split device index
-          }
-          std::getline(stream, line);
-          obj_data += line + "\n";             // scale_count
-          std::getline(stream, line);
-          obj_data += line + "\n";             // req_counts.size()
-          int req_count = std::stoi(line);
-          for (int i = 0; i < req_count; ++i) {
-            std::getline(stream, line);
-            obj_data += line + "\n";
-          }
-          kernel_exec_infos.push_back(D2SKernelExecInfo::deserialize(obj_data));
-        }
-
-        for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
-          HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
-                    << " === scale mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
-                    << " exec: " << kernel_exec_info.exec
-                    << " device_index: " << kernel_exec_info.device_index
-                    << " num_parts: " << kernel_exec_info.num_parts
-                    << " split_devices:";
-          for (int DeviceIndex : kernel_exec_info.split_devices) {
-            HANDLER_TRACE_STREAM << " " << DeviceIndex;
-          }
-          HANDLER_TRACE_STREAM
-                    << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
-        }
-      } else {
-        std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " PROGRAM mq_receive failed";
-        perror(errorMsg.c_str());
+      kernel_exec_infos = parseOfflineKernelExecInfos(received_data);
+      if (kernel_exec_infos.empty()) {
+        std::cerr << "Error: Process " << getpid()
+                  << " received empty scale kernel_exec_infos" << std::endl;
         exit(1);
+      }
+      for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
+                  << " === scale mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
+                  << " exec: " << kernel_exec_info.exec
+                  << " device_index: " << kernel_exec_info.device_index
+                  << " num_parts: " << kernel_exec_info.num_parts
+                  << " split_devices:";
+        for (int DeviceIndex : kernel_exec_info.split_devices) {
+          HANDLER_TRACE_STREAM << " " << DeviceIndex;
+        }
+        HANDLER_TRACE_STREAM
+                  << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
       }
     }
     
@@ -2712,69 +2830,39 @@ event handler::scheduleOffline() {
       }
       size_t message_size = serialized_data.size();
 
-      mq_send(mq_id_daemon, serialized_data.c_str(), message_size, 0);
-      HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === mq_send kernel_req_datas" << std::endl;
+      sendOfflineMqPayload(mq_id_daemon, serialized_data,
+                           MAX_MSG_DAEMON_SIZE, "kernel_req_datas");
+      HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
+                           << " === mq_send kernel_req_datas size: "
+                           << kernel_req_datas.size()
+                           << " bytes: " << message_size << std::endl;
     }
 
     // DONE ====【接收daemon对每个kernel的执行决策】
     std::vector<D2SKernelExecInfo> kernel_exec_infos;
     {
-      char buffer[MAX_MSG_DAEMON_SIZE];
-      ssize_t bytes_received = mq_receive(mq_id_program, buffer, MAX_MSG_PROGRAM_SIZE, nullptr);
-      
+      std::string received_data = receiveOfflineMqPayload(
+          mq_id_program, MAX_MSG_PROGRAM_SIZE, "kernel_exec_infos");
       HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === mq_receive kernel_exec_infos" << std::endl;
 
-      if (bytes_received > 0) {
-        std::string received_data(buffer, bytes_received);
-        std::istringstream stream(received_data);
-        std::string line;
-
-        while (std::getline(stream, line)) {
-          std::string obj_data = line + "\n";  // kernel_count
-          std::getline(stream, line);
-          obj_data += line + "\n";             // exec
-          std::getline(stream, line);
-          obj_data += line + "\n";             // device_index
-          std::getline(stream, line);
-          obj_data += line + "\n";             // num_parts
-          std::getline(stream, line);
-          obj_data += line + "\n";             // split_devices.size()
-          int split_device_count = std::stoi(line);
-          for (int i = 0; i < split_device_count; ++i) {
-            std::getline(stream, line);
-            obj_data += line + "\n";           // split device index
-          }
-          std::getline(stream, line);
-          obj_data += line + "\n";             // scale_count
-          std::getline(stream, line);
-          obj_data += line + "\n";             // req_counts.size()
-
-          int req_count = std::stoi(line);
-          for (int i = 0; i < req_count; ++i) {
-            std::getline(stream, line);
-            obj_data += line + "\n";
-          }
-
-          kernel_exec_infos.push_back(D2SKernelExecInfo::deserialize(obj_data));
-        }
-
-        for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
-          HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
-                    << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
-                    << " exec: " << kernel_exec_info.exec
-                    << " device_index: " << kernel_exec_info.device_index
-                    << " num_parts: " << kernel_exec_info.num_parts
-                    << " split_devices:";
-          for (int DeviceIndex : kernel_exec_info.split_devices) {
-            HANDLER_TRACE_STREAM << " " << DeviceIndex;
-          }
-          HANDLER_TRACE_STREAM
-                    << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
-        }
-      } else {
-        std::string errorMsg = "Error: Process " + std::to_string(getpid()) + " PROGRAM mq_receive failed";
-        perror(errorMsg.c_str());
+      kernel_exec_infos = parseOfflineKernelExecInfos(received_data);
+      if (kernel_exec_infos.empty()) {
+        std::cerr << "Error: Process " << getpid()
+                  << " received empty kernel_exec_infos" << std::endl;
         exit(1);
+      }
+      for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
+        HANDLER_TRACE_STREAM << "=== handler === Process " << getpid()
+                  << " === mq_receive kernel_exec_info === kernel_count: " << kernel_exec_info.kernel_count
+                  << " exec: " << kernel_exec_info.exec
+                  << " device_index: " << kernel_exec_info.device_index
+                  << " num_parts: " << kernel_exec_info.num_parts
+                  << " split_devices:";
+        for (int DeviceIndex : kernel_exec_info.split_devices) {
+          HANDLER_TRACE_STREAM << " " << DeviceIndex;
+        }
+        HANDLER_TRACE_STREAM
+                  << " req_size: " << kernel_exec_info.req_counts.size() << std::endl;
       }
 
       // **注意** 这里与online不同 不会有scaledevice 也不会返回跳过

@@ -150,6 +150,118 @@ void CloseSubmit() {
   mq_unlink(MESSAGE_QUEUE_SUBMIT_NAME);
 }
 
+static constexpr const char *OfflineMqMultipartTag =
+    "SYCL_OFFLINE_MQ_MULTIPART_V1";
+
+static void sendOfflineMqPayload(mqd_t Queue, const std::string &Payload,
+                                 size_t MaxMessageSize,
+                                 const char *Description) {
+  if (Payload.size() <= MaxMessageSize) {
+    if (mq_send(Queue, Payload.c_str(), Payload.size(), 0) == -1) {
+      std::string ErrorMsg =
+          std::string("Error: ") + Description + " mq_send failed";
+      perror(ErrorMsg.c_str());
+      exit(1);
+    }
+    return;
+  }
+
+  const size_t ChunkPayloadSize = MaxMessageSize;
+  const size_t ChunkCount =
+      (Payload.size() + ChunkPayloadSize - 1) / ChunkPayloadSize;
+  std::ostringstream Header;
+  Header << OfflineMqMultipartTag << "\n" << Payload.size() << "\n"
+         << ChunkCount << "\n";
+  std::string HeaderPayload = Header.str();
+  if (HeaderPayload.size() > MaxMessageSize) {
+    std::cerr << "Error: " << Description
+              << " multipart header exceeds mq message size" << std::endl;
+    exit(1);
+  }
+
+  if (mq_send(Queue, HeaderPayload.c_str(), HeaderPayload.size(), 0) == -1) {
+    std::string ErrorMsg =
+        std::string("Error: ") + Description + " multipart header mq_send failed";
+    perror(ErrorMsg.c_str());
+    exit(1);
+  }
+
+  for (size_t Offset = 0; Offset < Payload.size();
+       Offset += ChunkPayloadSize) {
+    const size_t ChunkSize =
+        std::min(ChunkPayloadSize, Payload.size() - Offset);
+    if (mq_send(Queue, Payload.data() + Offset, ChunkSize, 0) == -1) {
+      std::string ErrorMsg =
+          std::string("Error: ") + Description + " multipart chunk mq_send failed";
+      perror(ErrorMsg.c_str());
+      exit(1);
+    }
+  }
+
+  DAEMON_TRACE_STREAM << Description << " multipart mq_send payload_size: "
+                      << Payload.size() << " chunks: " << ChunkCount
+                      << std::endl;
+}
+
+static bool parseOfflineMqMultipartHeader(const std::string &Message,
+                                          size_t &PayloadSize,
+                                          size_t &ChunkCount) {
+  std::istringstream Stream(Message);
+  std::string Tag;
+  std::getline(Stream, Tag);
+  if (Tag != OfflineMqMultipartTag) {
+    return false;
+  }
+  Stream >> PayloadSize;
+  Stream >> ChunkCount;
+  return Stream.good() || Stream.eof();
+}
+
+static std::string receiveOfflineMqPayload(mqd_t Queue, size_t MaxMessageSize,
+                                           const char *Description) {
+  std::vector<char> Buffer(MaxMessageSize);
+  ssize_t BytesReceived =
+      mq_receive(Queue, Buffer.data(), MaxMessageSize, nullptr);
+  if (BytesReceived <= 0) {
+    std::string ErrorMsg =
+        std::string("Error: ") + Description + " mq_receive failed";
+    perror(ErrorMsg.c_str());
+    exit(1);
+  }
+
+  std::string Message(Buffer.data(), static_cast<size_t>(BytesReceived));
+  size_t PayloadSize = 0;
+  size_t ChunkCount = 0;
+  if (!parseOfflineMqMultipartHeader(Message, PayloadSize, ChunkCount)) {
+    return Message;
+  }
+
+  std::string Payload;
+  Payload.reserve(PayloadSize);
+  for (size_t I = 0; I < ChunkCount; ++I) {
+    BytesReceived = mq_receive(Queue, Buffer.data(), MaxMessageSize, nullptr);
+    if (BytesReceived <= 0) {
+      std::string ErrorMsg = std::string("Error: ") + Description +
+                             " multipart chunk mq_receive failed";
+      perror(ErrorMsg.c_str());
+      exit(1);
+    }
+    Payload.append(Buffer.data(), static_cast<size_t>(BytesReceived));
+  }
+
+  if (Payload.size() != PayloadSize) {
+    std::cerr << "Error: " << Description
+              << " multipart payload size mismatch, expected " << PayloadSize
+              << " got " << Payload.size() << std::endl;
+    exit(1);
+  }
+
+  DAEMON_TRACE_STREAM << Description << " multipart mq_receive payload_size: "
+                      << Payload.size() << " chunks: " << ChunkCount
+                      << std::endl;
+  return Payload;
+}
+
 void SendD2DKernelSchedInfo(MPI_Comm comm_daemon, int master_rank, int daemon_rank, const std::set<int>& onrun_ranks, D2DKernelSchedInfo& kernel_sched_info) {
   if (daemon_rank == master_rank) {
     std::string serialized_data = kernel_sched_info.serialize();
@@ -2911,7 +3023,8 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
         serialized_data += kernel_exec_info.serialize();
     }
     size_t message_size = serialized_data.size();
-    mq_send(mq_id_program, serialized_data.c_str(), message_size, 0);
+    sendOfflineMqPayload(mq_id_program, serialized_data, MAX_MSG_PROGRAM_SIZE,
+                         "commExecInfo kernel_exec_infos");
     DAEMON_TRACE_STREAM << "commExecInfo === Rank " << daemon_rank
               << ": mq_send kernel_exec_infos size: "
               << kernel_exec_infos.size() << " mqsize: " << message_size
@@ -3137,18 +3250,8 @@ static bool receiveOfflineKernelReqBatch(
   while (true) {
     DAEMON_TRACE_STREAM << "SystemSchedulerDaemonOffline: Rank " << daemon_rank
               << ": waiting reqs from handler" << std::endl;
-    char buffer[MAX_MSG_DAEMON_SIZE];
-    ssize_t bytes_received =
-        mq_receive(mq_id_daemon, buffer, MAX_MSG_DAEMON_SIZE, nullptr);
-
-    if (bytes_received <= 0) {
-      std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) +
-                             " DAEMON mq_receive failed";
-      perror(errorMsg.c_str());
-      exit(1);
-    }
-
-    std::string received_data(buffer, bytes_received);
+    std::string received_data = receiveOfflineMqPayload(
+        mq_id_daemon, MAX_MSG_DAEMON_SIZE, "offline kernel_req batch");
     if (received_data == "EXIT") {
       DAEMON_TRACE_STREAM << "Rank " << daemon_rank << ": SYCLAPP finish" << std::endl;
       return false;
