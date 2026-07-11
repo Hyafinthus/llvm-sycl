@@ -33,6 +33,7 @@
 // #define PRINT_KERNEL 1
 // #define MODIFY 1
 
+#include <algorithm>
 #include <cassert>
 #include <optional>
 #include <string>
@@ -2338,12 +2339,27 @@ pi_int32 enqueueImpKernel(
   std::shared_ptr<kernel_impl> SyclKernelImpl;
   std::shared_ptr<device_image_impl> DeviceImageImpl;
 
+  // Offline scheduling may rebind a recorded CG to another queue/device.
+  const bool KernelBundleMatchesQueue = [&]() {
+    if (!KernelBundleImplPtr || KernelBundleImplPtr->isInterop() ||
+        KernelBundleImplPtr->get_context() != Queue->get_context()) {
+      return false;
+    }
+    const std::vector<device> &BundleDevices =
+        KernelBundleImplPtr->get_devices();
+    const device QueueDevice = Queue->get_device();
+    return std::find(BundleDevices.begin(), BundleDevices.end(),
+                     QueueDevice) != BundleDevices.end();
+  }();
+
+  std::shared_ptr<program_impl> ProgramForRebind;
+
   // Use kernel_bundle if available unless it is interop.
   // Interop bundles can't be used in the first branch, because the kernels
   // in interop kernel bundles (if any) do not have kernel_id
   // and can therefore not be looked up, but since they are self-contained
   // they can simply be launched directly.
-  if (KernelBundleImplPtr && !KernelBundleImplPtr->isInterop()) {
+  if (KernelBundleMatchesQueue) {
     #ifdef PRINT_TRACE
     DAG_TRACE_STREAM << "===commands.cpp===isInterop" << std::endl;
     #endif
@@ -2379,34 +2395,45 @@ pi_int32 enqueueImpKernel(
     #ifdef PRINT_TRACE
     DAG_TRACE_STREAM << "===commands.cpp===MSyclKernel" << std::endl;
     #endif
-    assert(MSyclKernel->get_info<info::kernel::context>() ==
-           Queue->get_context());
-    Kernel = MSyclKernel->getHandleRef();
     auto SyclProg = MSyclKernel->getProgramImpl();
-    Program = SyclProg->getHandleRef();
-    if (SyclProg->is_cacheable()) {
-      RT::PiKernel FoundKernel = nullptr;
-      std::tie(FoundKernel, KernelMutex, std::ignore) =
-          detail::ProgramManager::getInstance().getOrCreateKernel(
-              OSModuleHandle, ContextImpl, DeviceImpl, KernelName,
-              SyclProg.get());
-      assert(FoundKernel == Kernel);
+    if (MSyclKernel->get_info<info::kernel::context>() ==
+        Queue->get_context()) {
+      Kernel = MSyclKernel->getHandleRef();
+      Program = SyclProg->getHandleRef();
+      if (SyclProg->is_cacheable()) {
+        RT::PiKernel FoundKernel = nullptr;
+        std::tie(FoundKernel, KernelMutex, std::ignore) =
+            detail::ProgramManager::getInstance().getOrCreateKernel(
+                OSModuleHandle, ContextImpl, DeviceImpl, KernelName,
+                SyclProg.get());
+        assert(FoundKernel == Kernel);
+      } else {
+        // Non-cacheable kernels use mutexes from kernel_impls.
+        // TODO this can still result in a race condition if multiple SYCL
+        // kernels are created with the same native handle. To address this,
+        // we need to either store and use a pi_native_handle -> mutex map or
+        // reuse and return existing SYCL kernels from make_native to avoid
+        // their duplication in such cases.
+        KernelMutex = &MSyclKernel->getNoncacheableEnqueueMutex();
+      }
     } else {
-      // Non-cacheable kernels use mutexes from kernel_impls.
-      // TODO this can still result in a race condition if multiple SYCL
-      // kernels are created with the same native handle. To address this,
-      // we need to either store and use a pi_native_handle -> mutex map or
-      // reuse and return existing SYCL kernels from make_native to avoid
-      // their duplication in such cases.
-      KernelMutex = &MSyclKernel->getNoncacheableEnqueueMutex();
+      ProgramForRebind = SyclProg;
+      #ifdef PRINT_TRACE
+      DAG_TRACE_STREAM
+          << "===commands.cpp===MSyclKernel context differs; rebind kernel"
+          << std::endl;
+      #endif
     }
-  } else {
+  }
+
+  if (Kernel == nullptr) {
     #ifdef PRINT_TRACE
     DAG_TRACE_STREAM << "===commands.cpp===Direct_Create_Kernel" << std::endl;
     #endif
     std::tie(Kernel, KernelMutex, Program) =
         detail::ProgramManager::getInstance().getOrCreateKernel(
-            OSModuleHandle, ContextImpl, DeviceImpl, KernelName, nullptr);
+            OSModuleHandle, ContextImpl, DeviceImpl, KernelName,
+            ProgramForRebind.get());
   }
 
   // We may need more events for the launch, so we make another reference.
