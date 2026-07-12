@@ -84,6 +84,17 @@ struct ProfileCostEntry {
 
 std::map<ProfileCostKey, ProfileCostEntry> profile_cost_table;
 
+static bool offlineEnvFlagEnabled(const char *Name) {
+  const char *Value = std::getenv(Name);
+  if (Value == nullptr) {
+    return false;
+  }
+
+  std::string Text(Value);
+  return Text == "1" || Text == "true" || Text == "TRUE" ||
+         Text == "yes" || Text == "YES" || Text == "on" || Text == "ON";
+}
+
 // ====【MPI】
 int mpi_rank, mpi_size; // main
 MPI_Comm comm_submit; // SystemSchedulerSubmit
@@ -1648,6 +1659,9 @@ static bool splitWriteRangesMatchDim0(const DAGNode *node, int num_parts) {
 }
 
 static bool worthConsideringSplit(DAGNode *node, int num_parts) {
+  if (offlineEnvFlagEnabled("SYCL_OFFLINE_DISABLE_SPLIT")) {
+    return false;
+  }
   if (num_parts <= 1) {
     return false;
   }

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <utility>
@@ -392,6 +393,35 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
   }
 
   return true;
+}
+
+static bool offlineEnvFlagEnabled(const char *Name) {
+  const char *Value = std::getenv(Name);
+  if (Value == nullptr) {
+    return false;
+  }
+
+  std::string Text(Value);
+  return Text == "1" || Text == "true" || Text == "TRUE" ||
+         Text == "yes" || Text == "YES" || Text == "on" || Text == "ON";
+}
+
+static bool offlineSplitKernelDisabled(int KernelCount) {
+  const char *Value = std::getenv("SYCL_OFFLINE_DISABLE_SPLIT_KERNELS");
+  if (Value == nullptr || *Value == '\0') {
+    return false;
+  }
+
+  std::stringstream Tokens(Value);
+  std::string Token;
+  while (std::getline(Tokens, Token, ',')) {
+    char *End = nullptr;
+    long Parsed = std::strtol(Token.c_str(), &End, 10);
+    if (End != Token.c_str() && Parsed == KernelCount) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
@@ -2317,6 +2347,24 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   std::vector<Requirement *> &KernelReqs = ExecCG->MRequirements;
   size_t &NumParts = PM.NumParts;
   std::vector<int> &SplitDevices = PM.SplitDevices;
+
+  if (NumParts > 1 && offlineEnvFlagEnabled("SYCL_OFFLINE_DISABLE_SPLIT")) {
+    HANDLER_TRACE_STREAM
+        << "=== handler === Split disabled by SYCL_OFFLINE_DISABLE_SPLIT "
+        << "for kernel_count: " << sycl_kernel_cg.kernel_count << std::endl;
+    NumParts = 1;
+    SplitDevices.clear();
+  }
+
+  if (NumParts > 1 &&
+      offlineSplitKernelDisabled(sycl_kernel_cg.kernel_count)) {
+    HANDLER_TRACE_STREAM
+        << "=== handler === Split disabled by "
+        << "SYCL_OFFLINE_DISABLE_SPLIT_KERNELS for kernel_count: "
+        << sycl_kernel_cg.kernel_count << std::endl;
+    NumParts = 1;
+    SplitDevices.clear();
+  }
 
   // SPLIT
   if (NumParts > 1) {
