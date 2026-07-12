@@ -355,6 +355,10 @@ static bool offlineSplitWriteAccess(access::mode Mode) {
          Mode == access::mode::atomic;
 }
 
+static bool offlineSplitPartitionOnlyWriteAccess(access::mode Mode) {
+  return Mode == access::mode::write || Mode == access::mode::discard_write;
+}
+
 static bool offlineSplitCanUseDim0ContiguousWrites(
     const detail::CGExecKernel *ExecCG, size_t NumParts) {
   if (ExecCG == nullptr || NumParts <= 1) {
@@ -380,6 +384,14 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
     const range<3> AccessRange = Req->MAccessRange;
 
     if (offlineSplitWriteAccess(Req->MAccessMode)) {
+      if (!offlineSplitPartitionOnlyWriteAccess(Req->MAccessMode)) {
+        HANDLER_TRACE_STREAM
+            << "=== handler === Split disabled: write mode "
+            << static_cast<int>(Req->MAccessMode)
+            << " needs read/modify/merge semantics" << std::endl;
+        return false;
+      }
+
       if (AccessRange[0] < NumParts || AccessRange[0] % NumParts != 0) {
         return false;
       }

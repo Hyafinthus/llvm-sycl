@@ -536,6 +536,10 @@ static bool isWriteAccess(acc_mode mode) {
          mode == acc_mode::atomic;
 }
 
+static bool isPartitionOnlyWriteAccess(acc_mode mode) {
+  return mode == acc_mode::write || mode == acc_mode::discard_write;
+}
+
 static bool containsNode(const std::vector<DAGNode *> &nodes, DAGNode *target) {
   return std::find(nodes.begin(), nodes.end(), target) != nodes.end();
 }
@@ -1627,6 +1631,14 @@ static bool splitWriteRangesMatchDim0(const DAGNode *node, int num_parts) {
   for (const SyclReqData &req : node->req_data) {
     if (!isWriteAccess(req.req_accmode)) {
       continue;
+    }
+
+    if (!isPartitionOnlyWriteAccess(req.req_accmode)) {
+      DAEMON_TRACE_STREAM << "algorithmHEFT: Kernel " << node->kernel_count
+                          << " split rejected: write mode "
+                          << static_cast<int>(req.req_accmode)
+                          << " needs read/modify/merge semantics" << std::endl;
+      return false;
     }
 
     if (req.range0 < static_cast<size_t>(num_parts) ||
