@@ -369,6 +369,8 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
   const bool KernelSplitsOnlyDim0 =
       NDR.GlobalSize[0] > 1 && NDR.GlobalSize[1] <= 1 &&
       NDR.GlobalSize[2] <= 1;
+  constexpr size_t MinSplitWriteElems = 65536;
+  size_t TotalWriteElems = 0;
 
   for (detail::Requirement *Req : ExecCG->MRequirements) {
     if (Req == nullptr) {
@@ -382,6 +384,8 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
         return false;
       }
 
+      TotalWriteElems += AccessRange.size();
+
       if (KernelSplitsOnlyDim0 &&
           (AccessRange[1] > 1 || AccessRange[2] > 1)) {
         HANDLER_TRACE_STREAM
@@ -391,6 +395,13 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
         return false;
       }
     }
+  }
+
+  if (TotalWriteElems < MinSplitWriteElems) {
+    HANDLER_TRACE_STREAM
+        << "=== handler === Split disabled: write range too small "
+        << TotalWriteElems << std::endl;
+    return false;
   }
 
   return true;

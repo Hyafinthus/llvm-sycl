@@ -1654,7 +1654,11 @@ static bool worthConsideringSplit(DAGNode *node, int num_parts) {
   if (num_parts % 2 != 0) {
     return false;
   }
-  if (totalWriteElems(node) == 0.0) {
+  const double write_elems = totalWriteElems(node);
+  if (write_elems == 0.0) {
+    return false;
+  }
+  if (write_elems < SPLIT_MIN_ELEMS) {
     return false;
   }
   if (totalReqElems(node) < SPLIT_MIN_ELEMS) {
@@ -2311,7 +2315,6 @@ int MonitorInit() {
       return -1;
   }
   DAEMON_TRACE_STREAM << "Number of GPUs: " << device_count << std::endl;
-  device_capability.resize(device_count + 1, fallbackCapabilityForProc(1));
   
   std::vector<int> nvmlBusIds;
   for (int i = 0; i < device_count; ++i) {
@@ -2430,8 +2433,12 @@ void CudaMonitor(int device_count) {
       // std::cout << "  Memory Used: " << memoryInfo.used / 1024.0 << " kB" << std::endl;
       // std::cout << "  Memory Free: " << memoryInfo.free / 1024.0 << " kB" << std::endl;
 
-      int device_index = i + 1;
-      auto sycl_it = index_nvml_sycl.find(device_index);
+      const int nvml_device_index = i + 1;
+      auto sycl_it = index_nvml_sycl.find(nvml_device_index);
+      if (sycl_it == index_nvml_sycl.end() && !index_nvml_sycl.empty()) {
+        continue;
+      }
+      int device_index = nvml_device_index;
       if (sycl_it != index_nvml_sycl.end()) {
         device_index = sycl_it->second;
       }
@@ -2451,10 +2458,6 @@ void CudaMonitor(int device_count) {
 
 void *SystemMonitor(void *arg) {
   int device_count = MonitorInit();
-  if (device_count != -1) {
-    device_monitor_info.resize(device_count + 1);
-    device_capability.resize(device_count + 1, fallbackCapabilityForProc(1));
-  }
   
   while(1) {
     CPUMonitor();
