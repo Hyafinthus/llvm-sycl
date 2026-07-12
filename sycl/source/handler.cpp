@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
-#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <utility>
@@ -372,56 +371,29 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
       NDR.GlobalSize[2] <= 1;
 
   for (detail::Requirement *Req : ExecCG->MRequirements) {
-    if (Req == nullptr || !offlineSplitWriteAccess(Req->MAccessMode)) {
+    if (Req == nullptr) {
       continue;
     }
 
-    if (Req->MMemoryRange[0] < NumParts ||
-        Req->MMemoryRange[0] % NumParts != 0) {
-      return false;
-    }
+    const range<3> AccessRange = Req->MAccessRange;
 
-    if (KernelSplitsOnlyDim0 &&
-        (Req->MMemoryRange[1] > 1 || Req->MMemoryRange[2] > 1)) {
-      HANDLER_TRACE_STREAM
-          << "=== handler === Split disabled: dim0-only kernel writes "
-          << "non-contiguous memory range " << Req->MMemoryRange[0] << ","
-          << Req->MMemoryRange[1] << "," << Req->MMemoryRange[2]
-          << std::endl;
-      return false;
+    if (offlineSplitWriteAccess(Req->MAccessMode)) {
+      if (AccessRange[0] < NumParts || AccessRange[0] % NumParts != 0) {
+        return false;
+      }
+
+      if (KernelSplitsOnlyDim0 &&
+          (AccessRange[1] > 1 || AccessRange[2] > 1)) {
+        HANDLER_TRACE_STREAM
+            << "=== handler === Split disabled: dim0-only kernel writes "
+            << "non-contiguous access range " << AccessRange[0] << ","
+            << AccessRange[1] << "," << AccessRange[2] << std::endl;
+        return false;
+      }
     }
   }
 
   return true;
-}
-
-static bool offlineEnvFlagEnabled(const char *Name) {
-  const char *Value = std::getenv(Name);
-  if (Value == nullptr) {
-    return false;
-  }
-
-  std::string Text(Value);
-  return Text == "1" || Text == "true" || Text == "TRUE" ||
-         Text == "yes" || Text == "YES" || Text == "on" || Text == "ON";
-}
-
-static bool offlineSplitKernelDisabled(int KernelCount) {
-  const char *Value = std::getenv("SYCL_OFFLINE_DISABLE_SPLIT_KERNELS");
-  if (Value == nullptr || *Value == '\0') {
-    return false;
-  }
-
-  std::stringstream Tokens(Value);
-  std::string Token;
-  while (std::getline(Tokens, Token, ',')) {
-    char *End = nullptr;
-    long Parsed = std::strtol(Token.c_str(), &End, 10);
-    if (End != Token.c_str() && Parsed == KernelCount) {
-      return true;
-    }
-  }
-  return false;
 }
 
 static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
@@ -2348,24 +2320,6 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   size_t &NumParts = PM.NumParts;
   std::vector<int> &SplitDevices = PM.SplitDevices;
 
-  if (NumParts > 1 && offlineEnvFlagEnabled("SYCL_OFFLINE_DISABLE_SPLIT")) {
-    HANDLER_TRACE_STREAM
-        << "=== handler === Split disabled by SYCL_OFFLINE_DISABLE_SPLIT "
-        << "for kernel_count: " << sycl_kernel_cg.kernel_count << std::endl;
-    NumParts = 1;
-    SplitDevices.clear();
-  }
-
-  if (NumParts > 1 &&
-      offlineSplitKernelDisabled(sycl_kernel_cg.kernel_count)) {
-    HANDLER_TRACE_STREAM
-        << "=== handler === Split disabled by "
-        << "SYCL_OFFLINE_DISABLE_SPLIT_KERNELS for kernel_count: "
-        << sycl_kernel_cg.kernel_count << std::endl;
-    NumParts = 1;
-    SplitDevices.clear();
-  }
-
   // SPLIT
   if (NumParts > 1) {
     std::vector<int> ValidSplitDevices;
@@ -2541,21 +2495,29 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       } else {
         SplitReqs_hasWrite.push_back(Req);
         rememberOfflineSplitWrite(PendingSplit, Req->MSYCLMemObj);
-        range<3> FullRange = Req->MMemoryRange;
-        size_t dim0 = FullRange[0];
+        range<3> AccessRange = Req->MAccessRange;
+        size_t dim0 = AccessRange[0];
         size_t chunk = dim0 / NumParts;
         for (size_t p = 0; p < NumParts; p++) {
           size_t begin0 = p * chunk;
           size_t end0 = (p + 1 == NumParts) ? (dim0) : (begin0 + chunk);
           size_t part0 = end0 - begin0;
-          HANDLER_TRACE_STREAM << "=== handler === Split step3 Write part " << p << " begin: " << begin0 << " end: " << end0 << " range: " << part0 << "," << FullRange[1] << "," << FullRange[2] << "\n";
+          HANDLER_TRACE_STREAM << "=== handler === Split step3 Write part "
+                    << p << " begin: " << begin0 << " end: " << end0
+                    << " range: " << part0 << "," << AccessRange[1]
+                    << "," << AccessRange[2] << "\n";
 
           auto CopyReqOwner = std::make_unique<Requirement>(*Req);
           Requirement *CopyReq = CopyReqOwner.get();
-          CopyReq->MOffset = id<3>(begin0, 0, 0);
-          CopyReq->MAccessRange = range<3>(part0, FullRange[1], FullRange[2]);
-          CopyReq->MMemoryRange = FullRange;
-          CopyReq->MOffsetInBytes = begin0 * FullRange[1] * FullRange[2] * Req->MElemSize;
+          CopyReq->MOffset =
+              id<3>(Req->MOffset[0] + begin0, Req->MOffset[1],
+                    Req->MOffset[2]);
+          CopyReq->MAccessRange =
+              range<3>(part0, AccessRange[1], AccessRange[2]);
+          CopyReq->MMemoryRange = Req->MMemoryRange;
+          CopyReq->MOffsetInBytes =
+              Req->MOffsetInBytes +
+              begin0 * AccessRange[1] * AccessRange[2] * Req->MElemSize;
           SplitReqs_Copy[p].push_back(CopyReq);
           SplitReqOwners.push_back(std::move(CopyReqOwner));
         }

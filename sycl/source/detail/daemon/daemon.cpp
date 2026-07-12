@@ -84,17 +84,6 @@ struct ProfileCostEntry {
 
 std::map<ProfileCostKey, ProfileCostEntry> profile_cost_table;
 
-static bool offlineEnvFlagEnabled(const char *Name) {
-  const char *Value = std::getenv(Name);
-  if (Value == nullptr) {
-    return false;
-  }
-
-  std::string Text(Value);
-  return Text == "1" || Text == "true" || Text == "TRUE" ||
-         Text == "yes" || Text == "YES" || Text == "on" || Text == "ON";
-}
-
 // ====【MPI】
 int mpi_rank, mpi_size; // main
 MPI_Comm comm_submit; // SystemSchedulerSubmit
@@ -1659,9 +1648,6 @@ static bool splitWriteRangesMatchDim0(const DAGNode *node, int num_parts) {
 }
 
 static bool worthConsideringSplit(DAGNode *node, int num_parts) {
-  if (offlineEnvFlagEnabled("SYCL_OFFLINE_DISABLE_SPLIT")) {
-    return false;
-  }
   if (num_parts <= 1) {
     return false;
   }
@@ -3279,7 +3265,7 @@ static bool receiveOfflineKernelReqBatch(
       DAEMON_TRACE_STREAM << "Rank " << daemon_rank
                 << ": mq_receive profile samples: "
                 << batch.profiles.size() << std::endl;
-      continue;
+      return true;
     }
 
     parseOfflineKernelReqBatch(received_data, local_pid, daemon_rank,
@@ -3380,6 +3366,13 @@ void *SystemSchedulerDaemonOffline(void *arg) {
 
     exchangeOfflineProfilesWithMaster(local_profiles, comm_daemon, daemon_rank,
                                       master_rank, onrun_ranks);
+
+    if (kernel_req_datas.empty()) {
+      DAEMON_TRACE_STREAM
+          << "SystemSchedulerDaemonOffline: Rank " << daemon_rank
+          << " processed profile-only batch" << std::endl;
+      continue;
+    }
 
     // ====【调度决策并发给其他rank】
     std::vector<D2DKernelSchedInfo> kernel_sched_order_infos;

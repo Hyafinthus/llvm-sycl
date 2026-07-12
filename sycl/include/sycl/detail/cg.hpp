@@ -25,6 +25,7 @@
 #include <sycl/nd_item.hpp>
 #include <sycl/range.hpp>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -216,6 +217,27 @@ public:
     auto SharedPtrStorageCopy = MSharedPtrStorage;
     auto EventsCopy = MEvents;
 
+    auto RemapArgStoragePtr = [this, &ArgsStorageCopy](void *Ptr) -> void * {
+      if (Ptr == nullptr)
+        return nullptr;
+
+      const std::uintptr_t PtrValue = reinterpret_cast<std::uintptr_t>(Ptr);
+      for (size_t I = 0; I < MArgsStorage.size(); ++I) {
+        if (MArgsStorage[I].empty())
+          continue;
+
+        const std::uintptr_t OldBegin =
+            reinterpret_cast<std::uintptr_t>(MArgsStorage[I].data());
+        const std::uintptr_t OldEnd = OldBegin + MArgsStorage[I].size();
+        if (PtrValue >= OldBegin && PtrValue < OldEnd) {
+          const std::uintptr_t Offset = PtrValue - OldBegin;
+          return ArgsStorageCopy[I].data() + Offset;
+        }
+      }
+
+      return Ptr;
+    };
+
     auto ReqsCopy = MRequirements; // vector<AccessorImplHost *>
     for (AccessorImplHost *&Req : ReqsCopy) {
       if (AccessorImplHost *MappedReq = FindMappedReq(Req))
@@ -241,7 +263,10 @@ public:
     for (ArgDesc &Arg : ArgsCopy) {
       if (Arg.MType == kernel_param_kind_t::kind_accessor ||
           Arg.MType == kernel_param_kind_t::kind_std_layout) {
-        Arg.MPtr = RemapReqArgPtr(Arg.MPtr);
+        void *MappedPtr = RemapReqArgPtr(Arg.MPtr);
+        if (MappedPtr == Arg.MPtr)
+          MappedPtr = RemapArgStoragePtr(Arg.MPtr);
+        Arg.MPtr = MappedPtr;
       }
     }
 
