@@ -19,6 +19,8 @@
 #include <sycl/nd_item.hpp>
 #include <sycl/range.hpp>
 
+#include <memory>
+
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 namespace detail {
@@ -214,6 +216,8 @@ public:
   // Return pointer to the lambda object.
   // Used to extract captured variables.
   virtual char *getPtr() = 0;
+  virtual size_t getSize() const = 0;
+  virtual std::unique_ptr<HostKernelBase> clone() const = 0;
   virtual ~HostKernelBase() = default;
 };
 
@@ -279,6 +283,11 @@ public:
   }
 
   char *getPtr() override { return reinterpret_cast<char *>(&MKernel); }
+  size_t getSize() const override { return sizeof(KernelType); }
+  std::unique_ptr<HostKernelBase> clone() const override {
+    return std::make_unique<HostKernel<KernelType, KernelArgType, Dims>>(
+        MKernel);
+  }
 
   template <class ArgT = KernelArgType>
   typename detail::enable_if_t<std::is_same<ArgT, void>::value>

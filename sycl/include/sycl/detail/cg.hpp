@@ -216,6 +216,17 @@ public:
 
     auto SharedPtrStorageCopy = MSharedPtrStorage;
     auto EventsCopy = MEvents;
+    std::unique_ptr<HostKernelBase> HostKernelCopy;
+    char *OldHostKernelPtr = nullptr;
+    char *NewHostKernelPtr = nullptr;
+    size_t HostKernelSize = 0;
+
+    if (MHostKernel) {
+      OldHostKernelPtr = MHostKernel->getPtr();
+      HostKernelSize = MHostKernel->getSize();
+      HostKernelCopy = MHostKernel->clone();
+      NewHostKernelPtr = HostKernelCopy ? HostKernelCopy->getPtr() : nullptr;
+    }
 
     auto RemapArgStoragePtr = [this, &ArgsStorageCopy](void *Ptr) -> void * {
       if (Ptr == nullptr)
@@ -233,6 +244,24 @@ public:
           const std::uintptr_t Offset = PtrValue - OldBegin;
           return ArgsStorageCopy[I].data() + Offset;
         }
+      }
+
+      return Ptr;
+    };
+
+    auto RemapHostKernelPtr = [OldHostKernelPtr, NewHostKernelPtr,
+                               HostKernelSize](void *Ptr) -> void * {
+      if (Ptr == nullptr || OldHostKernelPtr == nullptr ||
+          NewHostKernelPtr == nullptr || HostKernelSize == 0)
+        return Ptr;
+
+      const std::uintptr_t PtrValue = reinterpret_cast<std::uintptr_t>(Ptr);
+      const std::uintptr_t OldBegin =
+          reinterpret_cast<std::uintptr_t>(OldHostKernelPtr);
+      const std::uintptr_t OldEnd = OldBegin + HostKernelSize;
+      if (PtrValue >= OldBegin && PtrValue < OldEnd) {
+        const std::uintptr_t Offset = PtrValue - OldBegin;
+        return NewHostKernelPtr + Offset;
       }
 
       return Ptr;
@@ -261,18 +290,17 @@ public:
       return Ptr;
     };
     for (ArgDesc &Arg : ArgsCopy) {
-      if (Arg.MType == kernel_param_kind_t::kind_accessor ||
-          Arg.MType == kernel_param_kind_t::kind_std_layout) {
-        void *MappedPtr = RemapReqArgPtr(Arg.MPtr);
-        if (MappedPtr == Arg.MPtr)
-          MappedPtr = RemapArgStoragePtr(Arg.MPtr);
-        Arg.MPtr = MappedPtr;
-      }
+      void *MappedPtr = RemapReqArgPtr(Arg.MPtr);
+      if (MappedPtr == Arg.MPtr)
+        MappedPtr = RemapArgStoragePtr(Arg.MPtr);
+      if (MappedPtr == Arg.MPtr)
+        MappedPtr = RemapHostKernelPtr(Arg.MPtr);
+      Arg.MPtr = MappedPtr;
     }
 
     return std::make_unique<CGExecKernel>(
         NewNDR,
-        nullptr, // unique_ptr HostKernel
+        std::move(HostKernelCopy), // unique_ptr HostKernel
         MSyclKernel, // shared_ptr
         MKernelBundle, // shared_ptr
         std::move(ArgsStorageCopy),
