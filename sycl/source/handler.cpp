@@ -735,9 +735,18 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   HANDLER_TRACE_STREAM << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " before wait" << std::endl;
   if (!Pending.Events.empty()) {
-    for (const detail::EventImplPtr &Event : Pending.Events) {
+    for (size_t Part = 0; Part < Pending.Events.size(); ++Part) {
+      const detail::EventImplPtr &Event = Pending.Events[Part];
       if (Event) {
+        HANDLER_TRACE_STREAM
+            << "=== handler === Split finalize kernel_count: "
+            << Pending.KernelCount << " part: " << Part << " before wait"
+            << std::endl;
         Event->wait(Event);
+        HANDLER_TRACE_STREAM
+            << "=== handler === Split finalize kernel_count: "
+            << Pending.KernelCount << " part: " << Part << " after wait"
+            << std::endl;
       }
     }
   } else {
@@ -2626,16 +2635,6 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
             continue;
           }
 
-          // A pending split that only reads this memory object has already
-          // prepared a complete replica on this device.  Re-copying into the
-          // same allocation can race that pending kernel on another stream.
-          if (onlyRead && pendingOfflineSplitHasReadReplica(
-                              Req->MSYCLMemObj, SplitQueue)) {
-            HANDLER_TRACE_STREAM
-                << "=== handler === Split step3 reuse pending read replica\n";
-            continue;
-          }
-
           bool moved_by_p2p = false;
           if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
             try {
@@ -2734,10 +2733,10 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     NumParts = 1;
     HANDLER_TRACE_STREAM << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
 
-    // Read-only replicas prepared by an outstanding split remain current on
-    // every split device.  Point the ordinary scheduler at the matching
-    // replica so it does not enqueue an unnecessary H2D overwrite while the
-    // pending split is still reading it.
+    // A non-split read can consume the already prepared replica in its target
+    // context. This does not skip split-to-split version preparation below;
+    // it only prevents the ordinary scheduler from attempting an unsupported
+    // cross-context D2D move for an unchanged read-only object.
     for (Requirement *Req : KernelReqs) {
       if (Req == nullptr || Req->MAccessMode != access::mode::read ||
           !pendingOfflineSplitHasReadReplica(Req->MSYCLMemObj, KernelQueue)) {
@@ -2751,7 +2750,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
             << "kernel\n";
       }
     }
-    
+
 #if !defined(SCHEDULE_OFFLINE)
     std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg.kernel_queue;
     device exec_device = PM.globalDevices.at(1);
