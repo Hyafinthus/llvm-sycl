@@ -472,6 +472,7 @@ void queue_impl::wait(const detail::code_location &CodeLoc) {
 #endif
 
 #if defined(SCHEDULE_OFFLINE) || defined(SNMD_OFFLINE)
+  bool OfflineFlushed = false;
   {
     auto &PM = ProgramManager::getInstance();
     if (!PM.kernel_cgs.empty()) {
@@ -481,8 +482,17 @@ void queue_impl::wait(const detail::code_location &CodeLoc) {
                                     FlushQueue->is_host());
         event LastEvent = OfflineFlushHandler.scheduleOffline();
         LastEvent.wait();
+        OfflineFlushed = true;
       }
     }
+  }
+  if (OfflineFlushed) {
+    // The recorded CGs were enqueued and waited through scheduleOffline().
+    // The original queue may still track placeholder events from recording.
+#ifdef XPTI_ENABLE_INSTRUMENTATION
+    instrumentationEpilog(TelemetryEvent, Name, StreamID, IId);
+#endif
+    return;
   }
 #endif
 
