@@ -4460,11 +4460,9 @@ pi_result cuda_piEnqueueMemBufferCopy(pi_queue command_queue, pi_mem src_buffer,
     CUdeviceptr src = src_buffer->mem_.buffer_mem_.get() + src_offset;
     CUdeviceptr dst = dst_buffer->mem_.buffer_mem_.get() + dst_offset;
 
-    // Cross-context pointers must never be passed to cuMemcpyDtoDAsync.  The
-    // offline runtime is enabled in libsycl through define.hpp, while the CUDA
-    // plugin is a separate target and did not inherit SNMD_OFFLINE.  Decide
-    // from the actual PI contexts here so this safety property cannot depend
-    // on a build-system macro leaking into the plugin target.
+    // Cross-context pointers must never be passed to cuMemcpyDtoDAsync.
+    // Select the copy primitive from the actual PI contexts so this remains a
+    // runtime capability independent of scheduling policy.
     if (srcCtx != dstCtx) {
       result = PI_CHECK_ERROR(cuMemcpyPeerAsync(
           dst, dstCtx->get(), src, srcCtx->get(), size, stream));

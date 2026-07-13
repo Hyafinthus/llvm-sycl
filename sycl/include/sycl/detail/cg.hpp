@@ -176,8 +176,8 @@ public:
            "Wrong type of exec kernel CG.");
   }
 
-// #define SNMD_OFFLINE
-#ifdef SNMD_OFFLINE
+  // Split cloning is an always-available runtime capability.  Scheduling
+  // policy decides whether it is invoked for a particular kernel.
   std::unique_ptr<CGExecKernel> cloneForSplit(const NDRDescT &NewNDR) const {
     // CG base owns accessor implementations through MAccStorage, while MArgs
     // stores raw pointers to each accessor and its layout fields.  Split CGs
@@ -316,33 +316,6 @@ public:
         MType,
         MKernelCacheConfig);
   }
-
-  // CHECKED 已更新逻辑
-  // std::unique_ptr<CGExecKernel> cloneForSplit(const NDRDescT &NewNDR, std::vector<AccessorImplHost *> NewReqs, std::vector<ArgDesc> NewArgs) const {
-  //   // CG基类里有 MArgsStorage MAccStorage MSharedPtrStorage MRequirements MEvents
-  //   auto ArgsStorageCopy = MArgsStorage; // vector<vector<char>>
-  //   auto AccStorageCopy = MAccStorage; // vector<AccessorImplPtr>
-  //   auto SharedPtrStorageCopy = MSharedPtrStorage;
-  //   auto EventsCopy = MEvents;
-  //   return std::make_unique<CGExecKernel>(
-  //       NewNDR, // 子NDRange
-  //       nullptr, // HostKernel
-  //       MSyclKernel, // shared_ptr
-  //       MKernelBundle, // shared_ptr
-  //       std::move(ArgsStorageCopy),
-  //       std::move(AccStorageCopy),
-  //       std::move(SharedPtrStorageCopy),
-  //       std::move(NewReqs), // 子Req
-  //       std::move(EventsCopy),
-  //       std::move(NewArgs), // MArgs.MPtr直接作为Req*
-  //       MKernelName,
-  //       MOSModuleHandle,
-  //       MStreams,
-  //       MAuxiliaryResources,
-  //       MType,
-  //       MKernelCacheConfig);
-  // }
-#endif
 
   std::vector<ArgDesc> getArguments() const { return MArgs; }
   std::string getKernelName() const { return MKernelName; }
