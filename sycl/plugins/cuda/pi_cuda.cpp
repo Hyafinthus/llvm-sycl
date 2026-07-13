@@ -4552,8 +4552,7 @@ pi_result cuda_piEnqueueMemBufferCopyRect(
                                   ? dst_slice_pitch
                                   : DstRow * region->height_scalar;
 
-      auto RectFits = [](const _pi_mem::mem_::buffer_mem_ &Buffer,
-                         pi_buff_rect_offset Origin,
+      auto RectFits = [](size_t BufferSize, pi_buff_rect_offset Origin,
                          pi_buff_rect_region Region, size_t RowPitch,
                          size_t SlicePitch) {
         if (Region->width_bytes == 0 || Region->height_scalar == 0 ||
@@ -4580,13 +4579,13 @@ pi_result cuda_piEnqueueMemBufferCopyRect(
           return false;
         }
         End += Region->width_bytes;
-        return End <= Buffer.get_size();
+        return End <= BufferSize;
       };
 
-      if (!RectFits(src_buffer->mem_.buffer_mem_, src_origin, region, SrcRow,
-                    SrcSlice) ||
-          !RectFits(dst_buffer->mem_.buffer_mem_, dst_origin, region, DstRow,
-                    DstSlice) ||
+      if (!RectFits(src_buffer->mem_.buffer_mem_.get_size(), src_origin, region,
+                    SrcRow, SrcSlice) ||
+          !RectFits(dst_buffer->mem_.buffer_mem_.get_size(), dst_origin, region,
+                    DstRow, DstSlice) ||
           SrcSlice % SrcRow != 0 || DstSlice % DstRow != 0) {
         return PI_ERROR_INVALID_VALUE;
       }
