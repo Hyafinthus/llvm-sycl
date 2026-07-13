@@ -235,16 +235,9 @@ parseOfflineKernelExecInfos(const std::string &ReceivedData) {
 
 static property_list
 getOfflineProfilingPropertyList(const detail::QueueImplPtr &Queue) {
-  const property_list &Props = Queue->getPropertyList();
-  if (Props.has_property<property::queue::enable_profiling>()) {
-    return Props;
-  }
-
-  if (Props.has_property<property::queue::in_order>()) {
-    return property_list(property::queue::in_order{},
-                         property::queue::enable_profiling{});
-  }
-  return property_list(property::queue::enable_profiling{});
+  (void)Queue;
+  return property_list(property::queue::in_order{},
+                       property::queue::enable_profiling{});
 }
 
 // A platform default context can contain more than one device.  That is fine
@@ -280,6 +273,30 @@ getOfflineDeviceContext(const detail::DeviceImplPtr &Device) {
 static detail::QueueImplPtr
 makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
                           const detail::QueueImplPtr &OldQueue) {
+  // The daemon models every device as one HEFT processor timeline. Creating a
+  // new out-of-order queue for every rebind violates that model: kernels
+  // assigned sequentially to one GPU are launched on unrelated CUDA streams
+  // and can overlap pending split kernels and their transfers. Keep one
+  // in-order profiling queue per offline device. Different devices still run
+  // concurrently, including the different devices used by one split kernel.
+  static std::mutex QueueMutex;
+  static std::vector<std::pair<detail::DeviceImplPtr, detail::QueueImplPtr>>
+      DeviceQueues;
+
+  std::lock_guard<std::mutex> Lock(QueueMutex);
+  for (const auto &Entry : DeviceQueues) {
+    if (Entry.first == Device) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === Offline profiling queue reused, profiling: "
+          << Entry.second
+                 ->has_property<property::queue::enable_profiling>()
+          << " in_order: "
+          << Entry.second->has_property<property::queue::in_order>()
+          << std::endl;
+      return Entry.second;
+    }
+  }
+
   try {
     property_list ProfilingProps = getOfflineProfilingPropertyList(OldQueue);
     detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(
@@ -290,6 +307,7 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
               << " in_order: "
               << NewQueue->has_property<property::queue::in_order>()
               << std::endl;
+    DeviceQueues.push_back({Device, NewQueue});
     return NewQueue;
   } catch (const std::exception &e) {
     HANDLER_TRACE_STREAM << "=== handler === Offline profiling queue creation failed: "
@@ -300,9 +318,13 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
               << "Fallback to original queue properties." << std::endl;
   }
 
-  return std::make_shared<detail::queue_impl>(
-      Device, getOfflineDeviceContext(Device),
-      OldQueue->getAsyncHandler(), OldQueue->getPropertyList());
+  // Profiling may be unsupported by a backend, but ordering is part of the
+  // offline scheduler contract and must not be dropped in the fallback.
+  detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(
+      Device, getOfflineDeviceContext(Device), OldQueue->getAsyncHandler(),
+      property_list(property::queue::in_order{}));
+  DeviceQueues.push_back({Device, NewQueue});
+  return NewQueue;
 }
 
 static detail::SyclKernelCg *

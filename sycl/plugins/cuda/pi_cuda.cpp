@@ -2709,8 +2709,16 @@ pi_result cuda_piEnqueueMemBufferWrite(pi_queue command_queue, pi_mem buffer,
                                        const pi_event *event_wait_list,
                                        pi_event *event) {
 
-  assert(buffer != nullptr);
-  assert(command_queue != nullptr);
+  if (!command_queue)
+    return PI_ERROR_INVALID_QUEUE;
+  if (!buffer || !buffer->is_buffer())
+    return PI_ERROR_INVALID_MEM_OBJECT;
+  if (buffer->get_context() != command_queue->get_context())
+    return PI_ERROR_INVALID_CONTEXT;
+  const size_t BufferSize = buffer->mem_.buffer_mem_.get_size();
+  if (offset > BufferSize || size > BufferSize - offset ||
+      (size != 0 && ptr == nullptr))
+    return PI_ERROR_INVALID_VALUE;
   pi_result retErr = PI_SUCCESS;
   CUdeviceptr devPtr = buffer->mem_.buffer_mem_.get();
   std::unique_ptr<_pi_event> retImplEv{nullptr};
@@ -2755,8 +2763,16 @@ pi_result cuda_piEnqueueMemBufferRead(pi_queue command_queue, pi_mem buffer,
                                       const pi_event *event_wait_list,
                                       pi_event *event) {
 
-  assert(buffer != nullptr);
-  assert(command_queue != nullptr);
+  if (!command_queue)
+    return PI_ERROR_INVALID_QUEUE;
+  if (!buffer || !buffer->is_buffer())
+    return PI_ERROR_INVALID_MEM_OBJECT;
+  if (buffer->get_context() != command_queue->get_context())
+    return PI_ERROR_INVALID_CONTEXT;
+  const size_t BufferSize = buffer->mem_.buffer_mem_.get_size();
+  if (offset > BufferSize || size > BufferSize - offset ||
+      (size != 0 && ptr == nullptr))
+    return PI_ERROR_INVALID_VALUE;
   pi_result retErr = PI_SUCCESS;
   CUdeviceptr devPtr = buffer->mem_.buffer_mem_.get();
   std::unique_ptr<_pi_event> retImplEv{nullptr};
@@ -2890,12 +2906,19 @@ pi_result cuda_piKernelSetArg(pi_kernel kernel, pi_uint32 arg_index,
 pi_result cuda_piextKernelSetArgMemObj(pi_kernel kernel, pi_uint32 arg_index,
                                        const pi_mem *arg_value) {
 
-  assert(kernel != nullptr);
-  assert(arg_value != nullptr);
+  if (!kernel)
+    return PI_ERROR_INVALID_KERNEL;
+  if (!arg_value || !*arg_value)
+    return PI_ERROR_INVALID_MEM_OBJECT;
 
   pi_result retErr = PI_SUCCESS;
   try {
     pi_mem arg_mem = *arg_value;
+    // A CUdeviceptr is meaningful only in the CUDA context which owns its
+    // allocation. Reject a bad runtime binding here rather than launching a
+    // kernel which poisons the context and reports CUDA 700 at a later copy.
+    if (arg_mem->get_context() != kernel->get_context())
+      return PI_ERROR_INVALID_CONTEXT;
     if (arg_mem->mem_type_ == _pi_mem::mem_type::surface) {
       CUDA_ARRAY3D_DESCRIPTOR arrayDesc;
       PI_CHECK_ERROR(cuArray3DGetDescriptor(
