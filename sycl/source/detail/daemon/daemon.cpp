@@ -653,10 +653,10 @@ static void regenerateReqRanksAfterHEFT(
 
       DAGNode *producer = producer_it->second;
       sched_info->req_rank[req] = producer->exec_rank;
-      DAEMON_TRACE_STREAM << "regenerateReqRanksAfterHEFT: Kernel "
-                << node->kernel_count << " req " << req.req_count
-                << " source rank " << producer->exec_rank
-                << " from Kernel " << producer->kernel_count << std::endl;
+      // DAEMON_TRACE_STREAM << "regenerateReqRanksAfterHEFT: Kernel "
+      //           << node->kernel_count << " req " << req.req_count
+      //           << " source rank " << producer->exec_rank
+      //           << " from Kernel " << producer->kernel_count << std::endl;
     }
   }
 }
@@ -709,11 +709,11 @@ void generateDAGs(std::vector<DAGNode *> &kernel_dag_nodes, std::vector<DAGNode 
           }
         }
 
-        if (prev_node_added) {
-          DAEMON_TRACE_STREAM << "generateDAGs: Kernel " << node->kernel_count
-                    << " depends on Kernel " << prev_node->kernel_count
-                    << " for req " << req.req_count << std::endl;
-        }
+        // if (prev_node_added) {
+        //   DAEMON_TRACE_STREAM << "generateDAGs: Kernel " << node->kernel_count
+        //             << " depends on Kernel " << prev_node->kernel_count
+        //             << " for req " << req.req_count << std::endl;
+        // }
 
         if (prev_node_has_writer) {
           found_prev_writer = true;
@@ -2692,7 +2692,7 @@ void *SystemSchedulerDaemon(void *arg) {
         std::string received_data(buffer, bytes_received);
         kernel_req_data = S2DKernelReqData::deserialize(received_data);
         for (SyclReqData &req : kernel_req_data.reqs) {
-          DAEMON_TRACE_STREAM << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: " << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count << " req_count: " << req.req_count << " pointer: " << req.mem_pointer << std::endl;
+          // DAEMON_TRACE_STREAM << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: " << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count << " req_count: " << req.req_count << " pointer: " << req.mem_pointer << std::endl;
         }
       } else {
         std::string errorMsg = "Error: Rank " + std::to_string(daemon_rank) + " DAEMON mq_receive failed";
@@ -3052,7 +3052,7 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
     std::vector<SyclReqData> &req_for_rank = req_for_ranks[order];
     // 不只是此rank执行的kernel相关 可能其他rank需要此rank的数据
     // 此判断说明此kernel有需要从其他rank获取的数据
-    DAEMON_TRACE_STREAM << "OfflineCommExecInfo: Rank " << daemon_rank << ": Kernel_order: " << order << " : Kernel_count: " << kernel_sched_info.kernel_count << std::endl;
+    // DAEMON_TRACE_STREAM << "OfflineCommExecInfo: Rank " << daemon_rank << ": Kernel_order: " << order << " : Kernel_count: " << kernel_sched_info.kernel_count << std::endl;
 
     if (kernel_sched_info.req_rank.size() != kernel_sched_info.get_req_for_rank(kernel_sched_info.exec_rank).size()) {
       DAEMON_TRACE_STREAM << "OfflineCommExecInfo: Rank " << daemon_rank << ": Exec Rank: " << kernel_sched_info.exec_rank << " need data from other" << std::endl;
@@ -3383,7 +3383,7 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         std::vector<DAGNode *> nodes; // 所有kernel对应的DAG
         for (S2DKernelReqData & kernel_req_data : kernel_req_datas) {
           DAGNode *node = new DAGNode(kernel_req_data);
-          DAEMON_TRACE_STREAM << "Rank " << daemon_rank << ": generate DAGNode for kernel_count: " << node->kernel_count << std::endl;
+          // DAEMON_TRACE_STREAM << "Rank " << daemon_rank << ": generate DAGNode for kernel_count: " << node->kernel_count << std::endl;
           nodes.push_back(node);
         }
         generateDAGs(kernel_dag_nodes, nodes);
