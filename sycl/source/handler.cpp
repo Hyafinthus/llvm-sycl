@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <utility>
@@ -435,6 +436,61 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
   }
 
   return true;
+}
+
+static std::unique_ptr<detail::Requirement>
+makeOfflineLinearRowBlockReq(const detail::Requirement *Req,
+                             size_t RelativeBegin0, size_t Rows) {
+  if (Req == nullptr || Req->MIsSubBuffer || Req->MDims <= 1 || Rows == 0 ||
+      Req->MSYCLMemObj == nullptr ||
+      Req->MSYCLMemObj->getType() !=
+          detail::SYCLMemObjI::MemObjType::Buffer) {
+    return nullptr;
+  }
+
+  const range<3> AccessRange = Req->MAccessRange;
+  const range<3> MemoryRange = Req->MMemoryRange;
+  if (Req->MOffset[1] != 0 || Req->MOffset[2] != 0 ||
+      AccessRange[1] != MemoryRange[1] ||
+      AccessRange[2] != MemoryRange[2] ||
+      RelativeBegin0 > AccessRange[0] ||
+      Rows > AccessRange[0] - RelativeBegin0) {
+    return nullptr;
+  }
+
+  const size_t Max = std::numeric_limits<size_t>::max();
+  if ((MemoryRange[1] != 0 && MemoryRange[2] > Max / MemoryRange[1]) ||
+      RelativeBegin0 > Max - Req->MOffset[0]) {
+    return nullptr;
+  }
+
+  const size_t RowElements = MemoryRange[1] * MemoryRange[2];
+  const size_t LinearRow = Req->MOffset[0] + RelativeBegin0;
+  if (RowElements == 0 || LinearRow > MemoryRange[0] ||
+      Rows > MemoryRange[0] - LinearRow) {
+    return nullptr;
+  }
+
+  const size_t TotalElements = MemoryRange.size();
+  if (LinearRow > TotalElements / RowElements ||
+      Rows > (TotalElements - LinearRow * RowElements) / RowElements) {
+    return nullptr;
+  }
+  const size_t LinearOffset = LinearRow * RowElements;
+  const size_t CopyElements = Rows * RowElements;
+  if (LinearOffset > TotalElements ||
+      CopyElements > TotalElements - LinearOffset ||
+      (Req->MElemSize != 0 && LinearOffset > Max / Req->MElemSize)) {
+    return nullptr;
+  }
+
+  auto LinearReq = std::make_unique<detail::Requirement>(*Req);
+  LinearReq->MDims = 1;
+  LinearReq->MOffset = id<3>(LinearOffset, 0, 0);
+  LinearReq->MAccessRange = range<3>(CopyElements, 1, 1);
+  LinearReq->MMemoryRange = range<3>(TotalElements, 1, 1);
+  LinearReq->MOffsetInBytes = LinearOffset * Req->MElemSize;
+  return LinearReq;
 }
 
 static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
@@ -2475,6 +2531,14 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 
       // 3.1
       if (hasRead) {
+        // Full trailing dimensions form one contiguous row-major interval.
+        // Describe such replication as 1-D so host/device copies use the
+        // buffer-copy APIs rather than CUDA CopyRect.  The logical accessor
+        // retained by the kernel is unchanged.
+        std::unique_ptr<Requirement> LinearReadReqOwner =
+            makeOfflineLinearRowBlockReq(Req, 0, Req->MAccessRange[0]);
+        Requirement *TransferReq =
+            LinearReadReqOwner ? LinearReadReqOwner.get() : Req;
         QueueImplPtr SrcQueue = hostQ;
         if (ReqCurCtx != hostCtx && ReqRecord != nullptr) {
           SrcQueue = nullptr;
@@ -2496,7 +2560,9 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
           bool moved_by_p2p = false;
           if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
             try {
-              EventImplPtr ev_p2p = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, SrcQueue);
+              EventImplPtr ev_p2p =
+                  detail::Scheduler::getInstance().addMemoryMove(
+                      TransferReq, SplitQueue, SrcQueue);
               ev_p2p->wait(ev_p2p);
               moved_by_p2p = true;
               HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D success\n";
@@ -2509,12 +2575,16 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 
           if (!moved_by_p2p) {
             if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
-              EventImplPtr ev_host = detail::Scheduler::getInstance().addMemoryMove(Req, hostQ, SrcQueue);
+              EventImplPtr ev_host =
+                  detail::Scheduler::getInstance().addMemoryMove(
+                      TransferReq, hostQ, SrcQueue);
               ev_host->wait(ev_host);
               HANDLER_TRACE_STREAM << "=== handler === Split step3 copy back host\n";
             }
 
-            EventImplPtr ev_split = detail::Scheduler::getInstance().addMemoryMove(Req, SplitQueue, hostQ);
+            EventImplPtr ev_split =
+                detail::Scheduler::getInstance().addMemoryMove(
+                    TransferReq, SplitQueue, hostQ);
             ev_split->wait(ev_split);
             HANDLER_TRACE_STREAM << "=== handler === Split step3 copy to split device\n";
           }
@@ -2548,24 +2618,14 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
                     << " range: " << part0 << "," << AccessRange[1]
                     << "," << AccessRange[2] << "\n";
 
-          auto CopyReqOwner = std::make_unique<Requirement>(*Req);
+          auto CopyReqOwner =
+              makeOfflineLinearRowBlockReq(Req, begin0, part0);
+          if (!CopyReqOwner) {
+            throw sycl::runtime_error(
+                "Internal Error. Offline split write block is not contiguous.",
+                PI_ERROR_INVALID_VALUE);
+          }
           Requirement *CopyReq = CopyReqOwner.get();
-          const size_t RowElements = AccessRange[1] * AccessRange[2];
-          const size_t PartElements = part0 * RowElements;
-          const size_t TotalElements = Req->MMemoryRange.size();
-          const size_t LinearOffset =
-              (Req->MOffset[0] + begin0) * RowElements;
-
-          // A complete row block is contiguous.  Describe the merge as a 1-D
-          // copy so the CUDA backend uses its peer-buffer copy path instead of
-          // a 2-D CopyRect with cross-context pitches and origins.
-          CopyReq->MDims = 1;
-          CopyReq->MOffset = id<3>(LinearOffset, 0, 0);
-          CopyReq->MAccessRange = range<3>(PartElements, 1, 1);
-          CopyReq->MMemoryRange = range<3>(TotalElements, 1, 1);
-          CopyReq->MOffsetInBytes =
-              Req->MOffsetInBytes +
-              begin0 * AccessRange[1] * AccessRange[2] * Req->MElemSize;
           SplitReqs_Copy[p].push_back(CopyReq);
           SplitReqOwners.push_back(std::move(CopyReqOwner));
         }
