@@ -10,8 +10,10 @@
 #include <cerrno>
 #include <chrono>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <detail/config.hpp>
 #include <detail/global_handler.hpp>
@@ -30,6 +32,7 @@
 #include <sycl/detail/pi.h>
 #include <sycl/detail/pi.hpp>
 #include <sycl/access/access.hpp>
+#include <sycl/context.hpp>
 #include <sycl/device.hpp>
 #include <sycl/device_selector.hpp>
 #include <sycl/event.hpp>
@@ -243,13 +246,43 @@ getOfflineProfilingPropertyList(const detail::QueueImplPtr &Queue) {
   return property_list(property::queue::enable_profiling{});
 }
 
+// A platform default context can contain more than one device.  That is fine
+// for the normal SYCL scheduler, but the offline split implementation uses a
+// MemObjRecord's current context as the identity of the device that owns the
+// complete, merged value.  Reusing one default context for two CUDA devices
+// makes that state ambiguous and can select an allocation created for the
+// other device during a split merge.  Keep one stable private context per
+// offline device so context identity remains a valid ownership key.
+static detail::ContextImplPtr
+getOfflineDeviceContext(const detail::DeviceImplPtr &Device) {
+  static std::mutex ContextMutex;
+  static std::vector<
+      std::pair<detail::DeviceImplPtr, detail::ContextImplPtr>>
+      DeviceContexts;
+
+  std::lock_guard<std::mutex> Lock(ContextMutex);
+  for (const auto &Entry : DeviceContexts) {
+    if (Entry.first == Device) {
+      return Entry.second;
+    }
+  }
+
+  detail::ContextImplPtr NewContext = detail::getSyclObjImpl(
+      context{detail::createSyclObjFromImpl<device>(Device), {}, {}});
+  DeviceContexts.push_back({Device, NewContext});
+  HANDLER_TRACE_STREAM
+      << "=== handler === Offline private device context created: device "
+      << Device.get() << " context " << NewContext << std::endl;
+  return NewContext;
+}
+
 static detail::QueueImplPtr
 makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
                           const detail::QueueImplPtr &OldQueue) {
   try {
     property_list ProfilingProps = getOfflineProfilingPropertyList(OldQueue);
     detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(
-        Device, detail::queue_impl::getDefaultOrNew(Device),
+        Device, getOfflineDeviceContext(Device),
         OldQueue->getAsyncHandler(), ProfilingProps);
     HANDLER_TRACE_STREAM << "=== handler === Offline profiling queue created, profiling: "
               << NewQueue->has_property<property::queue::enable_profiling>()
@@ -267,7 +300,7 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
   }
 
   return std::make_shared<detail::queue_impl>(
-      Device, detail::queue_impl::getDefaultOrNew(Device),
+      Device, getOfflineDeviceContext(Device),
       OldQueue->getAsyncHandler(), OldQueue->getPropertyList());
 }
 
@@ -376,9 +409,17 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
     }
 
     const range<3> AccessRange = Req->MAccessRange;
+    const range<3> MemoryRange = Req->MMemoryRange;
 
     if (offlineSplitWriteAccess(Req->MAccessMode)) {
-      if (AccessRange[0] < NumParts || AccessRange[0] % NumParts != 0) {
+      // The merge implementation owns complete dim-0 row blocks.  Require the
+      // write accessor to cover the kernel's full dim-0 range and every trailing
+      // dimension so each part is one contiguous row-major byte interval.
+      if (Req->MIsSubBuffer || AccessRange[0] != NDR.GlobalSize[0] ||
+          AccessRange[0] < NumParts || AccessRange[0] % NumParts != 0 ||
+          Req->MOffset[1] != 0 || Req->MOffset[2] != 0 ||
+          AccessRange[1] != MemoryRange[1] ||
+          AccessRange[2] != MemoryRange[2]) {
         return false;
       }
 
@@ -2509,12 +2550,19 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 
           auto CopyReqOwner = std::make_unique<Requirement>(*Req);
           Requirement *CopyReq = CopyReqOwner.get();
-          CopyReq->MOffset =
-              id<3>(Req->MOffset[0] + begin0, Req->MOffset[1],
-                    Req->MOffset[2]);
-          CopyReq->MAccessRange =
-              range<3>(part0, AccessRange[1], AccessRange[2]);
-          CopyReq->MMemoryRange = Req->MMemoryRange;
+          const size_t RowElements = AccessRange[1] * AccessRange[2];
+          const size_t PartElements = part0 * RowElements;
+          const size_t TotalElements = Req->MMemoryRange.size();
+          const size_t LinearOffset =
+              (Req->MOffset[0] + begin0) * RowElements;
+
+          // A complete row block is contiguous.  Describe the merge as a 1-D
+          // copy so the CUDA backend uses its peer-buffer copy path instead of
+          // a 2-D CopyRect with cross-context pitches and origins.
+          CopyReq->MDims = 1;
+          CopyReq->MOffset = id<3>(LinearOffset, 0, 0);
+          CopyReq->MAccessRange = range<3>(PartElements, 1, 1);
+          CopyReq->MMemoryRange = range<3>(TotalElements, 1, 1);
           CopyReq->MOffsetInBytes =
               Req->MOffsetInBytes +
               begin0 * AccessRange[1] * AccessRange[2] * Req->MElemSize;

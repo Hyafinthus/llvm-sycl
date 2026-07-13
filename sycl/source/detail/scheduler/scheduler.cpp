@@ -441,7 +441,7 @@ EventImplPtr Scheduler::addMemoryMove(Requirement *Req,
     MemObjRecord *Record = MGraphBuilder.getOrInsertMemObjRecord(DstQueue, Req, AuxiliaryCmds);
 
     Command *NewCmd = MGraphBuilder.insertMemoryMove(Record, Req, DstQueue,
-                                                    SrcQueue->getContextImplPtr(), // NEW
+                                                    SrcQueue,
                                                     AuxiliaryCmds);
     NewCmdEvent = NewCmd->getEvent();
   }

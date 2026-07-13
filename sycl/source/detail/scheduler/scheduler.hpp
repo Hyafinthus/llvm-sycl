@@ -644,6 +644,11 @@ protected:
     AllocaCommandBase *getOrCreateAllocaForSplitReq(MemObjRecord *Record, const Requirement *Req,
                                                const QueueImplPtr &Queue,
                                                std::vector<Command *> &ToEnqueue);
+
+    AllocaCommandBase *findAllocaForSplitReq(MemObjRecord *Record,
+                                             const Requirement *Req,
+                                             const QueueImplPtr &Queue,
+                                             bool AllowConst = true);
 #endif
 
     AllocaCommandBase *getOrCreateAllocaForReq(MemObjRecord *Record, const Requirement *Req,
@@ -656,7 +661,8 @@ protected:
     // std::vector<std::unique_ptr<Command>> MSplitOwnedCmds;
 
     Command *insertMemoryMove(MemObjRecord *Record, Requirement *Req,
-                              const QueueImplPtr &DstQueue, const ContextImplPtr &SrcCtx,
+                              const QueueImplPtr &DstQueue,
+                              const QueueImplPtr &SrcQueue,
                               std::vector<Command *> &ToEnqueue);
 #endif
 

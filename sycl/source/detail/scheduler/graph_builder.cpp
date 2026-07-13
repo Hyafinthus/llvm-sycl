@@ -478,7 +478,7 @@ Command *Scheduler::GraphBuilder::insertMemoryMove(
 #ifdef SNMD_OFFLINE
 Command *Scheduler::GraphBuilder::insertMemoryMove(
     MemObjRecord *Record, Requirement *Req, const QueueImplPtr &DstQueue,
-    const ContextImplPtr &SrcCtx, // NEW: 解决Record->MCurContext不唯一的问题
+    const QueueImplPtr &SrcQueue,
     std::vector<Command *> &ToEnqueue) {
 
   std::vector<Command *> V1{Record->MWriteLeaves.toVector()};
@@ -498,8 +498,15 @@ Command *Scheduler::GraphBuilder::insertMemoryMove(
   std::vector<Command *> V2{Record->MWriteLeaves.toVector()};
   DAG_TRACE_STREAM << "===graph_builder.cpp=== findDepsForReq: MWriteLeaves size2: " << V2.size() << std::endl;
 
-  // NEW: 通过SrcCtx选择源alloca 不使用原逻辑Record->MCurContext
-  AllocaCommandBase *AllocaCmdSrc = findAllocaForReq(Record, Req, SrcCtx);
+  // Split queues may use a multi-device context.  Context-only lookup can then
+  // return an allocation belonging to a different CUDA device, which becomes
+  // an illegal address when the peer copy is enqueued.  Match both context and
+  // device through the actual source queue.
+  AllocaCommandBase *AllocaCmdSrc =
+      findAllocaForSplitReq(Record, Req, SrcQueue);
+  if (!AllocaCmdSrc)
+    throw runtime_error("Cannot find split source buffer allocation",
+                        PI_ERROR_INVALID_VALUE);
   
   std::set<Command *> Deps; // 依赖的 需要先执行的
   Deps.insert(AllocaCmdSrc);
@@ -872,6 +879,37 @@ static bool checkHostUnifiedMemory(const ContextImplPtr &Ctx) {
 }
 
 #ifdef SNMD_OFFLINE
+AllocaCommandBase *Scheduler::GraphBuilder::findAllocaForSplitReq(
+    MemObjRecord *Record, const Requirement *Req, const QueueImplPtr &Queue,
+    bool AllowConst) {
+  if (!Record || !Req || !Queue)
+    return nullptr;
+
+  const ContextImplPtr &Context = Queue->getContextImplPtr();
+  const DeviceImplPtr &Device = Queue->getDeviceImplPtr();
+  auto IsSuitableAlloca = [&Context, &Device, Req,
+                           AllowConst](AllocaCommandBase *AllocaCmd) {
+    if (!AllocaCmd || !AllocaCmd->getQueue())
+      return false;
+
+    bool Res = sameCtx(AllocaCmd->getQueue()->getContextImplPtr(), Context) &&
+               AllocaCmd->getQueue()->getDeviceImplPtr() == Device;
+    if (IsSuitableSubReq(Req)) {
+      const Requirement *TmpReq = AllocaCmd->getRequirement();
+      Res &= AllocaCmd->getType() == Command::CommandType::ALLOCA_SUB_BUF;
+      Res &= TmpReq->MOffsetInBytes == Req->MOffsetInBytes;
+      Res &= TmpReq->MSYCLMemObj->getSizeInBytes() ==
+             Req->MSYCLMemObj->getSizeInBytes();
+      Res &= AllowConst || !AllocaCmd->MIsConst;
+    }
+    return Res;
+  };
+
+  const auto It = std::find_if(Record->MAllocaCommands.begin(),
+                               Record->MAllocaCommands.end(), IsSuitableAlloca);
+  return Record->MAllocaCommands.end() != It ? *It : nullptr;
+}
+
 // 创建一个为DataParallel维护数据的getOrCreateAllocaForReq
 // 由insertMemoryMove调用
 // 去除无用的SubReq和LinkedAllocaCmd逻辑
@@ -879,8 +917,8 @@ AllocaCommandBase *Scheduler::GraphBuilder::getOrCreateAllocaForSplitReq(
     MemObjRecord *Record, const Requirement *Req, const QueueImplPtr &Queue,
     std::vector<Command *> &ToEnqueue) {
   
-  AllocaCommandBase *AllocaCmd = findAllocaForReq(
-      Record, Req, Queue->getContextImplPtr(), /*AllowConst=*/false);
+  AllocaCommandBase *AllocaCmd = findAllocaForSplitReq(
+      Record, Req, Queue, /*AllowConst=*/false);
   
   // 需要创建一个新的AllocaCmd
   if (!AllocaCmd) {
@@ -1412,7 +1450,8 @@ void Scheduler::GraphBuilder::createGraphForSplitCommand(
       const QueueImplPtr &QueueForAlloca = Queue;
       Record = getOrInsertMemObjRecord(QueueForAlloca, Req, ToEnqueue);
       markModifiedIfWrite(Record, Req);
-      AllocaCmd = getOrCreateAllocaForReq(Record, Req, QueueForAlloca, ToEnqueue);
+      AllocaCmd = getOrCreateAllocaForSplitReq(
+          Record, Req, QueueForAlloca, ToEnqueue);
       DAG_TRACE_STREAM << "===graph_builder.cpp=== createGraphForSplitCommand Req: " << Req << " MemObj: " << Req->MSYCLMemObj << " Record: " << Record << " AllocaCmd: " << AllocaCmd << std::endl;
 
       // CHECKED 删除 bool isSameCtx = sameCtx(QueueForAlloca->getContextImplPtr(), Record->MCurContext);
