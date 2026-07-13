@@ -355,10 +355,6 @@ static bool offlineSplitWriteAccess(access::mode Mode) {
          Mode == access::mode::atomic;
 }
 
-static bool offlineSplitPartitionOnlyWriteAccess(access::mode Mode) {
-  return Mode == access::mode::write || Mode == access::mode::discard_write;
-}
-
 static bool offlineSplitCanUseDim0ContiguousWrites(
     const detail::CGExecKernel *ExecCG, size_t NumParts) {
   if (ExecCG == nullptr || NumParts <= 1) {
@@ -373,8 +369,6 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
   const bool KernelSplitsOnlyDim0 =
       NDR.GlobalSize[0] > 1 && NDR.GlobalSize[1] <= 1 &&
       NDR.GlobalSize[2] <= 1;
-  constexpr size_t MinSplitWriteElems = 65536;
-  size_t TotalWriteElems = 0;
 
   for (detail::Requirement *Req : ExecCG->MRequirements) {
     if (Req == nullptr) {
@@ -384,19 +378,9 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
     const range<3> AccessRange = Req->MAccessRange;
 
     if (offlineSplitWriteAccess(Req->MAccessMode)) {
-      if (!offlineSplitPartitionOnlyWriteAccess(Req->MAccessMode)) {
-        HANDLER_TRACE_STREAM
-            << "=== handler === Split disabled: write mode "
-            << static_cast<int>(Req->MAccessMode)
-            << " needs read/modify/merge semantics" << std::endl;
-        return false;
-      }
-
       if (AccessRange[0] < NumParts || AccessRange[0] % NumParts != 0) {
         return false;
       }
-
-      TotalWriteElems += AccessRange.size();
 
       if (KernelSplitsOnlyDim0 &&
           (AccessRange[1] > 1 || AccessRange[2] > 1)) {
@@ -407,13 +391,6 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
         return false;
       }
     }
-  }
-
-  if (TotalWriteElems < MinSplitWriteElems) {
-    HANDLER_TRACE_STREAM
-        << "=== handler === Split disabled: write range too small "
-        << TotalWriteElems << std::endl;
-    return false;
   }
 
   return true;
