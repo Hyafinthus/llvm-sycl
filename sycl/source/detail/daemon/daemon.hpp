@@ -36,7 +36,7 @@ enum class acc_mode {
 
 #define MAX_MSG_NUM 10
 
-#define MAX_MSG_SUBMIT_SIZE 256
+#define MAX_MSG_SUBMIT_SIZE 4096
 #define MESSAGE_QUEUE_SUBMIT_NAME "/sycl_mq_submit"
 
 #define MAX_MSG_DAEMON_SIZE 8192

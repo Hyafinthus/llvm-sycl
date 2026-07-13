@@ -15,6 +15,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <stdexcept>
 #include <tuple>
 #include <unordered_set>
 #include <cuda_runtime_api.h>
@@ -31,7 +32,7 @@ volatile bool is_interrupted = false;
 
 // 一个SYCLAPP的全局信息
 int global_syclapp_count = 0; // 对于整个集群的SYCLAPP计数 因都会在Submit的Bcast前阻塞 每个节点的计数保持相等
-std::map<int, std::string> globalcount_to_binpath; // SYCLAPP计数_binpath
+std::map<int, std::vector<std::string>> globalcount_to_submit_args; // SYCLAPP计数_启动参数(argv)
 std::map<int, pid_t> globalcount_to_pid; // SYCLAPP计数_每个进程上不同的pid
 std::map<pid_t, ProgramInfo> pid_to_program; // 当前rank上的pid_整个SYCLAPP的进程信息
 // [master]
@@ -63,6 +64,65 @@ std::vector<int> ranks_idle;
 std::vector<std::vector<ComputeCapability>> gpu_capability; // 不同rank的设备算力, 包含fp32/fp64两套归一化能力
 std::vector<std::vector<double>> gpu_available_time; // 不同gpu的可用时间 monitor查看空闲？不空闲怎么做
 int local_comm_profile_id = -1;
+
+static std::vector<std::string> DeserializeSubmitArgs(const char *buffer,
+                                                      size_t buffer_size) {
+  if (buffer_size < sizeof(uint32_t)) {
+    throw std::runtime_error("submit payload is too small");
+  }
+
+  uint32_t arg_count = 0;
+  std::memcpy(&arg_count, buffer, sizeof(arg_count));
+  if (arg_count == 0) {
+    throw std::runtime_error("submit payload has no binary path");
+  }
+
+  std::vector<std::string> args;
+  args.reserve(arg_count);
+  size_t offset = sizeof(arg_count);
+  for (uint32_t i = 0; i < arg_count; ++i) {
+    if (offset >= buffer_size) {
+      throw std::runtime_error("submit payload ended before all args");
+    }
+
+    const void *arg_end = std::memchr(buffer + offset, '\0',
+                                     buffer_size - offset);
+    if (arg_end == nullptr) {
+      throw std::runtime_error("submit payload contains an unterminated arg");
+    }
+
+    const char *arg_end_char = static_cast<const char *>(arg_end);
+    args.emplace_back(buffer + offset, arg_end_char - (buffer + offset));
+    offset += args.back().size() + 1;
+  }
+
+  if (args[0].empty()) {
+    throw std::runtime_error("submit binary path is empty");
+  }
+
+  return args;
+}
+
+static std::vector<char *> BuildExecArgv(const std::vector<std::string> &args) {
+  std::vector<char *> exec_argv;
+  exec_argv.reserve(args.size() + 1);
+  for (const std::string &arg : args) {
+    exec_argv.push_back(const_cast<char *>(arg.c_str()));
+  }
+  exec_argv.push_back(nullptr);
+  return exec_argv;
+}
+
+static std::string JoinSubmitArgs(const std::vector<std::string> &args) {
+  std::ostringstream oss;
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (i != 0) {
+      oss << " ";
+    }
+    oss << args[i];
+  }
+  return oss.str();
+}
 
 struct ProfileCostKey {
   std::string kernel_key;
@@ -3529,7 +3589,9 @@ void *SystemSchedulerDaemonOffline(void *arg) {
 
 void *SystemSchedulerScale(void *arg) {
   int syclapp_count = *(int *)arg;
-  const char *binary_path = globalcount_to_binpath[syclapp_count].c_str();
+  const std::vector<std::string> &submit_args =
+      globalcount_to_submit_args[syclapp_count];
+  const char *binary_path = submit_args[0].c_str();
 
   // 选择一个master负责此SYCLAPP
   int master_rank = syclapp_count % submit_size;
@@ -3561,7 +3623,8 @@ void *SystemSchedulerScale(void *arg) {
     ProgramInfo program_info;
     pid_t pid = fork();
     if (pid == 0) { // 子进程
-      execl(binary_path, binary_path, NULL);
+      std::vector<char *> exec_argv = BuildExecArgv(submit_args);
+      execv(binary_path, exec_argv.data());
       std::string errorMsg = "Error: SUBMIT_Rank " + std::to_string(submit_rank) + " SYCLAPP_Rank " + std::to_string(syclapp_rank) + " Failed to execute binary";
       perror(errorMsg.c_str());
       exit(1);
@@ -3631,7 +3694,8 @@ void *SystemSchedulerScale(void *arg) {
       ProgramInfo program_info;
       pid_t pid = fork();
       if (pid == 0) { // 子进程
-        execl(binary_path, binary_path, NULL);
+        std::vector<char *> exec_argv = BuildExecArgv(submit_args);
+        execv(binary_path, exec_argv.data());
         std::string errorMsg = "Error: SUBMIT_Rank " + std::to_string(submit_rank) + " SYCLAPP_Rank " + std::to_string(syclapp_rank) + " Failed to execute binary";
         perror(errorMsg.c_str());
         exit(1);
@@ -3665,25 +3729,45 @@ void *SystemSchedulerSubmit(void *arg) {
   // while(1)用户向rank0提交bin_dir
   // 与管理单节点内的SystemSchedulerDaemon是两个不同的pthread
   while (1) {
-    char binary_path[MAX_MSG_SUBMIT_SIZE];
+    char submit_payload[MAX_MSG_SUBMIT_SIZE] = {};
+    int submit_payload_size = 0;
 
     // rank0会阻塞在此等待
-    ssize_t bytes_received;
     if (submit_rank == 0) {
-      bytes_received = mq_receive(mq_id_submit, binary_path, MAX_MSG_SUBMIT_SIZE, NULL);
+      ssize_t bytes_received = mq_receive(mq_id_submit, submit_payload, MAX_MSG_SUBMIT_SIZE, NULL);
       if (bytes_received == -1) {
         std::string errorMsg = "Error: SUBMIT_Rank " + std::to_string(submit_rank) + " SUBMIT mq_receive failed";
         perror(errorMsg.c_str());
         exit(1);
       }
-      DAEMON_TRACE_STREAM << "SUBMIT_Rank " << submit_rank << ": Received submit path: " << binary_path << std::endl;
+      submit_payload_size = static_cast<int>(bytes_received);
     }
 
     // 非rank0会阻塞在此等待
-    MPI_Bcast(binary_path, MAX_MSG_SUBMIT_SIZE, MPI_CHAR, 0, comm_submit);
+    MPI_Bcast(&submit_payload_size, 1, MPI_INT, 0, comm_submit);
+    if (submit_payload_size <= 0 ||
+        submit_payload_size > MAX_MSG_SUBMIT_SIZE) {
+      std::string errorMsg = "Error: SUBMIT_Rank " + std::to_string(submit_rank) + " invalid submit payload size: " + std::to_string(submit_payload_size);
+      std::cerr << errorMsg << std::endl;
+      exit(1);
+    }
+    MPI_Bcast(submit_payload, submit_payload_size, MPI_CHAR, 0, comm_submit);
+
+    std::vector<std::string> submit_args;
+    try {
+      submit_args = DeserializeSubmitArgs(submit_payload,
+                                          submit_payload_size);
+    } catch (const std::exception &e) {
+      std::string errorMsg = "Error: SUBMIT_Rank " + std::to_string(submit_rank) + " invalid submit payload: " + e.what();
+      std::cerr << errorMsg << std::endl;
+      exit(1);
+    }
+    DAEMON_TRACE_STREAM << "SUBMIT_Rank " << submit_rank
+                        << ": Received submit command: "
+                        << JoinSubmitArgs(submit_args) << std::endl;
 
     global_syclapp_count++;
-    globalcount_to_binpath.insert(std::pair<int, std::string>(global_syclapp_count, std::string(binary_path)));
+    globalcount_to_submit_args.insert(std::pair<int, std::vector<std::string>>(global_syclapp_count, submit_args));
 
     pthread_t scale_tid;
     pthread_create(&scale_tid, NULL, (void *(*)(void *))SystemSchedulerScale, &global_syclapp_count);
