@@ -604,6 +604,7 @@ struct PendingOfflineSplitMerge {
   std::vector<detail::QueueImplPtr> SplitQueues;
   std::vector<std::vector<detail::Requirement *>> SplitReqsCopy;
   std::vector<std::unique_ptr<detail::Requirement>> SplitReqOwners;
+  std::vector<detail::SYCLMemObjI *> ReadMemObjs;
   std::vector<detail::SYCLMemObjI *> WrittenMemObjs;
 };
 
@@ -633,6 +634,46 @@ static void rememberOfflineSplitWrite(PendingOfflineSplitMerge &Pending,
   }
 }
 
+static void rememberOfflineSplitRead(PendingOfflineSplitMerge &Pending,
+                                     detail::SYCLMemObjI *MemObj) {
+  if (MemObj == nullptr) {
+    return;
+  }
+  if (std::find(Pending.ReadMemObjs.begin(), Pending.ReadMemObjs.end(),
+                MemObj) == Pending.ReadMemObjs.end()) {
+    Pending.ReadMemObjs.push_back(MemObj);
+  }
+}
+
+static bool pendingOfflineSplitHasReadReplica(
+    detail::SYCLMemObjI *MemObj, const detail::QueueImplPtr &TargetQueue) {
+  if (MemObj == nullptr || TargetQueue == nullptr) {
+    return false;
+  }
+
+  for (const PendingOfflineSplitMerge &Pending :
+       pendingOfflineSplitMerges()) {
+    if (std::find(Pending.ReadMemObjs.begin(), Pending.ReadMemObjs.end(),
+                  MemObj) == Pending.ReadMemObjs.end() ||
+        std::find(Pending.WrittenMemObjs.begin(),
+                  Pending.WrittenMemObjs.end(), MemObj) !=
+            Pending.WrittenMemObjs.end()) {
+      continue;
+    }
+
+    for (const detail::QueueImplPtr &ReplicaQueue : Pending.SplitQueues) {
+      if (ReplicaQueue != nullptr &&
+          detail::sameCtx(ReplicaQueue->getContextImplPtr(),
+                          TargetQueue->getContextImplPtr()) &&
+          ReplicaQueue->getDeviceImplPtr() ==
+              TargetQueue->getDeviceImplPtr()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 static bool kernelTouchesPendingOfflineSplit(
     detail::SyclKernelCg *KernelCg, const PendingOfflineSplitMerge &Pending) {
   if (KernelCg == nullptr || !KernelCg->kernel_cg) {
@@ -649,9 +690,15 @@ static bool kernelTouchesPendingOfflineSplit(
     if (Req == nullptr) {
       continue;
     }
-    if (std::find(Pending.WrittenMemObjs.begin(),
-                  Pending.WrittenMemObjs.end(),
-                  Req->MSYCLMemObj) != Pending.WrittenMemObjs.end()) {
+    const bool TouchesPendingWrite =
+        std::find(Pending.WrittenMemObjs.begin(),
+                  Pending.WrittenMemObjs.end(), Req->MSYCLMemObj) !=
+        Pending.WrittenMemObjs.end();
+    const bool WritesPendingRead =
+        offlineSplitWriteAccess(Req->MAccessMode) &&
+        std::find(Pending.ReadMemObjs.begin(), Pending.ReadMemObjs.end(),
+                  Req->MSYCLMemObj) != Pending.ReadMemObjs.end();
+    if (TouchesPendingWrite || WritesPendingRead) {
       return true;
     }
   }
@@ -2557,6 +2604,16 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
             continue;
           }
 
+          // A pending split that only reads this memory object has already
+          // prepared a complete replica on this device.  Re-copying into the
+          // same allocation can race that pending kernel on another stream.
+          if (onlyRead && pendingOfflineSplitHasReadReplica(
+                              Req->MSYCLMemObj, SplitQueue)) {
+            HANDLER_TRACE_STREAM
+                << "=== handler === Split step3 reuse pending read replica\n";
+            continue;
+          }
+
           bool moved_by_p2p = false;
           if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
             try {
@@ -2603,6 +2660,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       // 3.2
       if (onlyRead) {
         SplitReqs_onlyRead.push_back(Req);
+        rememberOfflineSplitRead(PendingSplit, Req->MSYCLMemObj);
       } else {
         SplitReqs_hasWrite.push_back(Req);
         rememberOfflineSplitWrite(PendingSplit, Req->MSYCLMemObj);
@@ -2653,6 +2711,24 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   else {
     NumParts = 1;
     HANDLER_TRACE_STREAM << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
+
+    // Read-only replicas prepared by an outstanding split remain current on
+    // every split device.  Point the ordinary scheduler at the matching
+    // replica so it does not enqueue an unnecessary H2D overwrite while the
+    // pending split is still reading it.
+    for (Requirement *Req : KernelReqs) {
+      if (Req == nullptr || Req->MAccessMode != access::mode::read ||
+          !pendingOfflineSplitHasReadReplica(Req->MSYCLMemObj, KernelQueue)) {
+        continue;
+      }
+      if (MemObjRecord *Record =
+              detail::Scheduler::getInstance().getMemObjRecord(Req)) {
+        Record->MCurContext = KernelQueue->getContextImplPtr();
+        HANDLER_TRACE_STREAM
+            << "=== handler === reuse pending read replica for non-split "
+            << "kernel\n";
+      }
+    }
     
 #if !defined(SCHEDULE_OFFLINE)
     std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg.kernel_queue;
