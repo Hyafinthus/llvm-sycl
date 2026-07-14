@@ -55,3 +55,44 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #define SCHEDULE_OFFLINE 1 // 延迟提交kernel的离线调度
 
 #define SNMD_OFFLINE 1 // 单节点多设备的数据并行 且kernel接入先wait后调度的离线逻辑
+
+// ==== SNMD offline performance fixes and isolated test switches ====
+// Each switch is intentionally independent so Reactive and later miniapps can
+// run an ablation without changing the Split execution/merge implementation.
+#if defined(SCHEDULE_OFFLINE) && defined(SNMD_OFFLINE)
+
+// P1: A Split producer exposes one complete version on a deterministic merge
+// device. The daemon and handler must use the same source-of-truth device.
+#define SNMD_OFFLINE_CANONICAL_MERGE 1
+
+// P2: Collect a real num_parts=1 profile before allowing a Split probe.
+#define SNMD_OFFLINE_SINGLE_FIRST 1
+
+// P2: Once both profiles exist, retain Split only when its end-to-end profile
+// beats the single-device profile by at least the configured percentage.
+#define SNMD_OFFLINE_SPLIT_HYSTERESIS 1
+#define SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT 15
+#if SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT < 0 ||                             \
+    SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT >= 100
+#error "SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT must be in [0, 100)"
+#endif
+
+// P3: When a complete DAG depth already has enough independent tasks to fill
+// the GPUs, prefer task parallelism. A measured superlinear-throughput Split
+// can still pass the guard.
+#define SNMD_OFFLINE_WIDE_DAG_GUARD 1
+#define SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT 15
+#if SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT < 0 ||                    \
+    SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT >= 100
+#error "SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT must be in [0, 100)"
+#endif
+
+// P0 control: uncomment to retain offline HEFT/dual-GPU placement and disable
+// only num_parts>1 candidates.
+#define SNMD_OFFLINE_TEST_DISABLE_SPLIT 1
+
+// P5 diagnostics: uncomment for one daemon decision summary and one handler
+// data-movement summary per wait window. Keep disabled for formal timing.
+// #define SNMD_OFFLINE_SPLIT_STATS 1
+
+#endif

@@ -1042,6 +1042,23 @@ static bool hasExactProfileCost(const std::string &kernel_key, int rank,
                                 ignored_cost);
 }
 
+#if defined(SNMD_OFFLINE_SINGLE_FIRST) ||                                  \
+    defined(SNMD_OFFLINE_SPLIT_HYSTERESIS) ||                              \
+    defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
+    defined(SNMD_OFFLINE_SPLIT_STATS)
+static bool hasProfileCostForParts(const std::string &kernel_key,
+                                   int num_parts) {
+  const int parts = std::max(1, num_parts);
+  for (const auto &entry : profile_cost_table) {
+    if (entry.first.kernel_key == kernel_key &&
+        entry.first.num_parts == parts && entry.second.samples > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
 static std::string toLowerAscii(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
@@ -1625,7 +1642,20 @@ static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
 
   std::vector<int> source_procs;
   if (pre_node->num_parts > 1 && !pre_node->split_devices.empty()) {
+#ifdef SNMD_OFFLINE_CANONICAL_MERGE
+    // The handler merges all owned write ranges into the scheduler-selected
+    // primary device. Other part devices contain only partition output, not a
+    // complete current version that can satisfy an arbitrary consumer read.
+    const bool exec_proc_is_part =
+        std::find(pre_node->split_devices.begin(),
+                  pre_node->split_devices.end(), pre_node->exec_proc) !=
+        pre_node->split_devices.end();
+    source_procs.push_back(exec_proc_is_part
+                               ? pre_node->exec_proc
+                               : pre_node->split_devices.front());
+#else
     source_procs = pre_node->split_devices;
+#endif
   } else {
     source_procs.push_back(pre_node->exec_proc);
   }
@@ -1708,6 +1738,11 @@ static bool splitWriteRangesMatchDim0(const DAGNode *node, int num_parts) {
 }
 
 static bool worthConsideringSplit(DAGNode *node, int num_parts) {
+#ifdef SNMD_OFFLINE_TEST_DISABLE_SPLIT
+  (void)node;
+  (void)num_parts;
+  return false;
+#else
   if (num_parts <= 1) {
     return false;
   }
@@ -1724,6 +1759,7 @@ static bool worthConsideringSplit(DAGNode *node, int num_parts) {
     return false;
   }
   return true;
+#endif
 }
 
 static int countMaskBits(uint64_t mask) {
@@ -1989,6 +2025,15 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
   if (!worthConsideringSplit(node, num_parts)) {
     return candidate;
   }
+#ifdef SNMD_OFFLINE_SINGLE_FIRST
+  const std::string kernel_key = profileKeyForNode(node);
+  if (!hasProfileCostForParts(kernel_key, 1)) {
+    DAEMON_TRACE_STREAM
+        << "algorithmHEFT: Kernel " << node->kernel_count
+        << " split rejected until a single-device profile exists" << std::endl;
+    return candidate;
+  }
+#endif
   if (rank < 0 || rank >= static_cast<int>(gpu_available_time.size()) ||
       static_cast<int>(gpu_available_time[rank].size()) <= num_parts) {
     return candidate;
@@ -2029,6 +2074,56 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
         dependencyReadyTimeForDevices(node, rank, split_devices);
     const double start_time = std::max(device_ready, dep_ready);
     const double exec_cost = estimateSplitExecCost(node, rank, split_devices);
+
+#if defined(SNMD_OFFLINE_SPLIT_HYSTERESIS) ||                              \
+    defined(SNMD_OFFLINE_WIDE_DAG_GUARD)
+    double best_single_exec = std::numeric_limits<double>::infinity();
+    for (int proc : split_devices) {
+      best_single_exec =
+          std::min(best_single_exec, estimateSingleExecCost(node, rank, proc));
+    }
+
+    const bool has_split_profile =
+        hasProfileCostForParts(profileKeyForNode(node), num_parts);
+#endif
+#ifdef SNMD_OFFLINE_SPLIT_HYSTERESIS
+    if (has_split_profile && std::isfinite(best_single_exec)) {
+      const double max_split_cost =
+          best_single_exec *
+          (100.0 - SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT) / 100.0;
+      if (exec_cost > max_split_cost) {
+        DAEMON_TRACE_STREAM
+            << "algorithmHEFT: Kernel " << node->kernel_count
+            << " profiled split rejected by hysteresis: split " << exec_cost
+            << " single " << best_single_exec << std::endl;
+        continue;
+      }
+    }
+#endif
+
+#ifdef SNMD_OFFLINE_WIDE_DAG_GUARD
+    const int usable_gpu_count = static_cast<int>(gpu_procs.size());
+    if (usable_gpu_count > 1 &&
+        node->batch_parallel_width >= usable_gpu_count) {
+      bool measured_throughput_win = false;
+      if (has_split_profile && std::isfinite(best_single_exec)) {
+        const double max_throughput_split_cost =
+            best_single_exec *
+            (100.0 - SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT) /
+            (100.0 * static_cast<double>(num_parts));
+        measured_throughput_win = exec_cost <= max_throughput_split_cost;
+      }
+      if (!measured_throughput_win) {
+        DAEMON_TRACE_STREAM
+            << "algorithmHEFT: Kernel " << node->kernel_count
+            << " split rejected by wide-DAG guard: level_width "
+            << node->batch_parallel_width << " usable_gpus "
+            << usable_gpu_count << std::endl;
+        continue;
+      }
+    }
+#endif
+
     const double finish_time = start_time + exec_cost;
     if (finish_time < candidate.finish_time) {
       candidate.proc = split_devices.front();
@@ -2118,6 +2213,33 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
   for (DAGNode *node : nodes) {
     node->batch_root_count = batch_root_count;
   }
+
+#if defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
+    defined(SNMD_OFFLINE_SPLIT_STATS)
+  // Compute depth inside this wait batch only. Cross-window predecessors still
+  // contribute placement/communication cost, but must not make otherwise
+  // parallel roots appear at unrelated absolute depths.
+  const std::unordered_set<DAGNode *> current_batch_nodes(nodes.begin(),
+                                                          nodes.end());
+  std::vector<DAGNode *> batch_topo = reverseTopologicalOrder(nodes);
+  std::reverse(batch_topo.begin(), batch_topo.end());
+  std::map<DAGNode *, int> batch_depths;
+  std::map<int, int> batch_depth_widths;
+  for (DAGNode *node : batch_topo) {
+    int batch_depth = 0;
+    for (DAGNode *pre_node : node->depend_on) {
+      if (!current_batch_nodes.count(pre_node)) {
+        continue;
+      }
+      batch_depth = std::max(batch_depth, batch_depths[pre_node] + 1);
+    }
+    batch_depths[node] = batch_depth;
+    batch_depth_widths[batch_depth]++;
+  }
+  for (DAGNode *node : nodes) {
+    node->batch_parallel_width = batch_depth_widths[batch_depths[node]];
+  }
+#endif
 
   // 1.根据(规模+monitor)生成执行时间表 对于每个任务t_i计算w(i) 以及任务在不同proc上时各个pre的传输代价
   for (DAGNode *node : nodes) {
@@ -2268,6 +2390,55 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
   applyCoLocatedGpuScheduleIfBetter(nodes, initial_node_states,
                                     initial_available_time, heft_finish_time,
                                     kernel_sched_order_infos);
+
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+  uint64_t selected_single_kernels = 0;
+  uint64_t selected_split_kernels = 0;
+  long double estimated_split_extra_input_bytes = 0.0;
+  long double estimated_split_merge_bytes = 0.0;
+  for (DAGNode *node : nodes) {
+    const double single_exec_cost =
+        estimateSingleExecCost(node, node->exec_rank, node->exec_proc);
+    double selected_exec_cost = single_exec_cost;
+    const bool has_single_profile =
+        hasProfileCostForParts(profileKeyForNode(node), 1);
+    bool has_selected_profile = has_single_profile;
+    if (node->num_parts > 1) {
+      selected_split_kernels++;
+      selected_exec_cost =
+          estimateSplitExecCost(node, node->exec_rank, node->split_devices);
+      has_selected_profile = hasProfileCostForParts(
+          profileKeyForNode(node), node->num_parts);
+      estimated_split_extra_input_bytes +=
+          static_cast<long double>(totalReadBytes(node)) *
+          static_cast<long double>(node->num_parts - 1);
+      estimated_split_merge_bytes +=
+          static_cast<long double>(totalWriteBytes(node)) *
+          static_cast<long double>(node->num_parts - 1) /
+          static_cast<long double>(node->num_parts);
+    } else {
+      selected_single_kernels++;
+    }
+
+    std::cout << "SNMD_SCHED_DECISION kernel=" << node->kernel_count
+              << " depth_width=" << node->batch_parallel_width
+              << " rank=" << node->exec_rank
+              << " device=" << node->exec_proc
+              << " parts=" << node->num_parts
+              << " single_exec_cost=" << single_exec_cost
+              << " selected_exec_cost=" << selected_exec_cost
+              << " single_profile=" << (has_single_profile ? 1 : 0)
+              << " selected_profile=" << (has_selected_profile ? 1 : 0)
+              << std::endl;
+  }
+  std::cout << "SNMD_SCHED_STATS kernels=" << nodes.size()
+            << " single_kernels=" << selected_single_kernels
+            << " split_kernels=" << selected_split_kernels
+            << " estimated_split_extra_input_bytes="
+            << static_cast<double>(estimated_split_extra_input_bytes)
+            << " estimated_split_merge_bytes="
+            << static_cast<double>(estimated_split_merge_bytes) << std::endl;
+#endif
 
   regenerateReqRanksAfterHEFT(nodes, kernel_sched_order_infos);
 

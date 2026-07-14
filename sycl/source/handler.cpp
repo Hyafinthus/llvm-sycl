@@ -543,6 +543,9 @@ static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
 
 static void finalizeAllPendingOfflineSplits();
 static void clearPendingOfflineSplitState();
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+static void printAndResetOfflineSplitStats();
+#endif
 #endif
 
 static void clearOfflineBatch() {
@@ -556,6 +559,9 @@ static void clearOfflineBatch() {
 #endif
 #ifdef SNMD_OFFLINE
   finalizeAllPendingOfflineSplits();
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+  printAndResetOfflineSplitStats();
+#endif
   PM.NumParts = 1;
   PM.SplitDevices.clear();
   PM.SplitQueues_Write.clear();
@@ -617,6 +623,90 @@ static uint64_t offlineNowNs() {
 }
 
 #ifdef SNMD_OFFLINE
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+struct OfflineSplitStats {
+  uint64_t SingleKernelCount = 0;
+  uint64_t SplitKernelCount = 0;
+  uint64_t InputDirectD2DBytes = 0;
+  uint64_t InputD2HBytes = 0;
+  uint64_t InputH2DBytes = 0;
+  uint64_t MergeDirectD2DBytes = 0;
+  uint64_t MergeD2HBytes = 0;
+  uint64_t MergeH2DBytes = 0;
+  uint64_t PrepareWaitNs = 0;
+  uint64_t PartWaitNs = 0;
+  uint64_t MergeWaitNs = 0;
+};
+
+static OfflineSplitStats &offlineSplitStats() {
+  static OfflineSplitStats Stats;
+  return Stats;
+}
+
+static uint64_t offlineRequirementBytes(const detail::Requirement *Req) {
+  if (Req == nullptr) {
+    return 0;
+  }
+  const uint64_t Elements = static_cast<uint64_t>(Req->MAccessRange.size());
+  const uint64_t ElemSize = static_cast<uint64_t>(Req->MElemSize);
+  if (ElemSize != 0 &&
+      Elements > std::numeric_limits<uint64_t>::max() / ElemSize) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return Elements * ElemSize;
+}
+
+static void printAndResetOfflineSplitStats() {
+  OfflineSplitStats &Stats = offlineSplitStats();
+  if (Stats.SingleKernelCount == 0 && Stats.SplitKernelCount == 0) {
+    return;
+  }
+  std::cout << "SNMD_SPLIT_STATS pid=" << getpid()
+            << " single_kernels=" << Stats.SingleKernelCount
+            << " split_kernels=" << Stats.SplitKernelCount
+            << " input_direct_d2d_bytes=" << Stats.InputDirectD2DBytes
+            << " input_d2h_bytes=" << Stats.InputD2HBytes
+            << " input_h2d_bytes=" << Stats.InputH2DBytes
+            << " merge_direct_d2d_bytes=" << Stats.MergeDirectD2DBytes
+            << " merge_d2h_bytes=" << Stats.MergeD2HBytes
+            << " merge_h2d_bytes=" << Stats.MergeH2DBytes
+            << " prepare_wait_ns=" << Stats.PrepareWaitNs
+            << " part_wait_ns=" << Stats.PartWaitNs
+            << " merge_wait_ns=" << Stats.MergeWaitNs << std::endl;
+  Stats = OfflineSplitStats{};
+}
+#endif
+
+enum class OfflineSplitWaitKind { Prepare, Part, Merge };
+
+static inline void waitOfflineSplitEvent(const detail::EventImplPtr &Event,
+                                         OfflineSplitWaitKind Kind) {
+  if (!Event) {
+    return;
+  }
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+  const uint64_t StartNs = offlineNowNs();
+#else
+  (void)Kind;
+#endif
+  Event->wait(Event);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+  const uint64_t DurationNs = offlineNowNs() - StartNs;
+  OfflineSplitStats &Stats = offlineSplitStats();
+  switch (Kind) {
+  case OfflineSplitWaitKind::Prepare:
+    Stats.PrepareWaitNs += DurationNs;
+    break;
+  case OfflineSplitWaitKind::Part:
+    Stats.PartWaitNs += DurationNs;
+    break;
+  case OfflineSplitWaitKind::Merge:
+    Stats.MergeWaitNs += DurationNs;
+    break;
+  }
+#endif
+}
+
 struct PendingOfflineSplitMerge {
   int KernelCount = 0;
   detail::EventImplPtr Event;
@@ -748,7 +838,7 @@ static void waitPendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
             << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " part: " << Part << " before wait"
             << std::endl;
-        Event->wait(Event);
+        waitOfflineSplitEvent(Event, OfflineSplitWaitKind::Part);
         HANDLER_TRACE_STREAM
             << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " part: " << Part << " after wait"
@@ -756,7 +846,7 @@ static void waitPendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
       }
     }
   } else {
-    Pending.Event->wait(Pending.Event);
+    waitOfflineSplitEvent(Pending.Event, OfflineSplitWaitKind::Part);
   }
   HANDLER_TRACE_STREAM << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " after wait" << std::endl;
@@ -801,7 +891,11 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
                 << (SrcCtx == Pending.HostContext ? "true" : "false")
                 << std::endl;
 
+      // normalizeOfflineSplitDevices preserves the daemon order, whose first
+      // entry is D2SKernelExecInfo::device_index. Keep this canonical source in
+      // sync with estimateCommCostForDevices when the fix is enabled.
       detail::QueueImplPtr MergeQueue = Pending.SplitQueues.front();
+#if !defined(SNMD_OFFLINE_CANONICAL_MERGE)
       if (SrcCtx != Pending.HostContext && SrcQueue != nullptr) {
         for (const detail::QueueImplPtr &SplitQueue : Pending.SplitQueues) {
           if (detail::sameCtx(SplitQueue->getContextImplPtr(), SrcCtx)) {
@@ -810,6 +904,7 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
           }
         }
       }
+#endif
       detail::ContextImplPtr MergeCtx = MergeQueue->getContextImplPtr();
 
       if (p < Pending.SplitQueues.size() &&
@@ -828,7 +923,11 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
           detail::EventImplPtr ev_p2p =
               detail::Scheduler::getInstance().addMemoryMove(
                   CopyReq, MergeQueue, Pending.SplitQueues[p]);
-          ev_p2p->wait(ev_p2p);
+          waitOfflineSplitEvent(ev_p2p, OfflineSplitWaitKind::Merge);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+          offlineSplitStats().MergeDirectD2DBytes +=
+              offlineRequirementBytes(CopyReq);
+#endif
           moved_by_p2p = true;
           HANDLER_TRACE_STREAM
               << "=== handler === Split finalize merge direct D2D success"
@@ -848,14 +947,22 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
         detail::EventImplPtr ev_host =
             detail::Scheduler::getInstance().addMemoryMove(
                 CopyReq, Pending.HostQueue, Pending.SplitQueues[p]);
-        ev_host->wait(ev_host);
+        waitOfflineSplitEvent(ev_host, OfflineSplitWaitKind::Merge);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+        offlineSplitStats().MergeD2HBytes +=
+            offlineRequirementBytes(CopyReq);
+#endif
         HANDLER_TRACE_STREAM << "=== handler === Split finalize copy partition to host"
                   << std::endl;
 
         detail::EventImplPtr ev_merge =
             detail::Scheduler::getInstance().addMemoryMove(
                 CopyReq, MergeQueue, Pending.HostQueue);
-        ev_merge->wait(ev_merge);
+        waitOfflineSplitEvent(ev_merge, OfflineSplitWaitKind::Merge);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+        offlineSplitStats().MergeH2DBytes +=
+            offlineRequirementBytes(CopyReq);
+#endif
         HANDLER_TRACE_STREAM
             << "=== handler === Split finalize copy partition to merge device"
             << std::endl;
@@ -2590,6 +2697,9 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   }
 
   if (NumParts > 1) {
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+    offlineSplitStats().SplitKernelCount++;
+#endif
     HANDLER_TRACE_STREAM << "=== handler === Split NumParts: " << NumParts << std::endl;
 
     // 1
@@ -2673,7 +2783,11 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
               EventImplPtr ev_p2p =
                   detail::Scheduler::getInstance().addMemoryMove(
                       TransferReq, SplitQueue, SrcQueue);
-              ev_p2p->wait(ev_p2p);
+              waitOfflineSplitEvent(ev_p2p, OfflineSplitWaitKind::Prepare);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+              offlineSplitStats().InputDirectD2DBytes +=
+                  offlineRequirementBytes(TransferReq);
+#endif
               moved_by_p2p = true;
               HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D success\n";
             } catch (const std::exception &e) {
@@ -2688,14 +2802,22 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
               EventImplPtr ev_host =
                   detail::Scheduler::getInstance().addMemoryMove(
                       TransferReq, hostQ, SrcQueue);
-              ev_host->wait(ev_host);
+              waitOfflineSplitEvent(ev_host, OfflineSplitWaitKind::Prepare);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+              offlineSplitStats().InputD2HBytes +=
+                  offlineRequirementBytes(TransferReq);
+#endif
               HANDLER_TRACE_STREAM << "=== handler === Split step3 copy back host\n";
             }
 
             EventImplPtr ev_split =
                 detail::Scheduler::getInstance().addMemoryMove(
                     TransferReq, SplitQueue, hostQ);
-            ev_split->wait(ev_split);
+            waitOfflineSplitEvent(ev_split, OfflineSplitWaitKind::Prepare);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+            offlineSplitStats().InputH2DBytes +=
+                offlineRequirementBytes(TransferReq);
+#endif
             HANDLER_TRACE_STREAM << "=== handler === Split step3 copy to split device\n";
           }
         }
@@ -2763,6 +2885,9 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   }
   else {
     NumParts = 1;
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+    offlineSplitStats().SingleKernelCount++;
+#endif
     HANDLER_TRACE_STREAM << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
 
     // A non-split read can consume the already prepared replica in its target
