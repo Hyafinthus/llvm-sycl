@@ -621,6 +621,7 @@ struct PendingOfflineSplitMerge {
   int KernelCount = 0;
   detail::EventImplPtr Event;
   std::vector<detail::EventImplPtr> Events;
+  bool EventsWaited = false;
   detail::QueueImplPtr HostQueue;
   detail::ContextImplPtr HostContext;
   std::vector<detail::QueueImplPtr> SplitQueues;
@@ -727,8 +728,13 @@ static bool kernelTouchesPendingOfflineSplit(
   return false;
 }
 
-static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
+static void waitPendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
+  if (Pending.EventsWaited) {
+    return;
+  }
+
   if (!Pending.Event && Pending.Events.empty()) {
+    Pending.EventsWaited = true;
     return;
   }
 
@@ -754,6 +760,15 @@ static void finalizePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   }
   HANDLER_TRACE_STREAM << "=== handler === Split finalize kernel_count: "
             << Pending.KernelCount << " after wait" << std::endl;
+
+  Pending.EventsWaited = true;
+}
+
+static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
+  // Keep this helper safe if it is called independently, while the
+  // multi-pending finalizers below deliberately wait every relevant kernel
+  // before they enqueue the first merge copy.
+  waitPendingOfflineSplit(Pending);
 
   if (Pending.SplitQueues.empty()) {
     offlineSplitFinalizeTimes().push_back(
@@ -860,9 +875,23 @@ static void finalizePendingOfflineSplitsForKernel(
     detail::SyclKernelCg *KernelCg) {
   std::vector<PendingOfflineSplitMerge> &PendingSplits =
       pendingOfflineSplitMerges();
+
+  // Split kernels share stable in-order queues.  A later pending kernel can
+  // therefore already be queued behind an earlier one.  Waiting and merging
+  // one pending split at a time would enqueue the earlier merge *after* that
+  // later kernel, then only discover a failure from the later kernel while
+  // executing the earlier merge.  First wait every dependency touched by the
+  // current kernel, so errors remain attributed to the actual kernel/part and
+  // no merge is inserted ahead of an unchecked pending dependency.
+  for (PendingOfflineSplitMerge &Pending : PendingSplits) {
+    if (kernelTouchesPendingOfflineSplit(KernelCg, Pending)) {
+      waitPendingOfflineSplit(Pending);
+    }
+  }
+
   for (size_t I = 0; I < PendingSplits.size();) {
     if (kernelTouchesPendingOfflineSplit(KernelCg, PendingSplits[I])) {
-      finalizePendingOfflineSplit(PendingSplits[I]);
+      mergePendingOfflineSplit(PendingSplits[I]);
       PendingSplits.erase(PendingSplits.begin() + I);
     } else {
       ++I;
@@ -874,7 +903,10 @@ static void finalizeAllPendingOfflineSplits() {
   std::vector<PendingOfflineSplitMerge> &PendingSplits =
       pendingOfflineSplitMerges();
   for (PendingOfflineSplitMerge &Pending : PendingSplits) {
-    finalizePendingOfflineSplit(Pending);
+    waitPendingOfflineSplit(Pending);
+  }
+  for (PendingOfflineSplitMerge &Pending : PendingSplits) {
+    mergePendingOfflineSplit(Pending);
   }
   PendingSplits.clear();
 }

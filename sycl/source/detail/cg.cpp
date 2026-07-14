@@ -9,6 +9,8 @@
 #include <detail/accessor_impl.hpp>
 #include <sycl/detail/cg.hpp>
 
+#include <cstring>
+
 namespace sycl {
 __SYCL_INLINE_VER_NAMESPACE(_V1) {
 namespace detail {
@@ -131,6 +133,24 @@ CGExecKernel::cloneForSplit(const NDRDescT &NewNDR) const {
       MappedPtr = RemapArgStoragePtr(Arg.MPtr);
     if (MappedPtr == Arg.MPtr)
       MappedPtr = RemapHostKernelPtr(Arg.MPtr);
+
+    // Lambda kernels taking item/id/nd_item are normalized through a
+    // std::function.  In that case extractArgsAndReqsFromLambda records plain
+    // captured arguments using pointers into std::function's heap-allocated
+    // target, not necessarily into HostKernelBase::getPtr()/getSize().  A copy
+    // of the std::function owns a different target, so address-range remapping
+    // alone can leave split CGs with dangling scalar arguments.  Snapshot
+    // value and pointer arguments into storage owned by this clone.  Accessor
+    // arguments still use ReqMap above because the scheduler needs their
+    // independently owned Requirement objects.
+    if ((Arg.MType == kernel_param_kind_t::kind_std_layout ||
+         Arg.MType == kernel_param_kind_t::kind_pointer) &&
+        MappedPtr != nullptr && Arg.MSize > 0) {
+      std::vector<char> ArgValue(static_cast<size_t>(Arg.MSize));
+      std::memcpy(ArgValue.data(), MappedPtr, ArgValue.size());
+      ArgsStorageCopy.push_back(std::move(ArgValue));
+      MappedPtr = ArgsStorageCopy.back().data();
+    }
     Arg.MPtr = MappedPtr;
   }
 
