@@ -83,15 +83,6 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #error "SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT must be in [0, 100)"
 #endif
 
-// P2: Once both profiles exist, retain Split only when its end-to-end profile
-// beats the single-device profile by at least the configured percentage.
-#define SNMD_OFFLINE_SPLIT_HYSTERESIS 1
-#define SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT 15
-#if SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT < 0 ||                             \
-    SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT >= 100
-#error "SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT must be in [0, 100)"
-#endif
-
 // P3: When a complete DAG depth already has enough independent tasks to fill
 // the GPUs, prefer task parallelism. A measured superlinear-throughput Split
 // can still pass the guard.
@@ -102,19 +93,33 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #error "SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT must be in [0, 100)"
 #endif
 
-// Profile-risk admission: A cross-device placement must beat a data-local
-// single-device placement by more than the predictive uncertainty of the
-// available profile samples. Observed runtime jitter remains part of the
-// interval; only the cold-start prior decays with repeated samples.
-#define SNMD_OFFLINE_UNCERTAINTY_AWARE_MIGRATION 1
+// Unified risk objective. Every feasible Single/Split placement produces the
+// same (mean, predictive uncertainty) estimate. The scheduler minimizes its
+// upper confidence bound after monitor scaling and communication uncertainty;
+// no component is allowed to apply an independent placement penalty.
+#define SNMD_OFFLINE_UNIFIED_RISK_OBJECTIVE 1
 #define SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT 5
-#define SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT 196
+#define SNMD_OFFLINE_SCALED_PROFILE_ERROR_PERCENT 20
+#define SNMD_OFFLINE_COLD_MODEL_ERROR_PERCENT 50
+#define SNMD_OFFLINE_DERIVED_SPLIT_ERROR_PERCENT 30
+#define SNMD_OFFLINE_TRANSFER_ERROR_PERCENT 15
+#define SNMD_OFFLINE_RISK_CONFIDENCE_PERCENT 196
 #if SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT < 0 ||                       \
     SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT >= 100
 #error "SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT must be in [0, 100)"
 #endif
-#if SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT < 0
-#error "SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT must be nonnegative"
+#if SNMD_OFFLINE_SCALED_PROFILE_ERROR_PERCENT < 0 ||                       \
+    SNMD_OFFLINE_SCALED_PROFILE_ERROR_PERCENT >= 100 ||                    \
+    SNMD_OFFLINE_COLD_MODEL_ERROR_PERCENT < 0 ||                           \
+    SNMD_OFFLINE_COLD_MODEL_ERROR_PERCENT >= 100 ||                        \
+    SNMD_OFFLINE_DERIVED_SPLIT_ERROR_PERCENT < 0 ||                        \
+    SNMD_OFFLINE_DERIVED_SPLIT_ERROR_PERCENT >= 100 ||                     \
+    SNMD_OFFLINE_TRANSFER_ERROR_PERCENT < 0 ||                             \
+    SNMD_OFFLINE_TRANSFER_ERROR_PERCENT >= 100
+#error "SNMD offline uncertainty percentages must be in [0, 100)"
+#endif
+#if SNMD_OFFLINE_RISK_CONFIDENCE_PERCENT < 0
+#error "SNMD_OFFLINE_RISK_CONFIDENCE_PERCENT must be nonnegative"
 #endif
 
 // Completion-driven dispatch is currently enabled only for one daemon rank.

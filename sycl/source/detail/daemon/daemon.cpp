@@ -836,6 +836,34 @@ static constexpr double FALLBACK_CROSS_RANK_BW_GIB = 0.106;
 static constexpr double SPLIT_EFFICIENCY = 0.85;
 static constexpr double SPLIT_MIN_ELEMS = 65536.0;
 
+enum class CostEstimateSource {
+  cold_model,
+  exact_profile,
+  scaled_profile,
+  derived_split
+};
+
+struct CostEstimate {
+  double mean = std::numeric_limits<double>::infinity();
+  double uncertainty = 0.0;
+  int samples = 0;
+  CostEstimateSource source = CostEstimateSource::cold_model;
+};
+
+static const char *costEstimateSourceName(CostEstimateSource source) {
+  switch (source) {
+  case CostEstimateSource::cold_model:
+    return "cold";
+  case CostEstimateSource::exact_profile:
+    return "exact-profile";
+  case CostEstimateSource::scaled_profile:
+    return "scaled-profile";
+  case CostEstimateSource::derived_split:
+    return "derived-split";
+  }
+  return "unknown";
+}
+
 struct NodeCommProfile {
   int id = -1;
   std::string key;
@@ -905,8 +933,8 @@ struct TaskCandidate {
   int num_parts = 1;
   double start_time = 0.0;
   double finish_time = std::numeric_limits<double>::infinity();
-  double exec_cost = std::numeric_limits<double>::infinity();
-  double exec_uncertainty = 0.0;
+  CostEstimate exec_estimate;
+  double transfer_uncertainty = 0.0;
   double movement_bytes = 0.0;
   std::vector<int> occupied_procs;
   std::vector<DeviceReservation> transfer_reservations;
@@ -914,9 +942,68 @@ struct TaskCandidate {
 
 struct DependencyTransferPlan {
   double ready_time = 0.0;
+  double estimated_cost = 0.0;
+  double uncertainty = 0.0;
   double movement_bytes = 0.0;
   std::vector<TaskCandidate::DeviceReservation> reservations;
 };
+
+static double riskConfidenceMultiplier() {
+  return static_cast<double>(SNMD_OFFLINE_RISK_CONFIDENCE_PERCENT) / 100.0;
+}
+
+static double riskAdjustedCost(const CostEstimate &estimate) {
+  return estimate.mean +
+         riskConfidenceMultiplier() * estimate.uncertainty;
+}
+
+static double candidateTotalUncertainty(const TaskCandidate &candidate) {
+  return std::hypot(candidate.exec_estimate.uncertainty,
+                    candidate.transfer_uncertainty);
+}
+
+static double candidateRiskScore(const TaskCandidate &candidate) {
+  return candidate.finish_time +
+         riskConfidenceMultiplier() * candidateTotalUncertainty(candidate);
+}
+
+static bool preferTaskCandidate(const TaskCandidate &candidate,
+                                const TaskCandidate &incumbent) {
+  const double candidate_score = candidateRiskScore(candidate);
+  const double incumbent_score = candidateRiskScore(incumbent);
+  if (!std::isfinite(candidate_score)) {
+    return false;
+  }
+  if (!std::isfinite(incumbent_score)) {
+    return true;
+  }
+
+  const double scale = std::max({1.0, std::abs(candidate_score),
+                                 std::abs(incumbent_score)});
+  const double epsilon = scale * 1.0e-9;
+  if (candidate_score + epsilon < incumbent_score) {
+    return true;
+  }
+  if (incumbent_score + epsilon < candidate_score) {
+    return false;
+  }
+
+  // Deterministic tie-breaking keeps risk-equivalent work data-local and
+  // avoids consuming a gang when one device is sufficient.
+  if (candidate.movement_bytes != incumbent.movement_bytes) {
+    return candidate.movement_bytes < incumbent.movement_bytes;
+  }
+  if (candidate.num_parts != incumbent.num_parts) {
+    return candidate.num_parts < incumbent.num_parts;
+  }
+  if (candidate.finish_time != incumbent.finish_time) {
+    return candidate.finish_time < incumbent.finish_time;
+  }
+  if (candidate.rank != incumbent.rank) {
+    return candidate.rank < incumbent.rank;
+  }
+  return candidate.proc < incumbent.proc;
+}
 
 struct NodePlacementState {
   int exec_rank = -1;
@@ -1105,22 +1192,29 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
             << " samples " << entry.samples << std::endl;
 }
 
-static bool lookupExactProfileCost(const std::string &kernel_key, int rank,
-                                   int device, int num_parts, double &cost) {
-  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts)};
-  std::lock_guard<std::mutex> lock(profile_cost_mutex);
-  auto exact_it = profile_cost_table.find(exact);
-  if (exact_it == profile_cost_table.end()) {
-    return false;
+static double profileEntryUncertainty(const ProfileCostEntry &entry) {
+  if (entry.samples <= 0) {
+    return 0.0;
   }
-  cost = exact_it->second.ewma_cost;
-  return true;
+
+  // Predict the next service time, not only the sample mean. Runtime jitter is
+  // aleatoric uncertainty and remains after repeated observations; the
+  // capability prior is epistemic and decays as exact samples arrive.
+  const double observed_prediction_uncertainty =
+      entry.samples > 1
+          ? std::sqrt(entry.m2_cost /
+                      static_cast<double>(entry.samples - 1))
+          : 0.0;
+  const double prior_uncertainty =
+      std::max(0.001, entry.ewma_cost) *
+      (static_cast<double>(SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT) / 100.0) /
+      std::sqrt(static_cast<double>(entry.samples));
+  return std::hypot(observed_prediction_uncertainty, prior_uncertainty);
 }
 
-static bool lookupExactProfileUncertainty(const std::string &kernel_key,
-                                          int rank, int device,
-                                          int num_parts, double &uncertainty,
-                                          int &samples) {
+static bool lookupExactProfileEstimate(const std::string &kernel_key,
+                                       int rank, int device, int num_parts,
+                                       CostEstimate &estimate) {
   ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts)};
   std::lock_guard<std::mutex> lock(profile_cost_mutex);
   auto exact_it = profile_cost_table.find(exact);
@@ -1128,34 +1222,21 @@ static bool lookupExactProfileUncertainty(const std::string &kernel_key,
     return false;
   }
 
-  const ProfileCostEntry &entry = exact_it->second;
-  samples = entry.samples;
-  // We predict the next service time, not only the mean. Runtime jitter is
-  // therefore aleatoric uncertainty and must not vanish as samples grow.
-  const double observed_prediction_uncertainty =
-      samples > 1
-          ? std::sqrt(entry.m2_cost / static_cast<double>(samples - 1))
-          : 0.0;
-  // The capability/profile prior represents epistemic cold-start error and
-  // does shrink as exact observations make this device/mode estimate known.
-  const double prior_uncertainty =
-      std::max(0.001, entry.ewma_cost) *
-      (static_cast<double>(SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT) / 100.0) /
-      std::sqrt(static_cast<double>(samples));
-  uncertainty =
-      std::hypot(observed_prediction_uncertainty, prior_uncertainty);
+  estimate.mean = exact_it->second.ewma_cost;
+  estimate.uncertainty = profileEntryUncertainty(exact_it->second);
+  estimate.samples = exact_it->second.samples;
+  estimate.source = CostEstimateSource::exact_profile;
   return true;
 }
 
 static bool hasExactProfileCost(const std::string &kernel_key, int rank,
                                 int device, int num_parts) {
-  double ignored_cost = 0.0;
-  return lookupExactProfileCost(kernel_key, rank, device, num_parts,
-                                ignored_cost);
+  CostEstimate ignored_estimate;
+  return lookupExactProfileEstimate(kernel_key, rank, device, num_parts,
+                                    ignored_estimate);
 }
 
 #if defined(SNMD_OFFLINE_COLD_SPLIT_PROBE) ||                              \
-    defined(SNMD_OFFLINE_SPLIT_HYSTERESIS) ||                              \
     defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
     defined(SNMD_OFFLINE_SPLIT_STATS)
 static bool hasProfileCostForParts(const std::string &kernel_key,
@@ -1698,10 +1779,12 @@ static bool isKernelPlacementProc(int rank, int proc) {
   return proc == 0;
 }
 
-static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
-                                    int device, int num_parts,
-                                    KernelPrecision precision, double &cost) {
-  if (lookupExactProfileCost(kernel_key, rank, device, num_parts, cost)) {
+static bool lookupScaledProfileEstimate(const std::string &kernel_key,
+                                        int rank, int device, int num_parts,
+                                        KernelPrecision precision,
+                                        CostEstimate &estimate) {
+  if (lookupExactProfileEstimate(kernel_key, rank, device, num_parts,
+                                 estimate)) {
     return true;
   }
 
@@ -1709,6 +1792,7 @@ static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
   const double target_capability =
       std::max(0.1, deviceCapability(rank, device, precision));
   double weighted_sum = 0.0;
+  double weighted_uncertainty = 0.0;
   int samples = 0;
 
   std::lock_guard<std::mutex> lock(profile_cost_mutex);
@@ -1723,7 +1807,11 @@ static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
                                        precision));
     const double scaled_cost =
         entry.second.ewma_cost * source_capability / target_capability;
+    const double scaled_uncertainty =
+        profileEntryUncertainty(entry.second) * source_capability /
+        target_capability;
     weighted_sum += scaled_cost * entry.second.samples;
+    weighted_uncertainty += scaled_uncertainty * entry.second.samples;
     samples += entry.second.samples;
   }
 
@@ -1731,7 +1819,17 @@ static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
     return false;
   }
 
-  cost = weighted_sum / samples;
+  estimate.mean = weighted_sum / samples;
+  // Residuals from source devices alone cannot describe capability-model
+  // error on the target. Preserve both terms instead of treating a scaled
+  // profile as if it were an exact observation.
+  estimate.uncertainty = std::hypot(
+      weighted_uncertainty / samples,
+      estimate.mean *
+          (static_cast<double>(SNMD_OFFLINE_SCALED_PROFILE_ERROR_PERCENT) /
+           100.0));
+  estimate.samples = samples;
+  estimate.source = CostEstimateSource::scaled_profile;
   return true;
 }
 
@@ -1779,34 +1877,26 @@ static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
   return required_bytes < available_bytes * 0.85;
 }
 
-static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
-  double profile_cost = 0.0;
+static CostEstimate estimateSingleExecCost(DAGNode *node, int rank, int proc) {
+  CostEstimate estimate;
   const std::string key = profileKeyForNode(node);
   const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
-  if (lookupScaledProfileCost(key, rank, proc, 1, precision, profile_cost)) {
-    return std::max(0.001, profile_cost) *
-           deviceServiceTimeScale(rank, proc);
+  if (lookupScaledProfileEstimate(key, rank, proc, 1, precision, estimate)) {
+    const double scale = deviceServiceTimeScale(rank, proc);
+    estimate.mean = std::max(0.001, estimate.mean) * scale;
+    estimate.uncertainty *= scale;
+    return estimate;
   }
 
   const double cold_cost = coldWorkElems(node) /
                            std::max(0.1, deviceCapability(rank, proc,
                                                           precision));
-  return cold_cost * deviceServiceTimeScale(rank, proc);
-}
-
-static double estimateSingleExecUncertainty(DAGNode *node, int rank, int proc,
-                                            double estimated_cost) {
-  double uncertainty = 0.0;
-  int samples = 0;
-  if (lookupExactProfileUncertainty(profileKeyForNode(node), rank, proc, 1,
-                                    uncertainty, samples)) {
-    return uncertainty * deviceServiceTimeScale(rank, proc);
-  }
-
-  // A capability-scaled profile or a cold estimate has no direct residuals on
-  // this device. Keep its confidence deliberately broad so it cannot trigger
-  // a speculative migration merely because the point estimate is optimistic.
-  return std::max(0.001, estimated_cost) * 0.5;
+  estimate.mean = cold_cost * deviceServiceTimeScale(rank, proc);
+  estimate.uncertainty =
+      std::max(0.001, estimate.mean) *
+      (static_cast<double>(SNMD_OFFLINE_COLD_MODEL_ERROR_PERCENT) / 100.0);
+  estimate.source = CostEstimateSource::cold_model;
+  return estimate;
 }
 
 static std::vector<int> producerSourceProcs(const DAGNode *pre_node) {
@@ -1895,6 +1985,17 @@ static void reserveCalendar(std::vector<std::vector<double>> &calendar,
   calendar[rank][proc] = std::max(calendar[rank][proc], ready_time);
 }
 
+static void addTransferEstimate(DependencyTransferPlan &plan, double cost) {
+  if (!std::isfinite(cost) || cost <= 0.0) {
+    return;
+  }
+  plan.estimated_cost += cost;
+  const double uncertainty =
+      cost *
+      (static_cast<double>(SNMD_OFFLINE_TRANSFER_ERROR_PERCENT) / 100.0);
+  plan.uncertainty = std::hypot(plan.uncertainty, uncertainty);
+}
+
 static DependencyTransferPlan buildDependencyTransferPlan(
     DAGNode *node, int target_rank, const std::vector<int> &target_procs) {
   DependencyTransferPlan plan;
@@ -1916,11 +2017,11 @@ static DependencyTransferPlan buildDependencyTransferPlan(
 
     const std::vector<int> source_procs = producerSourceProcs(pre_node);
     if (source_procs.empty()) {
+      const double transfer_cost = estimateCommCostForDevices(
+          node, pre_node, target_rank, target_procs);
       plan.ready_time = std::max(
-          plan.ready_time,
-          pre_node->finish_time + estimateCommCostForDevices(
-                                      node, pre_node, target_rank,
-                                      target_procs));
+          plan.ready_time, pre_node->finish_time + transfer_cost);
+      addTransferEstimate(plan, transfer_cost);
       plan.movement_bytes += comm_bytes;
       continue;
     }
@@ -1931,6 +2032,7 @@ static DependencyTransferPlan buildDependencyTransferPlan(
       // model.
       const int dst_proc = target_procs.front();
       double best_end = std::numeric_limits<double>::infinity();
+      double best_transfer_cost = 0.0;
       int best_src_proc = -1;
       for (int src_proc : source_procs) {
         const double transfer_start = std::max(
@@ -1938,13 +2040,14 @@ static DependencyTransferPlan buildDependencyTransferPlan(
              calendarReadyTime(transfer_calendar, pre_node->exec_rank,
                                src_proc),
              calendarReadyTime(transfer_calendar, target_rank, dst_proc)});
-        const double transfer_end =
-            transfer_start + heftCostFromSeconds(secondsForBytesAtBandwidth(
-                                 comm_bytes,
-                                 crossRankBandwidthGiB(pre_node->exec_rank,
-                                                       target_rank)));
+        const double transfer_cost =
+            heftCostFromSeconds(secondsForBytesAtBandwidth(
+                comm_bytes,
+                crossRankBandwidthGiB(pre_node->exec_rank, target_rank)));
+        const double transfer_end = transfer_start + transfer_cost;
         if (transfer_end < best_end) {
           best_end = transfer_end;
+          best_transfer_cost = transfer_cost;
           best_src_proc = src_proc;
         }
       }
@@ -1953,6 +2056,7 @@ static DependencyTransferPlan buildDependencyTransferPlan(
                         best_end);
         reserveCalendar(transfer_calendar, target_rank, dst_proc, best_end);
         plan.ready_time = std::max(plan.ready_time, best_end);
+        addTransferEstimate(plan, best_transfer_cost);
         plan.movement_bytes += comm_bytes;
       } else {
         // In completion-driven mode infinity denotes a genuinely busy
@@ -1970,18 +2074,19 @@ static DependencyTransferPlan buildDependencyTransferPlan(
       }
 
       double best_end = std::numeric_limits<double>::infinity();
+      double best_transfer_cost = 0.0;
       int best_src_proc = -1;
       for (int src_proc : source_procs) {
         const double transfer_start = std::max(
             {pre_node->finish_time,
              calendarReadyTime(transfer_calendar, target_rank, src_proc),
              calendarReadyTime(transfer_calendar, target_rank, dst_proc)});
-        const double transfer_end =
-            transfer_start +
-            heftCostFromSeconds(sameRankCopySeconds(
-                target_rank, src_proc, dst_proc, comm_bytes));
+        const double transfer_cost = heftCostFromSeconds(sameRankCopySeconds(
+            target_rank, src_proc, dst_proc, comm_bytes));
+        const double transfer_end = transfer_start + transfer_cost;
         if (transfer_end < best_end) {
           best_end = transfer_end;
+          best_transfer_cost = transfer_cost;
           best_src_proc = src_proc;
         }
       }
@@ -1990,6 +2095,7 @@ static DependencyTransferPlan buildDependencyTransferPlan(
                         best_end);
         reserveCalendar(transfer_calendar, target_rank, dst_proc, best_end);
         plan.ready_time = std::max(plan.ready_time, best_end);
+        addTransferEstimate(plan, best_transfer_cost);
         plan.movement_bytes += comm_bytes;
       } else {
         plan.ready_time = std::numeric_limits<double>::infinity();
@@ -2112,40 +2218,56 @@ static double estimateSplitInternalCopyCost(
   return heftCostFromSeconds(seconds);
 }
 
-static double estimateSplitExecCost(DAGNode *node, int rank,
-                                    const std::vector<int> &split_devices) {
+static CostEstimate
+estimateSplitExecCost(DAGNode *node, int rank,
+                      const std::vector<int> &split_devices) {
   const int num_parts = static_cast<int>(split_devices.size());
   if (num_parts <= 1) {
     return estimateSingleExecCost(
         node, rank, split_devices.empty() ? 1 : split_devices.front());
   }
 
-  double profile_cost = 0.0;
+  CostEstimate estimate;
   const std::string key = profileKeyForNode(node);
   const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
-  if (lookupScaledProfileCost(key, rank, split_devices.front(), num_parts,
-                              precision, profile_cost)) {
+  if (lookupScaledProfileEstimate(key, rank, split_devices.front(), num_parts,
+                                  precision, estimate)) {
     double penalty = 1.0;
     for (int proc : split_devices) {
       penalty = std::max(penalty, deviceServiceTimeScale(rank, proc));
     }
-    return std::max(0.001, profile_cost) * penalty;
+    estimate.mean = std::max(0.001, estimate.mean) * penalty;
+    estimate.uncertainty *= penalty;
+    return estimate;
   }
 
-  double best_single = std::numeric_limits<double>::infinity();
+  CostEstimate best_single;
   for (int proc : split_devices) {
-    best_single = std::min(best_single, estimateSingleExecCost(node, rank, proc));
+    CostEstimate single = estimateSingleExecCost(node, rank, proc);
+    if (riskAdjustedCost(single) < riskAdjustedCost(best_single)) {
+      best_single = single;
+    }
   }
 
-  if (!std::isfinite(best_single)) {
+  if (!std::isfinite(best_single.mean)) {
     best_single = estimateSingleExecCost(node, rank, 1);
   }
 
   const double copy_overhead =
       estimateSplitInternalCopyCost(node, rank, split_devices);
   const double launch_overhead = 0.2 * num_parts;
-  return best_single / (num_parts * SPLIT_EFFICIENCY) + copy_overhead +
-         launch_overhead;
+  estimate.mean = best_single.mean / (num_parts * SPLIT_EFFICIENCY) +
+                  copy_overhead + launch_overhead;
+  const double propagated_single_uncertainty =
+      best_single.uncertainty / (num_parts * SPLIT_EFFICIENCY);
+  const double split_model_uncertainty =
+      estimate.mean *
+      (static_cast<double>(SNMD_OFFLINE_DERIVED_SPLIT_ERROR_PERCENT) / 100.0);
+  estimate.uncertainty =
+      std::hypot(propagated_single_uncertainty, split_model_uncertainty);
+  estimate.samples = best_single.samples;
+  estimate.source = CostEstimateSource::derived_split;
+  return estimate;
 }
 
 static TaskCandidate makeSingleCandidate(DAGNode *node, int rank, int proc) {
@@ -2166,12 +2288,11 @@ static TaskCandidate makeSingleCandidate(DAGNode *node, int rank, int proc) {
   const DependencyTransferPlan transfer_plan =
       buildDependencyTransferPlan(node, rank, std::vector<int>{proc});
   candidate.start_time = std::max(device_ready, transfer_plan.ready_time);
-  candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
-  candidate.exec_uncertainty =
-      estimateSingleExecUncertainty(node, rank, proc, candidate.exec_cost);
+  candidate.exec_estimate = estimateSingleExecCost(node, rank, proc);
+  candidate.transfer_uncertainty = transfer_plan.uncertainty;
   candidate.movement_bytes = transfer_plan.movement_bytes;
   candidate.transfer_reservations = transfer_plan.reservations;
-  candidate.finish_time = candidate.start_time + candidate.exec_cost;
+  candidate.finish_time = candidate.start_time + candidate.exec_estimate.mean;
   return candidate;
 }
 
@@ -2191,12 +2312,11 @@ static TaskCandidate makeSingleCandidateNoMemoryFilter(DAGNode *node, int rank,
   const DependencyTransferPlan transfer_plan =
       buildDependencyTransferPlan(node, rank, std::vector<int>{proc});
   candidate.start_time = std::max(device_ready, transfer_plan.ready_time);
-  candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
-  candidate.exec_uncertainty =
-      estimateSingleExecUncertainty(node, rank, proc, candidate.exec_cost);
+  candidate.exec_estimate = estimateSingleExecCost(node, rank, proc);
+  candidate.transfer_uncertainty = transfer_plan.uncertainty;
   candidate.movement_bytes = transfer_plan.movement_bytes;
   candidate.transfer_reservations = transfer_plan.reservations;
-  candidate.finish_time = candidate.start_time + candidate.exec_cost;
+  candidate.finish_time = candidate.start_time + candidate.exec_estimate.mean;
   return candidate;
 }
 
@@ -2214,36 +2334,6 @@ static void commitCandidateReservations(const TaskCandidate &candidate) {
         std::max(gpu_available_time[reservation.rank][reservation.proc],
                  reservation.ready_time);
   }
-}
-
-static bool shouldPreferDataLocalCandidate(
-    const TaskCandidate &best_candidate,
-    const TaskCandidate &data_local_candidate) {
-#ifndef SNMD_OFFLINE_UNCERTAINTY_AWARE_MIGRATION
-  (void)best_candidate;
-  (void)data_local_candidate;
-  return false;
-#else
-  if (!std::isfinite(best_candidate.finish_time) ||
-      !std::isfinite(data_local_candidate.finish_time) ||
-      best_candidate.movement_bytes <= 0.0 ||
-      data_local_candidate.movement_bytes > 0.0) {
-    return false;
-  }
-
-  const double predicted_gain =
-      data_local_candidate.finish_time - best_candidate.finish_time;
-  if (predicted_gain <= 0.0) {
-    return true;
-  }
-
-  const double combined_uncertainty =
-      std::hypot(best_candidate.exec_uncertainty,
-                 data_local_candidate.exec_uncertainty);
-  const double confidence_multiplier =
-      static_cast<double>(SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT) / 100.0;
-  return predicted_gain <= confidence_multiplier * combined_uncertainty;
-#endif
 }
 
 static std::vector<NodePlacementState>
@@ -2308,7 +2398,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
     const std::vector<DAGNode *> &nodes,
     const std::vector<NodePlacementState> &initial_node_states,
     const std::vector<std::vector<double>> &initial_available_time,
-    double heft_finish_time,
+    double heft_finish_time, double heft_risk_finish_time,
     std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
   if (nodes.size() < 2) {
     return false;
@@ -2322,6 +2412,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
   std::vector<NodePlacementState> best_states;
   std::vector<std::vector<double>> best_available_time;
   double best_finish_time = std::numeric_limits<double>::infinity();
+  double best_risk_finish_time = std::numeric_limits<double>::infinity();
 
   for (int rank = 0; rank < static_cast<int>(initial_available_time.size());
        ++rank) {
@@ -2336,6 +2427,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
       gpu_available_time = initial_available_time;
 
       bool valid = true;
+      double risk_finish_time = 0.0;
       for (DAGNode *node : topo_order) {
         TaskCandidate candidate =
             makeSingleCandidateNoMemoryFilter(node, rank, proc);
@@ -2351,6 +2443,8 @@ static bool applyCoLocatedGpuScheduleIfBetter(
         node->finish_time = candidate.finish_time;
         commitCandidateReservations(candidate);
         gpu_available_time[rank][proc] = candidate.finish_time;
+        risk_finish_time =
+            std::max(risk_finish_time, candidateRiskScore(candidate));
       }
 
       if (!valid) {
@@ -2358,8 +2452,11 @@ static bool applyCoLocatedGpuScheduleIfBetter(
       }
 
       const double finish_time = batchFinishTime(nodes);
-      if (finish_time < best_finish_time) {
+      if (risk_finish_time < best_risk_finish_time ||
+          (risk_finish_time == best_risk_finish_time &&
+           finish_time < best_finish_time)) {
         best_finish_time = finish_time;
+        best_risk_finish_time = risk_finish_time;
         best_states = saveNodePlacementStates(nodes);
         best_available_time = gpu_available_time;
       }
@@ -2369,7 +2466,8 @@ static bool applyCoLocatedGpuScheduleIfBetter(
   restoreNodePlacementStates(nodes, initial_node_states);
   gpu_available_time = initial_available_time;
 
-  if (!std::isfinite(best_finish_time) || best_finish_time >= heft_finish_time) {
+  if (!std::isfinite(best_risk_finish_time) ||
+      best_risk_finish_time >= heft_risk_finish_time) {
     restoreNodePlacementStates(nodes, heft_states);
     gpu_available_time = heft_available_time;
     return false;
@@ -2381,7 +2479,10 @@ static bool applyCoLocatedGpuScheduleIfBetter(
 
   DAEMON_TRACE_STREAM << "algorithmHEFT: co-located GPU batch schedule selected"
             << " finish_time " << best_finish_time
-            << " previous_heft_finish_time " << heft_finish_time << std::endl;
+            << " risk_finish_time " << best_risk_finish_time
+            << " previous_heft_finish_time " << heft_finish_time
+            << " previous_heft_risk_finish_time " << heft_risk_finish_time
+            << std::endl;
   for (DAGNode *node : topo_order) {
     DAEMON_TRACE_STREAM << "algorithmHEFT: Kernel " << node->kernel_count
               << " co-located to Rank " << node->exec_rank
@@ -2441,46 +2542,37 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
         buildDependencyTransferPlan(node, rank, split_devices);
     const double start_time =
         std::max(device_ready, transfer_plan.ready_time);
-    const double exec_cost = estimateSplitExecCost(node, rank, split_devices);
+    const CostEstimate exec_estimate =
+        estimateSplitExecCost(node, rank, split_devices);
 
-#if defined(SNMD_OFFLINE_SPLIT_HYSTERESIS) ||                              \
-    defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
+#if defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
     defined(SNMD_OFFLINE_COLD_SPLIT_PROBE)
-    double best_single_exec = std::numeric_limits<double>::infinity();
+    CostEstimate best_single_estimate;
     for (int proc : split_devices) {
-      best_single_exec =
-          std::min(best_single_exec, estimateSingleExecCost(node, rank, proc));
+      const CostEstimate single_estimate =
+          estimateSingleExecCost(node, rank, proc);
+      if (riskAdjustedCost(single_estimate) <
+          riskAdjustedCost(best_single_estimate)) {
+        best_single_estimate = single_estimate;
+      }
     }
 
     const bool has_split_profile =
         hasProfileCostForParts(profileKeyForNode(node), num_parts);
 #endif
 #ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
-    if (!has_split_profile && std::isfinite(best_single_exec)) {
+    if (!has_split_profile && std::isfinite(best_single_estimate.mean)) {
       const double max_cold_split_cost =
-          best_single_exec *
+          best_single_estimate.mean *
           (100.0 - SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT) / 100.0;
-      if (best_single_exec < SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST ||
-          exec_cost > max_cold_split_cost) {
+      if (best_single_estimate.mean <
+              SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST ||
+          exec_estimate.mean > max_cold_split_cost) {
         DAEMON_TRACE_STREAM
             << "algorithmHEFT: Kernel " << node->kernel_count
-            << " cold split probe rejected: split " << exec_cost
-            << " single " << best_single_exec << " min_single "
+            << " cold split probe rejected: split " << exec_estimate.mean
+            << " single " << best_single_estimate.mean << " min_single "
             << SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST << std::endl;
-        continue;
-      }
-    }
-#endif
-#ifdef SNMD_OFFLINE_SPLIT_HYSTERESIS
-    if (has_split_profile && std::isfinite(best_single_exec)) {
-      const double max_split_cost =
-          best_single_exec *
-          (100.0 - SNMD_OFFLINE_SPLIT_MIN_GAIN_PERCENT) / 100.0;
-      if (exec_cost > max_split_cost) {
-        DAEMON_TRACE_STREAM
-            << "algorithmHEFT: Kernel " << node->kernel_count
-            << " profiled split rejected by hysteresis: split " << exec_cost
-            << " single " << best_single_exec << std::endl;
         continue;
       }
     }
@@ -2491,12 +2583,13 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     if (usable_gpu_count > 1 &&
         node->batch_parallel_width >= usable_gpu_count) {
       bool measured_throughput_win = false;
-      if (has_split_profile && std::isfinite(best_single_exec)) {
-        const double max_throughput_split_cost =
-            best_single_exec *
+      if (has_split_profile && std::isfinite(best_single_estimate.mean)) {
+        const double max_throughput_split_risk =
+            riskAdjustedCost(best_single_estimate) *
             (100.0 - SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT) /
             (100.0 * static_cast<double>(num_parts));
-        measured_throughput_win = exec_cost <= max_throughput_split_cost;
+        measured_throughput_win =
+            riskAdjustedCost(exec_estimate) <= max_throughput_split_risk;
       }
       if (!measured_throughput_win) {
         DAEMON_TRACE_STREAM
@@ -2509,30 +2602,19 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     }
 #endif
 
-    const double finish_time = start_time + exec_cost;
-    if (finish_time < candidate.finish_time) {
-      candidate.proc = split_devices.front();
-      candidate.occupied_procs = split_devices;
-      candidate.start_time = start_time;
-      candidate.exec_cost = exec_cost;
-      double split_uncertainty = 0.0;
-      int split_samples = 0;
-      if (!lookupExactProfileUncertainty(
-              profileKeyForNode(node), rank, split_devices.front(), num_parts,
-              split_uncertainty, split_samples)) {
-        split_uncertainty = exec_cost * 0.5;
-      } else {
-        double service_scale = 1.0;
-        for (int proc : split_devices) {
-          service_scale =
-              std::max(service_scale, deviceServiceTimeScale(rank, proc));
-        }
-        split_uncertainty *= service_scale;
-      }
-      candidate.exec_uncertainty = split_uncertainty;
-      candidate.movement_bytes = transfer_plan.movement_bytes;
-      candidate.transfer_reservations = transfer_plan.reservations;
-      candidate.finish_time = finish_time;
+    TaskCandidate split_candidate;
+    split_candidate.rank = rank;
+    split_candidate.proc = split_devices.front();
+    split_candidate.num_parts = num_parts;
+    split_candidate.occupied_procs = split_devices;
+    split_candidate.start_time = start_time;
+    split_candidate.exec_estimate = exec_estimate;
+    split_candidate.transfer_uncertainty = transfer_plan.uncertainty;
+    split_candidate.movement_bytes = transfer_plan.movement_bytes;
+    split_candidate.transfer_reservations = transfer_plan.reservations;
+    split_candidate.finish_time = start_time + exec_estimate.mean;
+    if (preferTaskCandidate(split_candidate, candidate)) {
+      candidate = std::move(split_candidate);
     }
   }
   return candidate;
@@ -2544,19 +2626,18 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
 // policy from silently overriding the global scheduler.
 static TaskCandidate selectUnifiedTaskCandidate(DAGNode *node) {
   TaskCandidate best_candidate;
-  TaskCandidate best_data_local_candidate;
+  TaskCandidate best_mean_candidate;
 
   for (int rank = 0; rank < static_cast<int>(gpu_available_time.size());
        ++rank) {
     for (int proc = 0;
          proc < static_cast<int>(gpu_available_time[rank].size()); ++proc) {
       TaskCandidate candidate = makeSingleCandidate(node, rank, proc);
-      if (candidate.finish_time < best_candidate.finish_time) {
+      if (preferTaskCandidate(candidate, best_candidate)) {
         best_candidate = candidate;
       }
-      if (candidate.movement_bytes <= 0.0 &&
-          candidate.finish_time < best_data_local_candidate.finish_time) {
-        best_data_local_candidate = candidate;
+      if (candidate.finish_time < best_mean_candidate.finish_time) {
+        best_mean_candidate = candidate;
       }
     }
 
@@ -2568,29 +2649,34 @@ static TaskCandidate selectUnifiedTaskCandidate(DAGNode *node) {
         continue;
       }
       TaskCandidate candidate = makeSplitCandidate(node, rank, num_parts);
-      if (candidate.finish_time < best_candidate.finish_time) {
+      if (preferTaskCandidate(candidate, best_candidate)) {
         best_candidate = candidate;
+      }
+      if (candidate.finish_time < best_mean_candidate.finish_time) {
+        best_mean_candidate = candidate;
       }
     }
   }
 
-#ifdef SNMD_OFFLINE_UNCERTAINTY_AWARE_MIGRATION
-  if (shouldPreferDataLocalCandidate(best_candidate,
-                                     best_data_local_candidate)) {
+#ifdef SNMD_OFFLINE_UNIFIED_RISK_OBJECTIVE
+  if (std::isfinite(best_candidate.finish_time) &&
+      std::isfinite(best_mean_candidate.finish_time) &&
+      (best_candidate.rank != best_mean_candidate.rank ||
+       best_candidate.proc != best_mean_candidate.proc ||
+       best_candidate.num_parts != best_mean_candidate.num_parts)) {
     DAEMON_TRACE_STREAM
         << "selectUnifiedTaskCandidate: Kernel " << node->kernel_count
-        << " keeps data-local placement on Rank "
-        << best_data_local_candidate.rank << " Proc "
-        << best_data_local_candidate.proc << " local_finish "
-        << best_data_local_candidate.finish_time << " migrant_finish "
-        << best_candidate.finish_time << " confidence_margin "
-        << (static_cast<double>(
-                SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT) /
-            100.0) *
-               std::hypot(best_candidate.exec_uncertainty,
-                          best_data_local_candidate.exec_uncertainty)
-        << " avoided_bytes " << best_candidate.movement_bytes << std::endl;
-    best_candidate = best_data_local_candidate;
+        << " risk objective selected Rank " << best_candidate.rank
+        << " Proc " << best_candidate.proc << " NumParts "
+        << best_candidate.num_parts << " finish " << best_candidate.finish_time
+        << " uncertainty " << candidateTotalUncertainty(best_candidate)
+        << " risk " << candidateRiskScore(best_candidate)
+        << " over mean-best Rank " << best_mean_candidate.rank << " Proc "
+        << best_mean_candidate.proc << " NumParts "
+        << best_mean_candidate.num_parts << " finish "
+        << best_mean_candidate.finish_time << " uncertainty "
+        << candidateTotalUncertainty(best_mean_candidate) << " risk "
+        << candidateRiskScore(best_mean_candidate) << std::endl;
   }
 #endif
 
@@ -2624,7 +2710,7 @@ static double estimateAverageRankCost(DAGNode *node) {
          ++proc) {
       if (isKernelPlacementProc(rank, proc) &&
           monitorMemoryFits(node, rank, proc, 1)) {
-        sum += estimateSingleExecCost(node, rank, proc);
+        sum += riskAdjustedCost(estimateSingleExecCost(node, rank, proc));
         count++;
       }
     }
@@ -2668,7 +2754,13 @@ static double estimateAverageCommCost(DAGNode *node, DAGNode *pre_node) {
             seconds = secondsForBytesAtBandwidth(
                 comm_bytes, crossRankBandwidthGiB(src_rank, dst_rank));
           }
-          total_cost += heftCostFromSeconds(seconds);
+          CostEstimate transfer_estimate;
+          transfer_estimate.mean = heftCostFromSeconds(seconds);
+          transfer_estimate.uncertainty =
+              transfer_estimate.mean *
+              (static_cast<double>(SNMD_OFFLINE_TRANSFER_ERROR_PERCENT) /
+               100.0);
+          total_cost += riskAdjustedCost(transfer_estimate);
           count++;
         }
       }
@@ -2794,7 +2886,8 @@ void algorithmHEFT(
 
   // 3.每个任务计算 对于每个proc 计算start_v(p)=max_[last_finish(p),finish(u_1)+comm(u_1,v),...]
   // 和finish_v(p)=start_v(p)+w(v,p)
-  // 同时把SNMD split作为候选放置方式，选择earliest_finish_p(v)最小者。
+  // 同时把SNMD split作为候选放置方式，选择统一风险目标最小者。
+  double heft_risk_finish_time = 0.0;
   for (int order = 0; order < visited.size(); order++) {
     DAGNode *node = visited[order];
     TaskCandidate best_candidate = selectUnifiedTaskCandidate(node);
@@ -2804,6 +2897,8 @@ void algorithmHEFT(
     node->num_parts = best_candidate.num_parts;
     node->split_devices = best_candidate.occupied_procs;
     node->finish_time = best_candidate.finish_time;
+    heft_risk_finish_time =
+        std::max(heft_risk_finish_time, candidateRiskScore(best_candidate));
     commitCandidateReservations(best_candidate);
     for (int proc : best_candidate.occupied_procs) {
       gpu_available_time[node->exec_rank][proc] = node->finish_time;
@@ -2828,8 +2923,15 @@ void algorithmHEFT(
     }
     DAEMON_TRACE_STREAM
               << " start_time " << best_candidate.start_time
-              << " exec_cost " << best_candidate.exec_cost
-              << " exec_uncertainty " << best_candidate.exec_uncertainty
+              << " exec_cost " << best_candidate.exec_estimate.mean
+              << " exec_uncertainty "
+              << best_candidate.exec_estimate.uncertainty
+              << " transfer_uncertainty "
+              << best_candidate.transfer_uncertainty
+              << " cost_source "
+              << costEstimateSourceName(best_candidate.exec_estimate.source)
+              << " profile_samples " << best_candidate.exec_estimate.samples
+              << " risk_score " << candidateRiskScore(best_candidate)
               << " movement_bytes " << best_candidate.movement_bytes
               << " transfer_reservations "
               << best_candidate.transfer_reservations.size()
@@ -2839,6 +2941,7 @@ void algorithmHEFT(
   const double heft_finish_time = batchFinishTime(nodes);
   applyCoLocatedGpuScheduleIfBetter(nodes, initial_node_states,
                                     initial_available_time, heft_finish_time,
+                                    heft_risk_finish_time,
                                     kernel_sched_order_infos);
 
 #ifdef SNMD_OFFLINE_SPLIT_STATS
@@ -2847,15 +2950,15 @@ void algorithmHEFT(
   long double estimated_split_extra_input_bytes = 0.0;
   long double estimated_split_merge_bytes = 0.0;
   for (DAGNode *node : nodes) {
-    const double single_exec_cost =
+    const CostEstimate single_exec_estimate =
         estimateSingleExecCost(node, node->exec_rank, node->exec_proc);
-    double selected_exec_cost = single_exec_cost;
+    CostEstimate selected_exec_estimate = single_exec_estimate;
     const bool has_single_profile =
         hasProfileCostForParts(profileKeyForNode(node), 1);
     bool has_selected_profile = has_single_profile;
     if (node->num_parts > 1) {
       selected_split_kernels++;
-      selected_exec_cost =
+      selected_exec_estimate =
           estimateSplitExecCost(node, node->exec_rank, node->split_devices);
       has_selected_profile = hasProfileCostForParts(
           profileKeyForNode(node), node->num_parts);
@@ -2875,8 +2978,12 @@ void algorithmHEFT(
               << " rank=" << node->exec_rank
               << " device=" << node->exec_proc
               << " parts=" << node->num_parts
-              << " single_exec_cost=" << single_exec_cost
-              << " selected_exec_cost=" << selected_exec_cost
+              << " single_exec_cost=" << single_exec_estimate.mean
+              << " single_exec_uncertainty="
+              << single_exec_estimate.uncertainty
+              << " selected_exec_cost=" << selected_exec_estimate.mean
+              << " selected_exec_uncertainty="
+              << selected_exec_estimate.uncertainty
               << " single_profile=" << (has_single_profile ? 1 : 0)
               << " selected_profile=" << (has_selected_profile ? 1 : 0)
               << std::endl;
