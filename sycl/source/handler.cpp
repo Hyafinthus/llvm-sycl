@@ -61,6 +61,10 @@ struct OfflineProfileEvent {
   uint64_t HostStartNs = 0;
   uint64_t HostEndNs = 0;
   sycl::event Event;
+  // Capture the key before ProgramManager::kernel_reqs is cleared.  This also
+  // makes profile collection independent of the deferred command-group
+  // lifetime and is required by a future asynchronous completion path.
+  std::string KernelKey;
 };
 
 namespace sycl {
@@ -586,10 +590,11 @@ static std::string findOfflineKernelProfileKey(int KernelCount) {
 
 static void fillOfflineKernelReqData(
     S2DKernelReqData &KernelReqData, pid_t Pid, int KernelCount,
-    const detail::NDRDescT &NDRDesc,
+    const std::string &KernelName, const detail::NDRDescT &NDRDesc,
     const std::vector<detail::Requirement *> &Requirements) {
   KernelReqData.pid = Pid;
   KernelReqData.kernel_count = KernelCount;
+  KernelReqData.kernel_identity = stableKernelIdentity(KernelName);
   KernelReqData.req_size = Requirements.size();
   KernelReqData.work_dim = NDRDesc.Dims;
   KernelReqData.global_size0 = NDRDesc.GlobalSize[0];
@@ -1043,7 +1048,24 @@ static void fillOfflineProfileData(int WaitCount,
   ProfileData.device_index = ProfileEvent.DeviceIndex;
   ProfileData.num_parts = std::max(1, ProfileEvent.NumParts);
   ProfileData.duration_ns = Duration;
-  ProfileData.kernel_key = findOfflineKernelProfileKey(ProfileEvent.KernelCount);
+  ProfileData.kernel_key =
+      ProfileEvent.KernelKey.empty()
+          ? findOfflineKernelProfileKey(ProfileEvent.KernelCount)
+          : ProfileEvent.KernelKey;
+}
+
+static void waitOfflineBatchForUserFence(
+    const std::vector<OfflineProfileEvent> &ProfileEvents) {
+  // scheduleOffline is entered from queue::wait().  Waiting for every event is
+  // therefore required by the user-visible fence, not by profiling.  Keep the
+  // synchronization explicit and separate so querying profiling timestamps
+  // never creates an additional serialization dependency.
+  for (const OfflineProfileEvent &ProfileEvent : ProfileEvents) {
+    if (ProfileEvent.NumParts <= 1) {
+      sycl::event EventCopy = ProfileEvent.Event;
+      EventCopy.wait();
+    }
+  }
 }
 
 static bool collectOfflineProfilingInfo(
@@ -1065,7 +1087,6 @@ static bool collectOfflineProfilingInfo(
 
   try {
     sycl::event ProfileEventCopy = ProfileEvent.Event;
-    ProfileEventCopy.wait();
     uint64_t Start =
         ProfileEventCopy.get_profiling_info<
             info::event_profiling::command_start>();
@@ -1106,6 +1127,8 @@ static bool collectOfflineProfilingInfo(
 
 static void processOfflineProfilingBatch(
     int WaitCount, const std::vector<OfflineProfileEvent> &ProfileEvents) {
+  waitOfflineBatchForUserFence(ProfileEvents);
+
   S2DProfileBatchData Batch;
   for (const OfflineProfileEvent &ProfileEvent : ProfileEvents) {
     S2DKernelProfileData ProfileData;
@@ -1229,7 +1252,7 @@ event handler::finalize() {
           detail::combineAccessModesOfReqs(MRequirements);
 
           fillOfflineKernelReqData(kernel_req_data, getpid(),
-                                   daemon_kernel_count, MNDRDesc,
+                                   daemon_kernel_count, MKernelName, MNDRDesc,
                                    MRequirements);
 
           std::string serialized_data = kernel_req_data.serialize();
@@ -1291,7 +1314,7 @@ event handler::finalize() {
         detail::combineAccessModesOfReqs(MRequirements);
 
         fillOfflineKernelReqData(kernel_req_data, getpid(),
-                                 daemon_kernel_count, MNDRDesc,
+                                 daemon_kernel_count, MKernelName, MNDRDesc,
                                  MRequirements);
 
         std::string serialized_data = kernel_req_data.serialize();
@@ -1468,7 +1491,8 @@ event handler::finalize() {
       detail::combineAccessModesOfReqs(MRequirements);
 
       fillOfflineKernelReqData(kernel_req_data, getpid(),
-                               daemon_kernel_count, MNDRDesc, MRequirements);
+                               daemon_kernel_count, MKernelName, MNDRDesc,
+                               MRequirements);
     }
     kernel_reqs.push_back(kernel_req_data);
 
@@ -2945,7 +2969,8 @@ event handler::scheduleOffline() {
     profile_events.push_back(
         {sycl_kernel_cg->kernel_count, 1,
          static_cast<int>(detail::ProgramManager::getInstance().NumParts),
-         HostStart, HostEnd, last_event});
+         HostStart, HostEnd, last_event,
+         findOfflineKernelProfileKey(sycl_kernel_cg->kernel_count)});
   }
 #ifdef SNMD_OFFLINE
   finalizeAllPendingOfflineSplits();
@@ -3171,7 +3196,8 @@ event handler::scheduleOffline() {
 #endif
         profile_events.push_back({kernel_count, ActualDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,
-                                  HostEnd, last_event});
+                                  HostEnd, last_event,
+                                  findOfflineKernelProfileKey(kernel_count)});
         HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === resubmit kernel: " << kernel_count << std::endl;
       }
       else {
@@ -3396,7 +3422,8 @@ event handler::scheduleOffline() {
 #endif
         profile_events.push_back({kernel_count, ActualDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,
-                                  HostEnd, last_event});
+                                  HostEnd, last_event,
+                                  findOfflineKernelProfileKey(kernel_count)});
         HANDLER_TRACE_STREAM << getpid() << " === handler === resubmitted kernel: " << kernel_count << std::endl;
         if (exec_num == kernel_exec_infos.size() - 1)
           HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === resubmit last kernel: " << kernel_count << std::endl;

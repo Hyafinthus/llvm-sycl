@@ -8,6 +8,7 @@
 #include <set>
 #include <unordered_map>
 #include <cstdint>
+#include <iomanip>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -137,7 +138,20 @@ inline bool profileKeyWriteAccess(acc_mode mode) {
          mode == acc_mode::atomic;
 }
 
-inline std::string buildKernelProfileKey(const std::vector<SyclReqData> &reqs,
+inline uint64_t stableKernelIdentity(const std::string &kernel_name) {
+  // std::hash is not required to be stable across processes or library
+  // versions.  The daemon and handler communicate through separate processes,
+  // so use a small deterministic FNV-1a hash for the kernel symbol instead.
+  uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char ch : kernel_name) {
+    hash ^= static_cast<uint64_t>(ch);
+    hash *= 1099511628211ULL;
+  }
+  return kernel_name.empty() ? 0 : hash;
+}
+
+inline std::string buildKernelProfileKey(uint64_t kernel_identity,
+                                         const std::vector<SyclReqData> &reqs,
                                          int work_dim = 0,
                                          size_t global_size0 = 1,
                                          size_t global_size1 = 1,
@@ -145,7 +159,8 @@ inline std::string buildKernelProfileKey(const std::vector<SyclReqData> &reqs,
   size_t read_bytes = 0;
   size_t write_bytes = 0;
   std::ostringstream oss;
-  oss << "dims=" << work_dim << ":" << global_size0 << "x" << global_size1
+  oss << "kid=" << std::hex << kernel_identity << std::dec
+      << "|dims=" << work_dim << ":" << global_size0 << "x" << global_size1
       << "x" << global_size2 << "|reqs=" << reqs.size() << "|";
   for (const SyclReqData &req : reqs) {
     const size_t bytes =
@@ -168,6 +183,7 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
   pid_t pid;
 
   int kernel_count;
+  uint64_t kernel_identity = 0;
   int req_size;
   int work_dim = 0;
   size_t global_size0 = 1;
@@ -176,14 +192,15 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
   std::vector<SyclReqData> reqs;
 
   std::string profileKey() const {
-    return buildKernelProfileKey(reqs, work_dim, global_size0, global_size1,
-                                 global_size2);
+    return buildKernelProfileKey(kernel_identity, reqs, work_dim,
+                                 global_size0, global_size1, global_size2);
   }
 
   std::string serialize() const {
     std::ostringstream oss;
     oss << pid << "\n"
         << kernel_count << "\n"
+        << kernel_identity << "\n"
         << req_size << "\n"
         << work_dim << "\n"
         << global_size0 << "\n"
@@ -204,6 +221,7 @@ struct S2DKernelReqData { // daemon需要的一个kernel的信息
 
     iss >> kernel_data.pid;
     iss >> kernel_data.kernel_count;
+    iss >> kernel_data.kernel_identity;
     iss >> kernel_data.req_size;
     iss >> kernel_data.work_dim;
     iss >> kernel_data.global_size0;
@@ -508,7 +526,9 @@ struct ProgramInfo {
 };
 
 struct DAGNode { // 一个kernel的依赖关系
+  pid_t program_pid = 0;
   int kernel_count;
+  uint64_t kernel_identity = 0;
   int depth = 0; // 如果没有依赖 在DAG中的深度为0
   std::vector<SyclReqData> req_data;
   int work_dim = 0;
@@ -539,7 +559,9 @@ struct DAGNode { // 一个kernel的依赖关系
 
   DAGNode(int count, const std::vector<SyclReqData> &reqs) : kernel_count(count), req_data(reqs) {}
   explicit DAGNode(const S2DKernelReqData &kernel_data)
-      : kernel_count(kernel_data.kernel_count), req_data(kernel_data.reqs),
+      : program_pid(kernel_data.pid), kernel_count(kernel_data.kernel_count),
+        kernel_identity(kernel_data.kernel_identity),
+        req_data(kernel_data.reqs),
         work_dim(kernel_data.work_dim), global_size0(kernel_data.global_size0),
         global_size1(kernel_data.global_size1),
         global_size2(kernel_data.global_size2) {}

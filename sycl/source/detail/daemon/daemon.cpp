@@ -11,9 +11,11 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
+#include <list>
 #include <map>
 #include <stdexcept>
 #include <tuple>
@@ -59,11 +61,26 @@ std::vector<std::vector<MonitorInfo>> cluster_monitor_info;
 std::vector<std::vector<ComputeCapability>> cluster_device_capability;
 std::vector<int> cluster_comm_profile_ids;
 std::vector<int> ranks_idle;
+std::mutex monitor_state_mutex;
 
 // ====【Algorithm】
 std::vector<std::vector<ComputeCapability>> gpu_capability; // 不同rank的设备算力, 包含fp32/fp64两套归一化能力
 std::vector<std::vector<double>> gpu_available_time; // 不同gpu的可用时间 monitor查看空闲？不空闲怎么做
+std::vector<std::vector<double>> gpu_service_time_scale;
+std::vector<std::vector<double>> gpu_memory_available_kib;
+std::vector<int> gpu_comm_profile_ids;
+std::mutex offline_scheduler_mutex;
 int local_comm_profile_id = -1;
+
+static std::vector<MonitorInfo> snapshotLocalMonitorInfo() {
+  std::lock_guard<std::mutex> lock(monitor_state_mutex);
+  return device_monitor_info;
+}
+
+static std::vector<int> snapshotRankIdleState() {
+  std::lock_guard<std::mutex> lock(monitor_state_mutex);
+  return ranks_idle;
+}
 
 static std::vector<std::string> DeserializeSubmitArgs(const char *buffer,
                                                       size_t buffer_size) {
@@ -139,10 +156,15 @@ struct ProfileCostKey {
 
 struct ProfileCostEntry {
   double ewma_cost = 0.0;
+  double mean_cost = 0.0;
+  double m2_cost = 0.0;
+  double min_cost = std::numeric_limits<double>::infinity();
   int samples = 0;
 };
 
 std::map<ProfileCostKey, ProfileCostEntry> profile_cost_table;
+std::map<std::tuple<pid_t, int, int>, uint64_t> profile_device_update_ns;
+std::mutex profile_cost_mutex;
 
 // ====【MPI】
 int mpi_rank, mpi_size; // main
@@ -785,6 +807,21 @@ void generateDAGs(std::vector<DAGNode *> &kernel_dag_nodes, std::vector<DAGNode 
   }
 }
 
+static void rebaseCompletedOfflineDAG(
+    const std::vector<DAGNode *> &kernel_dag_nodes) {
+  // A new offline batch can only be submitted after the preceding user
+  // queue::wait returned. Previous nodes remain data producers and residency
+  // anchors, but their synthetic HEFT offsets do not belong to this batch's
+  // time origin.
+  for (DAGNode *node : kernel_dag_nodes) {
+    if (node == nullptr) {
+      continue;
+    }
+    node->finish_time = 0.0;
+    node->rank_u = 0.0;
+  }
+}
+
 static constexpr double PROFILE_NS_TO_COST = 10000.0;
 static constexpr double GIB_BYTES = 1024.0 * 1024.0 * 1024.0;
 static constexpr double HEFT_COMM_COST_PER_SECOND = 100000.0;
@@ -872,7 +909,8 @@ struct NodePlacementState {
 };
 
 static std::string profileKeyForNode(const DAGNode *node) {
-  return buildKernelProfileKey(node->req_data, node->work_dim,
+  return buildKernelProfileKey(node->kernel_identity, node->req_data,
+                               node->work_dim,
                                node->global_size0, node->global_size1,
                                node->global_size2);
 }
@@ -998,6 +1036,13 @@ static double coldWorkElems(const DAGNode *node) {
          coldArithmeticIntensityFactor(node);
 }
 
+static uint64_t daemonSteadyNowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 static void updateProfileCostTable(const S2DKernelProfileData &profile,
                                    int sample_rank) {
   if (profile.duration_ns == 0 || profile.kernel_key.empty()) {
@@ -1008,6 +1053,8 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
                      std::max(1, profile.num_parts)};
   const double sample_cost =
       static_cast<double>(profile.duration_ns) / PROFILE_NS_TO_COST;
+
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
   ProfileCostEntry &entry = profile_cost_table[key];
   if (entry.samples == 0) {
     entry.ewma_cost = sample_cost;
@@ -1015,18 +1062,35 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
     entry.ewma_cost = entry.ewma_cost * 0.7 + sample_cost * 0.3;
   }
   entry.samples++;
+  const double delta = sample_cost - entry.mean_cost;
+  entry.mean_cost += delta / static_cast<double>(entry.samples);
+  const double delta_after_mean = sample_cost - entry.mean_cost;
+  entry.m2_cost += delta * delta_after_mean;
+  entry.min_cost = std::min(entry.min_cost, sample_cost);
+  profile_device_update_ns[
+      {profile.pid, sample_rank, profile.device_index}] =
+      daemonSteadyNowNs();
+
+  const double stddev =
+      entry.samples > 1
+          ? std::sqrt(entry.m2_cost / static_cast<double>(entry.samples - 1))
+          : 0.0;
 
   DAEMON_TRACE_STREAM << "ProfileCostTable: key " << profile.kernel_key
             << " rank " << sample_rank << " device " << profile.device_index
             << " parts " << std::max(1, profile.num_parts)
             << " sample_cost " << sample_cost
             << " ewma_cost " << entry.ewma_cost
+            << " mean_cost " << entry.mean_cost
+            << " stddev_cost " << stddev
+            << " min_cost " << entry.min_cost
             << " samples " << entry.samples << std::endl;
 }
 
 static bool lookupExactProfileCost(const std::string &kernel_key, int rank,
                                    int device, int num_parts, double &cost) {
   ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts)};
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
   auto exact_it = profile_cost_table.find(exact);
   if (exact_it == profile_cost_table.end()) {
     return false;
@@ -1049,6 +1113,7 @@ static bool hasExactProfileCost(const std::string &kernel_key, int rank,
 static bool hasProfileCostForParts(const std::string &kernel_key,
                                    int num_parts) {
   const int parts = std::max(1, num_parts);
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
   for (const auto &entry : profile_cost_table) {
     if (entry.first.kernel_key == kernel_key &&
         entry.first.num_parts == parts && entry.second.samples > 0) {
@@ -1182,7 +1247,12 @@ static std::string inferCommProfileKeyFromHostName(
 }
 
 static std::string inferCommProfileKeyFromLocalDevices() {
-  for (const MonitorInfo &info : device_monitor_info) {
+  std::vector<MonitorInfo> monitor_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(monitor_state_mutex);
+    monitor_snapshot = device_monitor_info;
+  }
+  for (const MonitorInfo &info : monitor_snapshot) {
     if (containsIgnoreCase(info.name, "4090")) {
       return "4090-01";
     }
@@ -1215,21 +1285,20 @@ static int detectLocalCommProfileId() {
 }
 
 static const NodeCommProfile *commProfileForRank(int rank) {
-  if (rank >= 0 && rank < static_cast<int>(cluster_comm_profile_ids.size())) {
+  if (rank >= 0 && rank < static_cast<int>(gpu_comm_profile_ids.size())) {
     const NodeCommProfile *profile =
-        findNodeCommProfileById(cluster_comm_profile_ids[rank]);
+        findNodeCommProfileById(gpu_comm_profile_ids[rank]);
     if (profile != nullptr) {
       return profile;
     }
-  }
-  if (rank == mpi_rank) {
-    return findNodeCommProfileById(local_comm_profile_id);
   }
   return nullptr;
 }
 
 static void ensureLocalCommProfileVisible(size_t rank_count) {
-  local_comm_profile_id = detectLocalCommProfileId();
+  const int detected_profile_id = detectLocalCommProfileId();
+  std::lock_guard<std::mutex> lock(monitor_state_mutex);
+  local_comm_profile_id = detected_profile_id;
   if (cluster_comm_profile_ids.size() < rank_count) {
     cluster_comm_profile_ids.resize(rank_count, -1);
   }
@@ -1366,15 +1435,29 @@ static double minPositiveCapability(
   return std::isfinite(min_capability) ? min_capability : 1.0;
 }
 
-static double initialAvailableTimeFromUtil(double util, double capability) {
+static bool hasFreshProfileForDevice(pid_t program_pid, int rank, int proc) {
+  // A profile is sent immediately after the user's wait fence completed.  The
+  // monitor sample gathered in the same short interval still mostly reflects
+  // work that this runtime already knows has finished.  Treating it as new
+  // external load would count the same work twice.
+  static constexpr uint64_t FRESH_PROFILE_NS =
+      static_cast<uint64_t>(MONITOR_GATHER_INTERVAL) * 2ULL * 1000ULL;
+  const uint64_t now_ns = daemonSteadyNowNs();
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
+  auto it = profile_device_update_ns.find({program_pid, rank, proc});
+  return it != profile_device_update_ns.end() && now_ns >= it->second &&
+         now_ns - it->second <= FRESH_PROFILE_NS;
+}
+
+static double monitorServiceTimeScale(double util, bool fresh_profile) {
   util = std::max(0.0, std::min(100.0, util));
-  if (util < MONITOR_THRESHOLD) {
-    return 0.0;
+  if (fresh_profile || util <= MONITOR_THRESHOLD) {
+    return 1.0;
   }
 
-  const double busy_ratio =
+  const double external_busy_ratio =
       (util - MONITOR_THRESHOLD) / (100.0 - MONITOR_THRESHOLD);
-  return busy_ratio * 1000.0 / std::max(0.1, capability);
+  return 1.0 + external_busy_ratio;
 }
 
 static size_t offlineRankCount() {
@@ -1433,9 +1516,20 @@ static const MonitorInfo *monitorInfoForDevice(int rank, int proc) {
   return nullptr;
 }
 
-static void ensureOfflineDeviceModel() {
-  const size_t rank_count = offlineRankCount();
+static void ensureOfflineDeviceModel(pid_t program_pid) {
+  size_t rank_count = 0;
+  {
+    std::lock_guard<std::mutex> monitor_lock(monitor_state_mutex);
+    rank_count = offlineRankCount();
+  }
   ensureLocalCommProfileVisible(rank_count);
+
+  // Capture one coherent monitor generation for the whole scheduling pass.
+  // The algorithm never consults live NVML state again after this function.
+  std::lock_guard<std::mutex> monitor_lock(monitor_state_mutex);
+  rank_count = std::max(rank_count, offlineRankCount());
+  gpu_comm_profile_ids = cluster_comm_profile_ids;
+  gpu_comm_profile_ids.resize(rank_count, -1);
 
   std::vector<std::vector<ComputeCapability>> raw_capability(rank_count);
   for (size_t rank = 0; rank < rank_count; ++rank) {
@@ -1449,10 +1543,14 @@ static void ensureOfflineDeviceModel() {
   const double min_capability = minPositiveCapability(raw_capability);
   gpu_capability.resize(rank_count);
   gpu_available_time.resize(rank_count);
+  gpu_service_time_scale.resize(rank_count);
+  gpu_memory_available_kib.resize(rank_count);
 
   for (size_t rank = 0; rank < rank_count; ++rank) {
     gpu_capability[rank].resize(raw_capability[rank].size());
     gpu_available_time[rank].resize(raw_capability[rank].size());
+    gpu_service_time_scale[rank].resize(raw_capability[rank].size());
+    gpu_memory_available_kib[rank].resize(raw_capability[rank].size());
 
     for (size_t proc = 0; proc < raw_capability[rank].size(); ++proc) {
       gpu_capability[rank][proc] = ComputeCapability{
@@ -1462,17 +1560,27 @@ static void ensureOfflineDeviceModel() {
       const MonitorInfo *info =
           monitorInfoForDevice(static_cast<int>(rank), static_cast<int>(proc));
       const double util = info == nullptr ? 0.0 : info->util_used;
-      const double available_capability =
-          std::max(gpu_capability[rank][proc].fp32,
-                   gpu_capability[rank][proc].fp64);
-      gpu_available_time[rank][proc] =
-          initialAvailableTimeFromUtil(util, available_capability);
+      const bool fresh_profile = hasFreshProfileForDevice(
+          program_pid, static_cast<int>(rank), static_cast<int>(proc));
+
+      // Monitor data is represented once as a contextual service-time scale,
+      // rather than also inventing a second availability delay. Cross-window
+      // predecessor finish times remain the conservative ordering anchor in
+      // multi-rank mode until remote completion acknowledgements are added.
+      gpu_available_time[rank][proc] = 0.0;
+      gpu_service_time_scale[rank][proc] =
+          monitorServiceTimeScale(util, fresh_profile);
+      gpu_memory_available_kib[rank][proc] =
+          info == nullptr ? 0.0 : static_cast<double>(info->mem_available);
 
       DAEMON_TRACE_STREAM << "ensureOfflineDeviceModel: Rank " << rank
                 << " Proc " << proc
                 << " FP32Capability " << gpu_capability[rank][proc].fp32
                 << " FP64Capability " << gpu_capability[rank][proc].fp64
                 << " Util " << util
+                << " FreshProfile " << (fresh_profile ? 1 : 0)
+                << " ServiceTimeScale "
+                << gpu_service_time_scale[rank][proc]
                 << " AvailableTime " << gpu_available_time[rank][proc]
                 << std::endl;
     }
@@ -1555,6 +1663,7 @@ static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
   double weighted_sum = 0.0;
   int samples = 0;
 
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
   for (const auto &entry : profile_cost_table) {
     const ProfileCostKey &sample_key = entry.first;
     if (sample_key.kernel_key != kernel_key || sample_key.num_parts != parts) {
@@ -1578,34 +1687,47 @@ static bool lookupScaledProfileCost(const std::string &kernel_key, int rank,
   return true;
 }
 
-static double monitorPenalty(int rank, int proc) {
-  const MonitorInfo *info = monitorInfoForDevice(rank, proc);
-  if (info == nullptr) {
+static double deviceServiceTimeScale(int rank, int proc) {
+  if (rank < 0 || rank >= static_cast<int>(gpu_service_time_scale.size()) ||
+      proc < 0 ||
+      proc >= static_cast<int>(gpu_service_time_scale[rank].size())) {
     return 1.0;
   }
-  const double util = std::max(0.0, std::min(100.0, info->util_used));
-  return 1.0 + util / 100.0;
+  return std::max(1.0, gpu_service_time_scale[rank][proc]);
 }
 
 static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
                               int num_parts) {
+  // An exact successful profile proves that this already-materialized mode fit
+  // on the device. Until residency-aware allocation deltas are tracked, do not
+  // double-count its existing buffers against current free memory.
   if (proc > 0 &&
       hasExactProfileCost(profileKeyForNode(node), rank, proc, num_parts)) {
     return true;
   }
 
-  const MonitorInfo *info = monitorInfoForDevice(rank, proc);
-  if (info == nullptr || info->mem_available == 0) {
+  if (rank < 0 || rank >= static_cast<int>(gpu_memory_available_kib.size()) ||
+      proc < 0 ||
+      proc >= static_cast<int>(gpu_memory_available_kib[rank].size()) ||
+      gpu_memory_available_kib[rank][proc] <= 0.0) {
     return true;
   }
 
   double required_bytes = totalReqBytes(node);
   if (num_parts > 1 && !node->req_data.empty()) {
-    required_bytes =
-        (totalReadElems(node) + totalWriteElems(node) / num_parts) *
-        node->req_data.front().elem_size;
+    required_bytes = 0.0;
+    for (const SyclReqData &req : node->req_data) {
+      const double bytes = reqBytes(req);
+      // Read-only inputs are replicated by the current Split data path. A
+      // writable range is partitioned along dim0 and contributes one part on
+      // each participating device.
+      required_bytes += isWriteAccess(req.req_accmode)
+                            ? bytes / static_cast<double>(num_parts)
+                            : bytes;
+    }
   }
-  const double available_bytes = static_cast<double>(info->mem_available) * 1024.0;
+  const double available_bytes =
+      gpu_memory_available_kib[rank][proc] * 1024.0;
   return required_bytes < available_bytes * 0.85;
 }
 
@@ -1614,13 +1736,14 @@ static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
   const std::string key = profileKeyForNode(node);
   const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
   if (lookupScaledProfileCost(key, rank, proc, 1, precision, profile_cost)) {
-    return std::max(0.001, profile_cost) * monitorPenalty(rank, proc);
+    return std::max(0.001, profile_cost) *
+           deviceServiceTimeScale(rank, proc);
   }
 
   const double cold_cost = coldWorkElems(node) /
                            std::max(0.1, deviceCapability(rank, proc,
                                                           precision));
-  return cold_cost * monitorPenalty(rank, proc);
+  return cold_cost * deviceServiceTimeScale(rank, proc);
 }
 
 static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
@@ -1743,6 +1866,17 @@ static bool worthConsideringSplit(DAGNode *node, int num_parts) {
   (void)num_parts;
   return false;
 #else
+  static const bool split_enabled = [] {
+    const char *env = std::getenv("SYCL_SNMD_ENABLE_SPLIT");
+    if (env == nullptr) {
+      return SNMD_OFFLINE_SPLIT_DEFAULT_ENABLED != 0;
+    }
+    return std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
+           std::strcmp(env, "TRUE") == 0;
+  }();
+  if (!split_enabled) {
+    return false;
+  }
   if (num_parts <= 1) {
     return false;
   }
@@ -1808,7 +1942,7 @@ static double estimateSplitExecCost(DAGNode *node, int rank,
                               precision, profile_cost)) {
     double penalty = 1.0;
     for (int proc : split_devices) {
-      penalty = std::max(penalty, monitorPenalty(rank, proc));
+      penalty = std::max(penalty, deviceServiceTimeScale(rank, proc));
     }
     return std::max(0.001, profile_cost) * penalty;
   }
@@ -2199,10 +2333,20 @@ static double estimateAverageCommCost(DAGNode *node, DAGNode *pre_node) {
 }
 
 // nodes: 这批要调度的所有kernel
-void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
-  // 根据当前monitor得到每个rank的设备数量、归一化算力和初始可用时间。
-  // 0号设备固定是CPU，后续编号保持和handler端globalDevices一致。
-  ensureOfflineDeviceModel();
+void algorithmHEFT(
+    std::vector<DAGNode *> &nodes,
+    std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
+  // The legacy implementation stores the current HEFT calendar in globals.
+  // Serialize only this short metadata calculation so concurrent application
+  // daemon threads cannot overwrite each other's scheduling context.
+  std::lock_guard<std::mutex> scheduler_lock(offline_scheduler_mutex);
+  // Build one scheduling context for this wait-delimited batch. A confirmed
+  // completion frontier resets runtime-owned calendars; monitor load appears
+  // once as a service-time scale. Device numbering remains aligned with
+  // handler's globalDevices (proc 0 is the CPU).
+  const pid_t program_pid =
+      nodes.empty() || nodes.front() == nullptr ? 0 : nodes.front()->program_pid;
+  ensureOfflineDeviceModel(program_pid);
 
   int batch_root_count = 0;
   for (DAGNode *node : nodes) {
@@ -2250,6 +2394,7 @@ void algorithmHEFT(std::vector<DAGNode *> &nodes, std::vector<D2DKernelSchedInfo
     }
     node->total_elem = total_elem / 1000; // TODO 归一化
     DAEMON_TRACE_STREAM << "algorithmHEFT: Kernel " << node->kernel_count
+              << " identity " << std::hex << node->kernel_identity << std::dec
               << " total_elem: " << total_elem
               << " precision: "
               << precisionName(inferKernelPrecisionFromReqs(node->req_data))
@@ -2501,7 +2646,10 @@ void CPUMonitor() {
   file.close();
   // std::cout << "Memory available: " << mem_available << " kB" << std::endl;
 
-  device_monitor_info[0] = MonitorInfo{"CPU", utilization, mem_available};
+  {
+    std::lock_guard<std::mutex> lock(monitor_state_mutex);
+    device_monitor_info[0] = MonitorInfo{"CPU", utilization, mem_available};
+  }
 }
 
 int getCudaPciBusId(const sycl::device &device) {
@@ -2522,6 +2670,7 @@ int getCudaPciBusId(const sycl::device &device) {
 }
 
 int MonitorInit() {
+  std::lock_guard<std::mutex> lock(monitor_state_mutex);
   device_capability.resize(1);
   device_capability[0] = inferCpuCapabilityFromName(readCpuModelName());
 
@@ -2669,17 +2818,20 @@ void CudaMonitor(int device_count) {
       if (sycl_it != index_nvml_sycl.end()) {
         device_index = sycl_it->second;
       }
-      if (device_index >= static_cast<int>(device_monitor_info.size())) {
-        device_monitor_info.resize(device_index + 1);
+      {
+        std::lock_guard<std::mutex> lock(monitor_state_mutex);
+        if (device_index >= static_cast<int>(device_monitor_info.size())) {
+          device_monitor_info.resize(device_index + 1);
+        }
+        if (device_index >= static_cast<int>(device_capability.size())) {
+          device_capability.resize(device_index + 1,
+                                   fallbackCapabilityForProc(device_index));
+        }
+        device_monitor_info[device_index] =
+            MonitorInfo{name, utilization.gpu, memoryInfo.free / 1024.0};
+        device_capability[device_index] =
+            inferDeviceCapabilityFromName(name, false);
       }
-      if (device_index >= static_cast<int>(device_capability.size())) {
-        device_capability.resize(device_index + 1,
-                                 fallbackCapabilityForProc(device_index));
-      }
-      device_monitor_info[device_index] =
-          MonitorInfo{name, utilization.gpu, memoryInfo.free / 1024.0};
-      device_capability[device_index] =
-          inferDeviceCapabilityFromName(name, false);
   }
 }
 
@@ -2712,40 +2864,66 @@ void *SystemSchedulerMonitor(void *arg) {
   pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemMonitor, NULL);
   pthread_detach(monitor_tid);
 
-  ranks_idle.resize(monitor_size, false);
-  cluster_monitor_info.resize(monitor_size);
-  cluster_device_capability.resize(monitor_size);
-  cluster_comm_profile_ids.resize(monitor_size, -1);
+  {
+    std::lock_guard<std::mutex> lock(monitor_state_mutex);
+    ranks_idle.resize(monitor_size, false);
+    cluster_monitor_info.resize(monitor_size);
+    cluster_device_capability.resize(monitor_size);
+  }
+  {
+    std::lock_guard<std::mutex> lock(monitor_state_mutex);
+    cluster_comm_profile_ids.resize(monitor_size, -1);
+  }
 
   // 每个rank彼此感知是否有空闲即可 无需传递所有状态？
   while (1) {
-    local_comm_profile_id = detectLocalCommProfileId();
+    const int detected_comm_profile_id = detectLocalCommProfileId();
+
+    std::vector<MonitorInfo> local_monitor_snapshot;
+    std::vector<ComputeCapability> local_capability_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(monitor_state_mutex);
+      local_monitor_snapshot = device_monitor_info;
+      local_capability_snapshot = device_capability;
+    }
 
     int is_idle = 0;
-    for (int i = 1; i < device_monitor_info.size(); i++) {
-      if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
+    for (int i = 1; i < local_monitor_snapshot.size(); i++) {
+      if (local_monitor_snapshot[i].util_used < MONITOR_THRESHOLD) {
         is_idle = 1;
         break;
       }
     }
 
-    MPI_Allgather(&is_idle, 1, MPI_INT, ranks_idle.data(), 1, MPI_INT, comm_monitor);
-    MPI_Allgather(&local_comm_profile_id, 1, MPI_INT,
-                  cluster_comm_profile_ids.data(), 1, MPI_INT,
+    std::vector<int> gathered_ranks_idle(monitor_size, false);
+    MPI_Allgather(&is_idle, 1, MPI_INT, gathered_ranks_idle.data(), 1,
+                  MPI_INT, comm_monitor);
+    {
+      std::lock_guard<std::mutex> lock(monitor_state_mutex);
+      ranks_idle = std::move(gathered_ranks_idle);
+    }
+    std::vector<int> gathered_comm_profile_ids(monitor_size, -1);
+    MPI_Allgather(&detected_comm_profile_id, 1, MPI_INT,
+                  gathered_comm_profile_ids.data(), 1, MPI_INT,
                   comm_monitor);
+    {
+      std::lock_guard<std::mutex> lock(monitor_state_mutex);
+      local_comm_profile_id = detected_comm_profile_id;
+      cluster_comm_profile_ids = std::move(gathered_comm_profile_ids);
+    }
 
     std::array<double, MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS> local_monitor{};
     const int local_device_count =
-        std::min<int>(device_monitor_info.size(), MAX_MONITOR_DEVICES);
+        std::min<int>(local_monitor_snapshot.size(), MAX_MONITOR_DEVICES);
     for (int i = 0; i < local_device_count; ++i) {
       const int offset = i * MONITOR_PACKED_FIELDS;
       local_monitor[offset + 0] = 1.0;
-      local_monitor[offset + 1] = device_monitor_info[i].util_used;
+      local_monitor[offset + 1] = local_monitor_snapshot[i].util_used;
       local_monitor[offset + 2] =
-          static_cast<double>(device_monitor_info[i].mem_available);
+          static_cast<double>(local_monitor_snapshot[i].mem_available);
       const ComputeCapability capability =
-          i < static_cast<int>(device_capability.size())
-              ? device_capability[i]
+          i < static_cast<int>(local_capability_snapshot.size())
+              ? local_capability_snapshot[i]
               : fallbackCapabilityForProc(i);
       local_monitor[offset + 3] = capability.fp32;
       local_monitor[offset + 4] = capability.fp64;
@@ -2759,26 +2937,29 @@ void *SystemSchedulerMonitor(void *arg) {
                   MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS, MPI_DOUBLE,
                   comm_monitor);
 
-    for (int rank = 0; rank < monitor_size; ++rank) {
-      std::vector<MonitorInfo> rank_info;
-      std::vector<ComputeCapability> rank_capability;
-      for (int device = 0; device < MAX_MONITOR_DEVICES; ++device) {
-        const int offset =
-            rank * MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS +
-            device * MONITOR_PACKED_FIELDS;
-        if (packed_monitor[offset] == 0.0) {
-          continue;
+    {
+      std::lock_guard<std::mutex> lock(monitor_state_mutex);
+      for (int rank = 0; rank < monitor_size; ++rank) {
+        std::vector<MonitorInfo> rank_info;
+        std::vector<ComputeCapability> rank_capability;
+        for (int device = 0; device < MAX_MONITOR_DEVICES; ++device) {
+          const int offset =
+              rank * MAX_MONITOR_DEVICES * MONITOR_PACKED_FIELDS +
+              device * MONITOR_PACKED_FIELDS;
+          if (packed_monitor[offset] == 0.0) {
+            continue;
+          }
+          rank_info.push_back(MonitorInfo{
+              device == 0 ? "CPU" : "GPU",
+              packed_monitor[offset + 1],
+              static_cast<size_t>(packed_monitor[offset + 2])});
+          rank_capability.push_back(
+              ComputeCapability{packed_monitor[offset + 3],
+                                packed_monitor[offset + 4]});
         }
-        rank_info.push_back(MonitorInfo{
-            device == 0 ? "CPU" : "GPU",
-            packed_monitor[offset + 1],
-            static_cast<size_t>(packed_monitor[offset + 2])});
-        rank_capability.push_back(
-            ComputeCapability{packed_monitor[offset + 3],
-                              packed_monitor[offset + 4]});
+        cluster_monitor_info[rank] = std::move(rank_info);
+        cluster_device_capability[rank] = std::move(rank_capability);
       }
-      cluster_monitor_info[rank] = std::move(rank_info);
-      cluster_device_capability[rank] = std::move(rank_capability);
     }
 
     // for (int i = 0; i < monitor_size; i++) {
@@ -2841,11 +3022,13 @@ void *SystemSchedulerDaemon(void *arg) {
           exit(1);
         }
         kernel_exec_info.scale_count = scale_count;
+        const std::vector<MonitorInfo> monitor_snapshot =
+            snapshotLocalMonitorInfo();
         int min_util = 100;
         int min_util_index = -1;
-        for (int i = 1; i < device_monitor_info.size(); i++) {
-          if (device_monitor_info[i].util_used < min_util) {
-            min_util = device_monitor_info[i].util_used;
+        for (int i = 1; i < monitor_snapshot.size(); i++) {
+          if (monitor_snapshot[i].util_used < min_util) {
+            min_util = monitor_snapshot[i].util_used;
             min_util_index = i;
           }
         }
@@ -2933,6 +3116,10 @@ void *SystemSchedulerDaemon(void *arg) {
       DAEMON_TRACE_STREAM << "Rank " << daemon_rank << ": mq_receive kernel_req_data pid: " << kernel_req_data.pid << " count: " << kernel_req_data.kernel_count << std::endl;
     }
 
+    const std::vector<MonitorInfo> monitor_snapshot =
+        snapshotLocalMonitorInfo();
+    const std::vector<int> ranks_idle_snapshot = snapshotRankIdleState();
+
     // ====【调度决策并发给其他rank】
     D2DKernelSchedInfo kernel_sched_info;
     bool scale = false;
@@ -2956,8 +3143,8 @@ void *SystemSchedulerDaemon(void *arg) {
         // 不太可能没依赖 必然会依赖初始化的write 无空闲扩容的情况很少
         if (most_rank == -1) { 
           bool idle = false;
-          for (int i = 1; i < device_monitor_info.size(); i++) {
-            if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
+          for (int i = 1; i < monitor_snapshot.size(); i++) {
+            if (monitor_snapshot[i].util_used < MONITOR_THRESHOLD) {
               idle = true;
               break;
             }
@@ -2966,11 +3153,11 @@ void *SystemSchedulerDaemon(void *arg) {
             kernel_sched_info.exec_rank = daemon_rank;
             kernel_sched_info.exec_device = -1;
           } else {
-            for (int i = 0; i < ranks_idle.size(); i++) {
+            for (int i = 0; i < ranks_idle_snapshot.size(); i++) {
               if (i == monitor_rank) {
                 continue;
               }
-              if (ranks_idle[i]) {
+              if (ranks_idle_snapshot[i]) {
                 kernel_sched_info.exec_rank = i;
 
                 std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
@@ -3011,8 +3198,8 @@ void *SystemSchedulerDaemon(void *arg) {
           } else {
             if (most_rank == daemon_rank) { // 依赖在master
               bool idle = false;
-              for (int i = 1; i < device_monitor_info.size(); i++) {
-                if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
+              for (int i = 1; i < monitor_snapshot.size(); i++) {
+                if (monitor_snapshot[i].util_used < MONITOR_THRESHOLD) {
                   idle = true;
                   break;
                 }
@@ -3021,11 +3208,11 @@ void *SystemSchedulerDaemon(void *arg) {
                 kernel_sched_info.exec_rank = daemon_rank;
                 kernel_sched_info.exec_device = -1;
               } else { // master不空闲 找空闲rank扩容
-                for (int i = 0; i < ranks_idle.size(); i++) {
+                for (int i = 0; i < ranks_idle_snapshot.size(); i++) {
                   if (i == monitor_rank) {
                     continue;
                   }
-                  if (ranks_idle[i]) {
+                  if (ranks_idle_snapshot[i]) {
                     kernel_sched_info.exec_rank = i;
 
                     std::lock_guard<std::mutex> lock(*pid_to_scalecount_mutex[local_pid]);
@@ -3084,8 +3271,8 @@ void *SystemSchedulerDaemon(void *arg) {
         // 空闲状态可能有变化 但一定执行 选择最空闲的device执行
         if (kernel_sched_info.exec_device == -1) {
           std::vector<int> idle_devices;
-          for (int i = 1; i < device_monitor_info.size(); i++) {
-            if (device_monitor_info[i].util_used < MONITOR_THRESHOLD) {
+          for (int i = 1; i < monitor_snapshot.size(); i++) {
+            if (monitor_snapshot[i].util_used < MONITOR_THRESHOLD) {
               idle_devices.push_back(i);
             }
           }
@@ -3095,9 +3282,9 @@ void *SystemSchedulerDaemon(void *arg) {
           } else { // 找利用率最低的
             int min_util = 100;
             int min_util_index = -1;
-            for (int i = 1; i < device_monitor_info.size(); i++) {
-              if (device_monitor_info[i].util_used < min_util) {
-                min_util = device_monitor_info[i].util_used;
+            for (int i = 1; i < monitor_snapshot.size(); i++) {
+              if (monitor_snapshot[i].util_used < min_util) {
+                min_util = monitor_snapshot[i].util_used;
                 min_util_index = i;
               }
             }
@@ -3368,51 +3555,136 @@ deserializeProfileSamples(const std::string &data) {
   return profiles;
 }
 
-static void exchangeOfflineProfilesWithMaster(
+static constexpr int OFFLINE_PROFILE_DATA_TAG = 202;
+static constexpr const char *OFFLINE_PROFILE_DONE_MARKER =
+    "SNMD_PROFILE_DONE\n";
+
+struct PendingOfflineProfileSend {
+  std::string payload;
+  MPI_Request request = MPI_REQUEST_NULL;
+};
+
+static void progressPendingOfflineProfileSends(
+    std::list<PendingOfflineProfileSend> &pending_sends) {
+  for (auto it = pending_sends.begin(); it != pending_sends.end();) {
+    int complete = 0;
+    MPI_Test(&it->request, &complete, MPI_STATUS_IGNORE);
+    if (complete) {
+      it = pending_sends.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+static void consumeOfflineProfilePayloadAtMaster(
+    const std::string &payload, int source_rank,
+    std::set<int> &finished_profile_ranks) {
+  if (payload == OFFLINE_PROFILE_DONE_MARKER) {
+    // The marker uses the same source/tag as samples, so MPI's non-overtaking
+    // guarantee ensures every earlier sample from this rank was consumed.
+    finished_profile_ranks.insert(source_rank);
+    return;
+  }
+  std::vector<S2DKernelProfileData> remote_profiles =
+      deserializeProfileSamples(payload);
+  for (const S2DKernelProfileData &profile : remote_profiles) {
+    updateProfileCostTable(profile, source_rank);
+  }
+}
+
+static bool receiveOneOfflineProfilePayloadAtMaster(
+    MPI_Comm &comm_daemon, bool blocking,
+    std::set<int> &finished_profile_ranks) {
+  MPI_Status status;
+  if (blocking) {
+    MPI_Probe(MPI_ANY_SOURCE, OFFLINE_PROFILE_DATA_TAG, comm_daemon, &status);
+  } else {
+    int available = 0;
+    MPI_Iprobe(MPI_ANY_SOURCE, OFFLINE_PROFILE_DATA_TAG, comm_daemon,
+               &available, &status);
+    if (!available) {
+      return false;
+    }
+  }
+
+  int payload_size = 0;
+  MPI_Get_count(&status, MPI_CHAR, &payload_size);
+  if (payload_size <= 0) {
+    // Consume even a malformed zero-byte internal message so it cannot poison
+    // subsequent probes. It is not accepted as a shutdown marker.
+    MPI_Recv(nullptr, 0, MPI_CHAR, status.MPI_SOURCE,
+             OFFLINE_PROFILE_DATA_TAG, comm_daemon, MPI_STATUS_IGNORE);
+    return true;
+  }
+
+  std::string payload(static_cast<size_t>(payload_size), '\0');
+  MPI_Recv(payload.data(), payload_size, MPI_CHAR, status.MPI_SOURCE,
+           OFFLINE_PROFILE_DATA_TAG, comm_daemon, MPI_STATUS_IGNORE);
+  consumeOfflineProfilePayloadAtMaster(payload, status.MPI_SOURCE,
+                                       finished_profile_ranks);
+  return true;
+}
+
+static void publishAndDrainOfflineProfiles(
     const std::vector<S2DKernelProfileData> &local_profiles,
     MPI_Comm &comm_daemon, int daemon_rank, int master_rank,
-    const std::set<int> &onrun_ranks) {
-  static constexpr int PROFILE_LEN_TAG = 201;
-  static constexpr int PROFILE_DATA_TAG = 202;
-
-  std::string payload = serializeProfileSamples(local_profiles);
-  int payload_size = static_cast<int>(payload.size());
-
+    std::list<PendingOfflineProfileSend> &pending_sends,
+    std::set<int> &finished_profile_ranks) {
   if (daemon_rank == master_rank) {
     for (const S2DKernelProfileData &profile : local_profiles) {
       updateProfileCostTable(profile, daemon_rank);
     }
-
-    for (int rank : onrun_ranks) {
-      if (rank == master_rank) {
-        continue;
-      }
-
-      int remote_size = 0;
-      MPI_Recv(&remote_size, 1, MPI_INT, rank, PROFILE_LEN_TAG, comm_daemon,
-               MPI_STATUS_IGNORE);
-      if (remote_size <= 0) {
-        continue;
-      }
-
-      std::string remote_payload(remote_size, '\0');
-      MPI_Recv(remote_payload.data(), remote_size, MPI_CHAR, rank,
-               PROFILE_DATA_TAG, comm_daemon, MPI_STATUS_IGNORE);
-
-      std::vector<S2DKernelProfileData> remote_profiles =
-          deserializeProfileSamples(remote_payload);
-      for (const S2DKernelProfileData &profile : remote_profiles) {
-        updateProfileCostTable(profile, rank);
-      }
+    while (receiveOneOfflineProfilePayloadAtMaster(
+        comm_daemon, /*blocking=*/false, finished_profile_ranks)) {
     }
-  } else {
-    MPI_Send(&payload_size, 1, MPI_INT, master_rank, PROFILE_LEN_TAG,
-             comm_daemon);
-    if (payload_size > 0) {
-      MPI_Send(payload.data(), payload_size, MPI_CHAR, master_rank,
-               PROFILE_DATA_TAG, comm_daemon);
-    }
+    return;
   }
+
+  progressPendingOfflineProfileSends(pending_sends);
+  if (local_profiles.empty()) {
+    return;
+  }
+
+  pending_sends.emplace_back();
+  PendingOfflineProfileSend &send = pending_sends.back();
+  send.payload = serializeProfileSamples(local_profiles);
+  MPI_Isend(send.payload.data(), static_cast<int>(send.payload.size()),
+            MPI_CHAR, master_rank, OFFLINE_PROFILE_DATA_TAG, comm_daemon,
+            &send.request);
+}
+
+static void flushOfflineProfilesOnExit(
+    MPI_Comm &comm_daemon, int daemon_rank, int master_rank,
+    const std::set<int> &onrun_ranks,
+    std::list<PendingOfflineProfileSend> &pending_sends,
+    std::set<int> &finished_profile_ranks) {
+  if (daemon_rank == master_rank) {
+    auto all_workers_finished = [&] {
+      for (int rank : onrun_ranks) {
+        if (rank != master_rank && !finished_profile_ranks.count(rank)) {
+          return false;
+        }
+      }
+      return true;
+    };
+    while (!all_workers_finished()) {
+      receiveOneOfflineProfilePayloadAtMaster(
+          comm_daemon, /*blocking=*/true, finished_profile_ranks);
+    }
+    return;
+  }
+
+  // Shutdown is the only point where profile delivery is allowed to join. No
+  // further application work can be delayed, and the marker lets the master
+  // drain all earlier nonblocking sends without guessing a message count.
+  const std::string marker = OFFLINE_PROFILE_DONE_MARKER;
+  MPI_Send(marker.data(), static_cast<int>(marker.size()), MPI_CHAR,
+           master_rank, OFFLINE_PROFILE_DATA_TAG, comm_daemon);
+  for (PendingOfflineProfileSend &send : pending_sends) {
+    MPI_Wait(&send.request, MPI_STATUS_IGNORE);
+  }
+  pending_sends.clear();
 }
 
 static void parseOfflineKernelReqBatch(
@@ -3432,6 +3704,8 @@ static void parseOfflineKernelReqBatch(
     std::string obj_data = line + "\n";  // pid line
     std::getline(stream, line);
     obj_data += line + "\n";  // kernel_count line
+    std::getline(stream, line);
+    obj_data += line + "\n";  // kernel_identity line
     std::getline(stream, line);
     obj_data += line + "\n";  // req_size line
     std::getline(stream, line);
@@ -3570,6 +3844,8 @@ void *SystemSchedulerDaemonOffline(void *arg) {
 
   // 维护一个SYCLAPP的所有kernel的依赖关系 DAG相关
   std::vector<DAGNode *> kernel_dag_nodes; // 所有kernel对应的DAG
+  std::list<PendingOfflineProfileSend> pending_profile_sends;
+  std::set<int> finished_profile_ranks;
   DAEMON_TRACE_STREAM << "SystemSchedulerDaemonOffline: Rank " << daemon_rank << " for PID " << local_pid << " started." << std::endl;
 
   //【通用情况】
@@ -3581,6 +3857,10 @@ void *SystemSchedulerDaemonOffline(void *arg) {
     if (!receiveOfflineKernelReqBatch(mq_id_daemon, local_pid, daemon_rank,
                                       daemon_wait_count, kernel_req_datas,
                                       local_profiles)) {
+      flushOfflineProfilesOnExit(
+          comm_daemon, daemon_rank, master_rank,
+          globalcount_to_onrun[syclapp_count], pending_profile_sends,
+          finished_profile_ranks);
       break;
     }
 
@@ -3594,8 +3874,13 @@ void *SystemSchedulerDaemonOffline(void *arg) {
     // }
     int onrun_size = onrun_ranks.size();
 
-    exchangeOfflineProfilesWithMaster(local_profiles, comm_daemon, daemon_rank,
-                                      master_rank, onrun_ranks);
+    // Profile publication is deliberately not a collective. A rank that
+    // finishes early must remain able to receive/schedule useful work instead
+    // of waiting for the slowest rank merely to make a performance sample
+    // globally visible.
+    publishAndDrainOfflineProfiles(local_profiles, comm_daemon, daemon_rank,
+                                   master_rank, pending_profile_sends,
+                                   finished_profile_ranks);
 
     if (kernel_req_datas.empty()) {
       DAEMON_TRACE_STREAM
@@ -3611,6 +3896,12 @@ void *SystemSchedulerDaemonOffline(void *arg) {
       // 算法计算适合的rank数 以及每个kernel的执行顺序和device 需要同时考虑每个rank的device空闲
       if (daemon_rank == master_rank) {
         // 1. 构建DAG 确定依赖
+        // A local wait fences every device queue used by the single-rank SNMD
+        // path. Multi-rank execution needs explicit remote completion
+        // acknowledgements before the same rebase is safe.
+        if (onrun_size == 1) {
+          rebaseCompletedOfflineDAG(kernel_dag_nodes);
+        }
         std::vector<DAGNode *> nodes; // 所有kernel对应的DAG
         for (S2DKernelReqData & kernel_req_data : kernel_req_datas) {
           DAGNode *node = new DAGNode(kernel_req_data);

@@ -38,6 +38,10 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #define DAEMON_TRACE_STREAM OFFLINE_TRACE_NULL_STREAM
 #endif
 
+#ifndef SNMD_OFFLINE_SPLIT_DEFAULT_ENABLED
+#define SNMD_OFFLINE_SPLIT_DEFAULT_ENABLED 0
+#endif
+
 #ifdef PRINT_HANDLER_TRACE
 #define HANDLER_TRACE_STREAM std::cout
 #else
@@ -87,9 +91,11 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #error "SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT must be in [0, 100)"
 #endif
 
-// P0 control: uncomment to retain offline HEFT/dual-GPU placement and disable
-// only num_parts>1 candidates.
-#define SNMD_OFFLINE_TEST_DISABLE_SPLIT 1
+// Keep Split default-off until the current data path passes the application's
+// correctness suite, but allow an explicit runtime opt-in without rebuilding:
+//   SYCL_SNMD_ENABLE_SPLIT=1
+// SNMD_OFFLINE_TEST_DISABLE_SPLIT remains an optional compile-time hard stop.
+// #define SNMD_OFFLINE_TEST_DISABLE_SPLIT 1
 
 // P5 diagnostics: uncomment for one daemon decision summary and one handler
 // data-movement summary per wait window. Keep disabled for formal timing.
