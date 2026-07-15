@@ -1346,6 +1346,7 @@ Scheduler::GraphBuilder::addCG(std::unique_ptr<detail::CG> CommandGroup,
     }
 
     PM.NumParts = 1;
+    PM.PersistentSplit = false;
     PM.SplitQueues_Write.clear();
     DAG_TRACE_STREAM << "=== graph_builder.cpp === addCG: RESET NumParts & SplitQueues_Write\n";
   }

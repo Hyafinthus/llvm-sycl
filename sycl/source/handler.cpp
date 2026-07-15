@@ -68,6 +68,7 @@ struct OfflineProfileEvent {
   // lifetime and is required by a future asynchronous completion path.
   std::string KernelKey;
   uint64_t MaterializationNs = 0;
+  bool PersistentSplit = false;
 };
 
 namespace sycl {
@@ -217,6 +218,8 @@ parseOfflineKernelExecInfos(const std::string &ReceivedData) {
     ObjData += Line + "\n"; // device_index
     std::getline(Stream, Line);
     ObjData += Line + "\n"; // num_parts
+    std::getline(Stream, Line);
+    ObjData += Line + "\n"; // persistent_split
     std::getline(Stream, Line);
     ObjData += Line + "\n"; // split_devices.size()
     int SplitDeviceCount = std::stoi(Line);
@@ -490,10 +493,66 @@ static bool offlineSplitCanUseDim0ContiguousWrites(
   return true;
 }
 
+static bool offlineReqHasPartitionLocalContract(
+    const detail::CGExecKernel *ExecCG, const detail::Requirement *Req) {
+  return ExecCG != nullptr && Req != nullptr && Req->MSYCLMemObj != nullptr &&
+         std::find(ExecCG->MSNMDPartitionLocalReqs.begin(),
+                   ExecCG->MSNMDPartitionLocalReqs.end(), Req) !=
+             ExecCG->MSNMDPartitionLocalReqs.end();
+}
+
+static bool offlineReqHasValidPartitionLocalShape(
+    const detail::NDRDescT &NDR, const detail::Requirement *Req,
+    size_t NumParts = 1) {
+  if (Req == nullptr || NumParts == 0) {
+    return false;
+  }
+  const range<3> AccessRange = Req->MAccessRange;
+  const range<3> MemoryRange = Req->MMemoryRange;
+  return !Req->MIsSubBuffer && Req->MOffset[0] == 0 &&
+         Req->MOffset[1] == 0 && Req->MOffset[2] == 0 &&
+         AccessRange[0] == NDR.GlobalSize[0] &&
+         AccessRange[0] >= NumParts && AccessRange[0] % NumParts == 0 &&
+         AccessRange[1] == MemoryRange[1] &&
+         AccessRange[2] == MemoryRange[2];
+}
+
+static bool offlineSplitHasValidPersistentContract(
+    const detail::CGExecKernel *ExecCG, size_t NumParts) {
+  if (ExecCG == nullptr || NumParts <= 1 ||
+      !offlineSplitCanUseDim0ContiguousWrites(ExecCG, NumParts)) {
+    return false;
+  }
+
+  const detail::NDRDescT &NDR = ExecCG->MNDRDesc;
+  bool HasWrite = false;
+  for (const detail::Requirement *Req : ExecCG->MRequirements) {
+    if (Req == nullptr) {
+      continue;
+    }
+    const bool PartitionLocal =
+        offlineReqHasPartitionLocalContract(ExecCG, Req);
+    if (offlineSplitWriteAccess(Req->MAccessMode)) {
+      HasWrite = true;
+      if (!PartitionLocal || Req->MAccessMode == access::mode::atomic) {
+        return false;
+      }
+    }
+    if (!PartitionLocal) {
+      continue;
+    }
+
+    if (!offlineReqHasValidPartitionLocalShape(NDR, Req, NumParts)) {
+      return false;
+    }
+  }
+  return HasWrite;
+}
+
 static std::unique_ptr<detail::Requirement>
 makeOfflineLinearRowBlockReq(const detail::Requirement *Req,
                              size_t RelativeBegin0, size_t Rows) {
-  if (Req == nullptr || Req->MIsSubBuffer || Req->MDims <= 1 || Rows == 0 ||
+  if (Req == nullptr || Req->MIsSubBuffer || Rows == 0 ||
       Req->MSYCLMemObj == nullptr ||
       Req->MSYCLMemObj->getType() !=
           detail::SYCLMemObjI::MemObjType::Buffer) {
@@ -549,6 +608,7 @@ static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
                                       int ActualDeviceIndex) {
   auto &PM = detail::ProgramManager::getInstance();
   PM.NumParts = 1;
+  PM.PersistentSplit = false;
   PM.SplitDevices.clear();
   PM.SplitEvents.clear();
 
@@ -564,11 +624,13 @@ static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
   }
 
   PM.NumParts = PM.SplitDevices.size();
+  PM.PersistentSplit = KernelExecInfo.persistent_split;
   HANDLER_TRACE_STREAM << "=== handler === Offline split devices:";
   for (int DeviceIndex : PM.SplitDevices) {
     HANDLER_TRACE_STREAM << " " << DeviceIndex;
   }
-  HANDLER_TRACE_STREAM << " num_parts: " << PM.NumParts << std::endl;
+  HANDLER_TRACE_STREAM << " num_parts: " << PM.NumParts
+                       << " persistent: " << PM.PersistentSplit << std::endl;
 }
 
 static void finalizeAllPendingOfflineSplits();
@@ -593,6 +655,7 @@ static void clearOfflineBatch() {
   printAndResetOfflineSplitStats();
 #endif
   PM.NumParts = 1;
+  PM.PersistentSplit = false;
   PM.SplitDevices.clear();
   PM.SplitQueues_Write.clear();
   PM.SplitEvents.clear();
@@ -617,7 +680,8 @@ static std::string findOfflineKernelProfileKey(int KernelCount) {
 static void fillOfflineKernelReqData(
     S2DKernelReqData &KernelReqData, pid_t Pid, int KernelCount,
     const std::string &KernelName, const detail::NDRDescT &NDRDesc,
-    const std::vector<detail::Requirement *> &Requirements) {
+    const std::vector<detail::Requirement *> &Requirements,
+    const std::vector<detail::AccessorImplHost *> &PartitionLocalReqs) {
   KernelReqData.pid = Pid;
   KernelReqData.kernel_count = KernelCount;
   KernelReqData.kernel_identity = stableKernelIdentity(KernelName);
@@ -642,6 +706,19 @@ static void fillOfflineKernelReqData(
     ReqData.range0 = Req->MMemoryRange[0];
     ReqData.range1 = Req->MMemoryRange[1];
     ReqData.range2 = Req->MMemoryRange[2];
+    ReqData.access_range0 = Req->MAccessRange[0];
+    ReqData.access_range1 = Req->MAccessRange[1];
+    ReqData.access_range2 = Req->MAccessRange[2];
+    ReqData.offset0 = Req->MOffset[0];
+    ReqData.offset1 = Req->MOffset[1];
+    ReqData.offset2 = Req->MOffset[2];
+    ReqData.is_sub_buffer = Req->MIsSubBuffer;
+    const bool DeclaredPartitionLocal =
+        std::find(PartitionLocalReqs.begin(), PartitionLocalReqs.end(), Req) !=
+        PartitionLocalReqs.end();
+    ReqData.partition_local =
+        DeclaredPartitionLocal &&
+        offlineReqHasValidPartitionLocalShape(NDRDesc, Req);
 
     KernelReqData.reqs.push_back(ReqData);
   }
@@ -665,6 +742,8 @@ struct OfflineSplitStats {
   uint64_t MergeDirectD2DBytes = 0;
   uint64_t MergeD2HBytes = 0;
   uint64_t MergeH2DBytes = 0;
+  uint64_t ResidentReusedBytes = 0;
+  uint64_t ResidentSupersededBytes = 0;
   uint64_t PrepareWaitNs = 0;
   uint64_t PartWaitNs = 0;
   uint64_t MergeWaitNs = 0;
@@ -704,6 +783,9 @@ static void printAndResetOfflineSplitStats() {
             << " merge_direct_d2d_bytes=" << Stats.MergeDirectD2DBytes
             << " merge_d2h_bytes=" << Stats.MergeD2HBytes
             << " merge_h2d_bytes=" << Stats.MergeH2DBytes
+            << " resident_reused_bytes=" << Stats.ResidentReusedBytes
+            << " resident_superseded_bytes="
+            << Stats.ResidentSupersededBytes
             << " prepare_wait_ns=" << Stats.PrepareWaitNs
             << " part_wait_ns=" << Stats.PartWaitNs
             << " merge_wait_ns=" << Stats.MergeWaitNs << std::endl;
@@ -747,13 +829,18 @@ struct PendingOfflineSplitMerge {
   std::vector<detail::EventImplPtr> Events;
   bool EventsWaited = false;
   uint64_t PartsCompleteNs = 0;
+  bool Resident = false;
+  std::vector<int> SplitDeviceIndices;
+  size_t PartitionDim0 = 0;
   detail::QueueImplPtr HostQueue;
   detail::ContextImplPtr HostContext;
   std::vector<detail::QueueImplPtr> SplitQueues;
   std::vector<std::vector<detail::Requirement *>> SplitReqsCopy;
   std::vector<std::unique_ptr<detail::Requirement>> SplitReqOwners;
   std::vector<detail::SYCLMemObjI *> ReadMemObjs;
+  std::vector<detail::SYCLMemObjI *> PartitionLocalReadMemObjs;
   std::vector<detail::SYCLMemObjI *> WrittenMemObjs;
+  std::vector<detail::SYCLMemObjI *> SupersededWrittenMemObjs;
 };
 
 struct OfflineSplitFinalizeTiming {
@@ -767,6 +854,12 @@ struct OfflineReadReplicaCacheEntry {
   std::vector<detail::QueueImplPtr> Queues;
 };
 
+struct OfflinePartitionReadCacheEntry {
+  detail::SYCLMemObjI *MemObj = nullptr;
+  std::vector<int> SplitDeviceIndices;
+  size_t PartitionDim0 = 0;
+};
+
 static std::vector<PendingOfflineSplitMerge> &pendingOfflineSplitMerges() {
   static std::vector<PendingOfflineSplitMerge> PendingSplits;
   return PendingSplits;
@@ -774,6 +867,12 @@ static std::vector<PendingOfflineSplitMerge> &pendingOfflineSplitMerges() {
 
 static std::vector<OfflineReadReplicaCacheEntry> &offlineReadReplicaCache() {
   static std::vector<OfflineReadReplicaCacheEntry> Cache;
+  return Cache;
+}
+
+static std::vector<OfflinePartitionReadCacheEntry> &
+offlinePartitionReadCache() {
+  static std::vector<OfflinePartitionReadCacheEntry> Cache;
   return Cache;
 }
 
@@ -796,6 +895,7 @@ static void clearPendingOfflineSplitState() {
   pendingOfflineSplitMerges().clear();
   offlineSplitFinalizeTimes().clear();
   offlineReadReplicaCache().clear();
+  offlinePartitionReadCache().clear();
 }
 
 static void rememberOfflineSplitWrite(PendingOfflineSplitMerge &Pending,
@@ -820,6 +920,144 @@ static void rememberOfflineSplitRead(PendingOfflineSplitMerge &Pending,
   }
 }
 
+static bool pendingOfflineSplitMemSuperseded(
+    const PendingOfflineSplitMerge &Pending, detail::SYCLMemObjI *MemObj) {
+  return std::find(Pending.SupersededWrittenMemObjs.begin(),
+                   Pending.SupersededWrittenMemObjs.end(), MemObj) !=
+         Pending.SupersededWrittenMemObjs.end();
+}
+
+static bool pendingOfflineSplitMatchesDevices(
+    const PendingOfflineSplitMerge &Pending,
+    const std::vector<int> &SplitDeviceIndices, size_t PartitionDim0) {
+  return Pending.Resident &&
+         Pending.SplitDeviceIndices == SplitDeviceIndices &&
+         Pending.SplitQueues.size() == SplitDeviceIndices.size() &&
+         Pending.PartitionDim0 == PartitionDim0;
+}
+
+static PendingOfflineSplitMerge *findCompatibleResidentVersion(
+    const detail::Requirement *Req, const detail::CGExecKernel *ExecCG,
+    const std::vector<int> &SplitDeviceIndices) {
+  if (!offlineReqHasPartitionLocalContract(ExecCG, Req)) {
+    return nullptr;
+  }
+  if (!offlineReqHasValidPartitionLocalShape(
+          ExecCG->MNDRDesc, Req, SplitDeviceIndices.size())) {
+    return nullptr;
+  }
+  detail::SYCLMemObjI *MemObj = Req->MSYCLMemObj;
+
+  std::vector<PendingOfflineSplitMerge> &Pending =
+      pendingOfflineSplitMerges();
+  for (auto It = Pending.rbegin(); It != Pending.rend(); ++It) {
+    if (!pendingOfflineSplitMatchesDevices(
+            *It, SplitDeviceIndices, ExecCG->MNDRDesc.GlobalSize[0]) ||
+        pendingOfflineSplitMemSuperseded(*It, MemObj)) {
+      continue;
+    }
+    if (std::find(It->WrittenMemObjs.begin(), It->WrittenMemObjs.end(),
+                  MemObj) != It->WrittenMemObjs.end()) {
+      return &*It;
+    }
+  }
+  return nullptr;
+}
+
+static bool kernelCanConsumeResidentSplit(
+    detail::SyclKernelCg *KernelCg,
+    const PendingOfflineSplitMerge &Pending) {
+  if (KernelCg == nullptr || !KernelCg->kernel_cg || !Pending.Resident) {
+    return false;
+  }
+  auto *ExecCG =
+      dynamic_cast<detail::CGExecKernel *>(KernelCg->kernel_cg.get());
+  const auto &PM = detail::ProgramManager::getInstance();
+  if (ExecCG == nullptr || PM.NumParts <= 1 ||
+      !offlineSplitHasValidPersistentContract(ExecCG, PM.NumParts) ||
+      !pendingOfflineSplitMatchesDevices(
+          Pending, PM.SplitDevices, ExecCG->MNDRDesc.GlobalSize[0])) {
+    return false;
+  }
+
+  bool TouchesCompatibleState = false;
+  for (detail::Requirement *Req : ExecCG->MRequirements) {
+    if (Req == nullptr) {
+      continue;
+    }
+    const bool TouchesWrite =
+        std::find(Pending.WrittenMemObjs.begin(), Pending.WrittenMemObjs.end(),
+                  Req->MSYCLMemObj) != Pending.WrittenMemObjs.end() &&
+        !pendingOfflineSplitMemSuperseded(Pending, Req->MSYCLMemObj);
+    if (TouchesWrite) {
+      TouchesCompatibleState = true;
+      if (!offlineReqHasPartitionLocalContract(ExecCG, Req)) {
+        return false;
+      }
+    }
+    const bool InvalidatesReplica =
+        offlineSplitWriteAccess(Req->MAccessMode) &&
+        std::find(Pending.ReadMemObjs.begin(), Pending.ReadMemObjs.end(),
+                  Req->MSYCLMemObj) != Pending.ReadMemObjs.end();
+    if (InvalidatesReplica) {
+      return false;
+    }
+    const bool OrdersAfterPartitionRead =
+        offlineSplitWriteAccess(Req->MAccessMode) &&
+        std::find(Pending.PartitionLocalReadMemObjs.begin(),
+                  Pending.PartitionLocalReadMemObjs.end(),
+                  Req->MSYCLMemObj) !=
+            Pending.PartitionLocalReadMemObjs.end();
+    if (OrdersAfterPartitionRead) {
+      // offlineSplitHasValidPersistentContract() and the device-scheme check
+      // above prove that this write owns the same per-device row block. Stable
+      // in-order queues therefore preserve the read->write anti-dependence
+      // without first gathering an unrelated resident output.
+      TouchesCompatibleState = true;
+    }
+  }
+  return TouchesCompatibleState;
+}
+
+static void supersedeOlderResidentWrites(
+    const PendingOfflineSplitMerge &NewPending) {
+  for (PendingOfflineSplitMerge &Pending : pendingOfflineSplitMerges()) {
+    if (!Pending.Resident ||
+        Pending.SplitDeviceIndices != NewPending.SplitDeviceIndices) {
+      continue;
+    }
+    for (detail::SYCLMemObjI *MemObj : NewPending.WrittenMemObjs) {
+      if (std::find(Pending.WrittenMemObjs.begin(),
+                    Pending.WrittenMemObjs.end(), MemObj) ==
+              Pending.WrittenMemObjs.end() ||
+          pendingOfflineSplitMemSuperseded(Pending, MemObj)) {
+        continue;
+      }
+      Pending.SupersededWrittenMemObjs.push_back(MemObj);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+      for (const auto &PartReqs : Pending.SplitReqsCopy) {
+        for (const detail::Requirement *Req : PartReqs) {
+          if (Req != nullptr && Req->MSYCLMemObj == MemObj) {
+            offlineSplitStats().ResidentSupersededBytes +=
+                offlineRequirementBytes(Req);
+          }
+        }
+      }
+#endif
+    }
+  }
+}
+
+static bool offlineSubmittedPersistentSplit(int KernelCount) {
+  for (const PendingOfflineSplitMerge &Pending :
+       pendingOfflineSplitMerges()) {
+    if (Pending.KernelCount == KernelCount) {
+      return Pending.Resident;
+    }
+  }
+  return false;
+}
+
 static void cacheOfflineSplitReadReplicas(
     const PendingOfflineSplitMerge &Pending) {
   for (detail::SYCLMemObjI *MemObj : Pending.ReadMemObjs) {
@@ -839,6 +1077,23 @@ static void cacheOfflineSplitReadReplicas(
       }
     }
   }
+  for (detail::SYCLMemObjI *MemObj : Pending.PartitionLocalReadMemObjs) {
+    if (std::find(Pending.WrittenMemObjs.begin(), Pending.WrittenMemObjs.end(),
+                  MemObj) != Pending.WrittenMemObjs.end()) {
+      continue;
+    }
+    auto CacheIt = std::find_if(
+        offlinePartitionReadCache().begin(), offlinePartitionReadCache().end(),
+        [MemObj, &Pending](const OfflinePartitionReadCacheEntry &Entry) {
+          return Entry.MemObj == MemObj &&
+                 Entry.SplitDeviceIndices == Pending.SplitDeviceIndices &&
+                 Entry.PartitionDim0 == Pending.PartitionDim0;
+        });
+    if (CacheIt == offlinePartitionReadCache().end()) {
+      offlinePartitionReadCache().push_back(
+          {MemObj, Pending.SplitDeviceIndices, Pending.PartitionDim0});
+    }
+  }
 }
 
 static void invalidateOfflineReadReplica(detail::SYCLMemObjI *MemObj) {
@@ -849,6 +1104,27 @@ static void invalidateOfflineReadReplica(detail::SYCLMemObjI *MemObj) {
                                return Entry.MemObj == MemObj;
                              }),
               Cache.end());
+  std::vector<OfflinePartitionReadCacheEntry> &PartitionCache =
+      offlinePartitionReadCache();
+  PartitionCache.erase(
+      std::remove_if(PartitionCache.begin(), PartitionCache.end(),
+                     [MemObj](const OfflinePartitionReadCacheEntry &Entry) {
+                       return Entry.MemObj == MemObj;
+                     }),
+      PartitionCache.end());
+}
+
+static bool pendingOfflineSplitHasPartitionReadReplica(
+    detail::SYCLMemObjI *MemObj,
+    const std::vector<int> &SplitDeviceIndices, size_t PartitionDim0) {
+  return std::any_of(
+      offlinePartitionReadCache().begin(), offlinePartitionReadCache().end(),
+      [MemObj, &SplitDeviceIndices, PartitionDim0](
+          const OfflinePartitionReadCacheEntry &Entry) {
+        return Entry.MemObj == MemObj &&
+               Entry.SplitDeviceIndices == SplitDeviceIndices &&
+               Entry.PartitionDim0 == PartitionDim0;
+      });
 }
 
 static bool pendingOfflineSplitHasReadReplica(
@@ -873,26 +1149,6 @@ static bool pendingOfflineSplitHasReadReplica(
     }
   }
 
-  for (const PendingOfflineSplitMerge &Pending :
-       pendingOfflineSplitMerges()) {
-    if (std::find(Pending.ReadMemObjs.begin(), Pending.ReadMemObjs.end(),
-                  MemObj) == Pending.ReadMemObjs.end() ||
-        std::find(Pending.WrittenMemObjs.begin(),
-                  Pending.WrittenMemObjs.end(), MemObj) !=
-            Pending.WrittenMemObjs.end()) {
-      continue;
-    }
-
-    for (const detail::QueueImplPtr &ReplicaQueue : Pending.SplitQueues) {
-      if (ReplicaQueue != nullptr &&
-          detail::sameCtx(ReplicaQueue->getContextImplPtr(),
-                          TargetQueue->getContextImplPtr()) &&
-          ReplicaQueue->getDeviceImplPtr() ==
-              TargetQueue->getDeviceImplPtr()) {
-        return true;
-      }
-    }
-  }
   return false;
 }
 
@@ -918,8 +1174,12 @@ static bool kernelTouchesPendingOfflineSplit(
         Pending.WrittenMemObjs.end();
     const bool WritesPendingRead =
         offlineSplitWriteAccess(Req->MAccessMode) &&
-        std::find(Pending.ReadMemObjs.begin(), Pending.ReadMemObjs.end(),
-                  Req->MSYCLMemObj) != Pending.ReadMemObjs.end();
+        (std::find(Pending.ReadMemObjs.begin(), Pending.ReadMemObjs.end(),
+                   Req->MSYCLMemObj) != Pending.ReadMemObjs.end() ||
+         std::find(Pending.PartitionLocalReadMemObjs.begin(),
+                   Pending.PartitionLocalReadMemObjs.end(),
+                   Req->MSYCLMemObj) !=
+             Pending.PartitionLocalReadMemObjs.end());
     if (TouchesPendingWrite || WritesPendingRead) {
       return true;
     }
@@ -990,6 +1250,13 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
 
   for (size_t p = 0; p < Pending.SplitReqsCopy.size(); ++p) {
     for (detail::Requirement *CopyReq : Pending.SplitReqsCopy[p]) {
+      if (pendingOfflineSplitMemSuperseded(Pending,
+                                           CopyReq->MSYCLMemObj)) {
+        HANDLER_TRACE_STREAM
+            << "=== handler === Split finalize skip superseded version"
+            << std::endl;
+        continue;
+      }
       detail::MemObjRecord *Rec =
           detail::Scheduler::getInstance().getMemObjRecord(CopyReq);
       if (Rec == nullptr) {
@@ -1129,13 +1396,21 @@ static void finalizePendingOfflineSplitsForKernel(
   // current kernel, so errors remain attributed to the actual kernel/part and
   // no merge is inserted ahead of an unchecked pending dependency.
   for (PendingOfflineSplitMerge &Pending : PendingSplits) {
-    if (kernelTouchesPendingOfflineSplit(KernelCg, Pending)) {
+    if (kernelTouchesPendingOfflineSplit(KernelCg, Pending) &&
+        !kernelCanConsumeResidentSplit(KernelCg, Pending)) {
       waitPendingOfflineSplit(Pending);
     }
   }
 
   for (size_t I = 0; I < PendingSplits.size();) {
     if (kernelTouchesPendingOfflineSplit(KernelCg, PendingSplits[I])) {
+      if (kernelCanConsumeResidentSplit(KernelCg, PendingSplits[I])) {
+        HANDLER_TRACE_STREAM
+            << "=== handler === retain compatible resident Split from "
+            << "kernel_count: " << PendingSplits[I].KernelCount << std::endl;
+        ++I;
+        continue;
+      }
       mergePendingOfflineSplit(PendingSplits[I]);
       PendingSplits.erase(PendingSplits.begin() + I);
     } else {
@@ -1163,6 +1438,19 @@ static void finalizeCompletedOfflineSplit(int KernelCount) {
     if (PendingSplits[I].KernelCount != KernelCount) {
       continue;
     }
+    if (PendingSplits[I].Resident) {
+      // Completion is still acknowledged only after every part has finished,
+      // but a compatible successor can consume the per-device allocations
+      // directly.  Materialization is deferred until an incompatible edge or
+      // the user-visible window fence.
+      waitPendingOfflineSplit(PendingSplits[I]);
+      offlineSplitFinalizeTimes().push_back(
+          {PendingSplits[I].KernelCount, PendingSplits[I].PartsCompleteNs, 0});
+      HANDLER_TRACE_STREAM
+          << "=== handler === Split completion retained resident partitions "
+          << "for kernel_count: " << KernelCount << std::endl;
+      return;
+    }
     // Completion-driven gang scheduling guarantees no later command has been
     // queued on these devices before this acknowledgement. It is therefore
     // safe to materialize this one completed Split without the static path's
@@ -1182,7 +1470,14 @@ static void applyOfflineSplitFinalizeTimes(
         if (FinalizeTime.PartsCompleteNs > ProfileEvent.HostEndNs) {
           ProfileEvent.HostEndNs = FinalizeTime.PartsCompleteNs;
         }
-        ProfileEvent.MaterializationNs += FinalizeTime.MaterializationNs;
+        // Resident-mode samples represent preparation plus gang execution.
+        // An incompatible successor is charged for canonicalization by the
+        // daemon transfer model; folding the same merge into the producer's
+        // profile would double-count it and make static/completion paths learn
+        // different meanings for the same profile key.
+        if (!ProfileEvent.PersistentSplit) {
+          ProfileEvent.MaterializationNs += FinalizeTime.MaterializationNs;
+        }
       }
     }
   }
@@ -1259,6 +1554,7 @@ static void fillOfflineProfileData(int WaitCount,
   ProfileData.kernel_count = ProfileEvent.KernelCount;
   ProfileData.device_index = ProfileEvent.DeviceIndex;
   ProfileData.num_parts = std::max(1, ProfileEvent.NumParts);
+  ProfileData.persistent_split = ProfileEvent.PersistentSplit;
   ProfileData.duration_ns = Duration;
   ProfileData.kernel_key =
       ProfileEvent.KernelKey.empty()
@@ -1474,7 +1770,8 @@ event handler::finalize() {
 
           fillOfflineKernelReqData(kernel_req_data, getpid(),
                                    daemon_kernel_count, MKernelName, MNDRDesc,
-                                   MRequirements);
+                                   MRequirements,
+                                   MSNMDPartitionLocalReqs);
 
           std::string serialized_data = kernel_req_data.serialize();
           size_t message_size = serialized_data.size();
@@ -1536,7 +1833,8 @@ event handler::finalize() {
 
         fillOfflineKernelReqData(kernel_req_data, getpid(),
                                  daemon_kernel_count, MKernelName, MNDRDesc,
-                                 MRequirements);
+                                 MRequirements,
+                                 MSNMDPartitionLocalReqs);
 
         std::string serialized_data = kernel_req_data.serialize();
         size_t message_size = serialized_data.size();
@@ -1713,7 +2011,8 @@ event handler::finalize() {
 
       fillOfflineKernelReqData(kernel_req_data, getpid(),
                                daemon_kernel_count, MKernelName, MNDRDesc,
-                               MRequirements);
+                               MRequirements,
+                               MSNMDPartitionLocalReqs);
     }
     kernel_reqs.push_back(kernel_req_data);
 
@@ -2343,7 +2642,8 @@ event handler::finalize() {
           std::move(MRequirements), std::move(MEvents), std::move(MArgs),
           MKernelName, MOSModuleHandle, std::move(MStreamStorage),
           std::move(MImpl->MAuxiliaryResources), MCGType,
-          MImpl->MKernelCacheConfig, MCodeLoc));
+          MImpl->MKernelCacheConfig, MCodeLoc,
+          std::move(MSNMDPartitionLocalReqs)));
 
       detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
           std::move(CommandGroup), MQueue);
@@ -2705,7 +3005,8 @@ event handler::finalize() {
         std::move(MRequirements), std::move(MEvents), std::move(MArgs),
         MKernelName, MOSModuleHandle, std::move(MStreamStorage),
         std::move(MImpl->MAuxiliaryResources), MCGType,
-        MImpl->MKernelCacheConfig, MCodeLoc));
+        MImpl->MKernelCacheConfig, MCodeLoc,
+        std::move(MSNMDPartitionLocalReqs)));
     break;
   }
   case detail::CG::CodeplayInteropTask:
@@ -2941,6 +3242,17 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     SplitDevices.clear();
   }
 
+  if (NumParts > 1 && PM.PersistentSplit &&
+      !offlineSplitHasValidPersistentContract(ExecCG, NumParts)) {
+    // A stale or over-optimistic daemon decision must never weaken memory
+    // correctness. Keep ordinary Split enabled, but force its output through
+    // the canonical materialization path.
+    HANDLER_TRACE_STREAM
+        << "=== handler === persistent Split downgraded: invalid accessor "
+        << "partition contract" << std::endl;
+    PM.PersistentSplit = false;
+  }
+
   if (NumParts > 1) {
 #ifdef SNMD_OFFLINE_SPLIT_STATS
     offlineSplitStats().SplitKernelCount++;
@@ -2967,6 +3279,9 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     PendingSplit.KernelCount = sycl_kernel_cg.kernel_count;
     PendingSplit.HostQueue = hostQ;
     PendingSplit.HostContext = hostCtx;
+    PendingSplit.Resident = PM.PersistentSplit;
+    PendingSplit.SplitDeviceIndices = SplitDevices;
+    PendingSplit.PartitionDim0 = ExecCG->MNDRDesc.GlobalSize[0];
     PendingSplit.SplitQueues = SplitQueues_Write;
 
     // 2
@@ -3004,6 +3319,35 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
             makeOfflineLinearRowBlockReq(Req, 0, Req->MAccessRange[0]);
         Requirement *TransferReq =
             LinearReadReqOwner ? LinearReadReqOwner.get() : Req;
+        const bool PartitionLocal =
+            offlineReqHasPartitionLocalContract(ExecCG, Req) &&
+            offlineReqHasValidPartitionLocalShape(ExecCG->MNDRDesc, Req,
+                                                  NumParts);
+        PendingOfflineSplitMerge *ResidentSource =
+            findCompatibleResidentVersion(Req, ExecCG, SplitDevices);
+        const bool ReusePartitionRead =
+            PartitionLocal && ResidentSource == nullptr &&
+            pendingOfflineSplitHasPartitionReadReplica(Req->MSYCLMemObj,
+                                                       SplitDevices,
+                                                       ExecCG->MNDRDesc
+                                                           .GlobalSize[0]);
+        if (ResidentSource != nullptr || ReusePartitionRead) {
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+          offlineSplitStats().ResidentReusedBytes +=
+              offlineRequirementBytes(TransferReq);
+#endif
+          if (ResidentSource != nullptr) {
+            HANDLER_TRACE_STREAM
+                << "=== handler === Split step3 reuse resident partitioned "
+                << "version from kernel_count: "
+                << ResidentSource->KernelCount << std::endl;
+          } else {
+            HANDLER_TRACE_STREAM
+                << "=== handler === Split step3 reuse partition-local "
+                   "read-only replica"
+                << std::endl;
+          }
+        }
         QueueImplPtr SrcQueue = hostQ;
         if (ReqCurCtx != hostCtx && ReqRecord != nullptr) {
           SrcQueue = nullptr;
@@ -3016,64 +3360,93 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
           HANDLER_TRACE_STREAM << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
         }
 
-        for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
-          if (onlyRead && pendingOfflineSplitHasReadReplica(
-                              Req->MSYCLMemObj, SplitQueue)) {
-#ifdef SNMD_OFFLINE_SPLIT_STATS
-            offlineSplitStats().ReusedReadReplicaBytes +=
-                offlineRequirementBytes(TransferReq);
-#endif
-            HANDLER_TRACE_STREAM
-                << "=== handler === Split step3 reuse read-only replica\n";
-            continue;
-          }
-          if (ReqCurCtx != hostCtx && SplitQueue->getContextImplPtr() == ReqCurCtx) {
-            HANDLER_TRACE_STREAM << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
-            continue;
-          }
-
-          bool moved_by_p2p = false;
-          if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
-            try {
-              EventImplPtr ev_p2p =
-                  detail::Scheduler::getInstance().addMemoryMove(
-                      TransferReq, SplitQueue, SrcQueue);
-              waitOfflineSplitEvent(ev_p2p, OfflineSplitWaitKind::Prepare);
-#ifdef SNMD_OFFLINE_SPLIT_STATS
-              offlineSplitStats().InputDirectD2DBytes +=
-                  offlineRequirementBytes(TransferReq);
-#endif
-              moved_by_p2p = true;
-              HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D success\n";
-            } catch (const std::exception &e) {
-              HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D, reason: " << e.what() << "\n";
-            } catch (...) {
-              HANDLER_TRACE_STREAM << "=== handler === Split step3 direct D2D failed, fallback D2H->H2D\n";
+        if (ResidentSource == nullptr && !ReusePartitionRead) {
+          for (size_t Part = 0; Part < SplitQueues_Write.size(); ++Part) {
+            const QueueImplPtr &SplitQueue = SplitQueues_Write[Part];
+            std::unique_ptr<Requirement> PartReadReqOwner;
+            Requirement *PartTransferReq = TransferReq;
+            if (PartitionLocal) {
+              const size_t Chunk = Req->MAccessRange[0] / NumParts;
+              PartReadReqOwner = makeOfflineLinearRowBlockReq(
+                  Req, Part * Chunk, Chunk);
+              if (!PartReadReqOwner) {
+                throw sycl::runtime_error(
+                    "Internal Error. Offline partition-local read block is "
+                    "not contiguous.",
+                    PI_ERROR_INVALID_VALUE);
+              }
+              PartTransferReq = PartReadReqOwner.get();
             }
-          }
 
-          if (!moved_by_p2p) {
+            if (onlyRead && !PartitionLocal &&
+                pendingOfflineSplitHasReadReplica(Req->MSYCLMemObj,
+                                                  SplitQueue)) {
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+              offlineSplitStats().ReusedReadReplicaBytes +=
+                  offlineRequirementBytes(PartTransferReq);
+#endif
+              HANDLER_TRACE_STREAM
+                  << "=== handler === Split step3 reuse read-only replica\n";
+              continue;
+            }
+            if (ReqCurCtx != hostCtx &&
+                SplitQueue->getContextImplPtr() == ReqCurCtx) {
+              HANDLER_TRACE_STREAM << "=== handler === Split step3 SplitQueue "
+                                      "is SrcQueue, continue\n";
+              continue;
+            }
+
+            bool moved_by_p2p = false;
             if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
-              EventImplPtr ev_host =
-                  detail::Scheduler::getInstance().addMemoryMove(
-                      TransferReq, hostQ, SrcQueue);
-              waitOfflineSplitEvent(ev_host, OfflineSplitWaitKind::Prepare);
+              try {
+                EventImplPtr ev_p2p =
+                    detail::Scheduler::getInstance().addMemoryMove(
+                        PartTransferReq, SplitQueue, SrcQueue);
+                waitOfflineSplitEvent(ev_p2p, OfflineSplitWaitKind::Prepare);
 #ifdef SNMD_OFFLINE_SPLIT_STATS
-              offlineSplitStats().InputD2HBytes +=
-                  offlineRequirementBytes(TransferReq);
+                offlineSplitStats().InputDirectD2DBytes +=
+                    offlineRequirementBytes(PartTransferReq);
 #endif
-              HANDLER_TRACE_STREAM << "=== handler === Split step3 copy back host\n";
+                moved_by_p2p = true;
+                HANDLER_TRACE_STREAM
+                    << "=== handler === Split step3 direct D2D success\n";
+              } catch (const std::exception &e) {
+                HANDLER_TRACE_STREAM
+                    << "=== handler === Split step3 direct D2D failed, "
+                       "fallback D2H->H2D, reason: "
+                    << e.what() << "\n";
+              } catch (...) {
+                HANDLER_TRACE_STREAM
+                    << "=== handler === Split step3 direct D2D failed, "
+                       "fallback D2H->H2D\n";
+              }
             }
 
-            EventImplPtr ev_split =
-                detail::Scheduler::getInstance().addMemoryMove(
-                    TransferReq, SplitQueue, hostQ);
-            waitOfflineSplitEvent(ev_split, OfflineSplitWaitKind::Prepare);
+            if (!moved_by_p2p) {
+              if (ReqCurCtx != hostCtx && SrcQueue != nullptr) {
+                EventImplPtr ev_host =
+                    detail::Scheduler::getInstance().addMemoryMove(
+                        PartTransferReq, hostQ, SrcQueue);
+                waitOfflineSplitEvent(ev_host, OfflineSplitWaitKind::Prepare);
 #ifdef SNMD_OFFLINE_SPLIT_STATS
-            offlineSplitStats().InputH2DBytes +=
-                offlineRequirementBytes(TransferReq);
+                offlineSplitStats().InputD2HBytes +=
+                    offlineRequirementBytes(PartTransferReq);
 #endif
-            HANDLER_TRACE_STREAM << "=== handler === Split step3 copy to split device\n";
+                HANDLER_TRACE_STREAM
+                    << "=== handler === Split step3 copy back host\n";
+              }
+
+              EventImplPtr ev_split =
+                  detail::Scheduler::getInstance().addMemoryMove(
+                      PartTransferReq, SplitQueue, hostQ);
+              waitOfflineSplitEvent(ev_split, OfflineSplitWaitKind::Prepare);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+              offlineSplitStats().InputH2DBytes +=
+                  offlineRequirementBytes(PartTransferReq);
+#endif
+              HANDLER_TRACE_STREAM
+                  << "=== handler === Split step3 copy to split device\n";
+            }
           }
         }
       } else {
@@ -3090,7 +3463,18 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       // 3.2
       if (onlyRead) {
         SplitReqs_onlyRead.push_back(Req);
-        rememberOfflineSplitRead(PendingSplit, Req->MSYCLMemObj);
+        // A partition-local read does not create a complete replica and must
+        // never enter the ordinary read-only replica cache.
+        if (!offlineReqHasPartitionLocalContract(ExecCG, Req) ||
+            !offlineReqHasValidPartitionLocalShape(ExecCG->MNDRDesc, Req,
+                                                   NumParts)) {
+          rememberOfflineSplitRead(PendingSplit, Req->MSYCLMemObj);
+        } else if (std::find(PendingSplit.PartitionLocalReadMemObjs.begin(),
+                            PendingSplit.PartitionLocalReadMemObjs.end(),
+                            Req->MSYCLMemObj) ==
+                   PendingSplit.PartitionLocalReadMemObjs.end()) {
+          PendingSplit.PartitionLocalReadMemObjs.push_back(Req->MSYCLMemObj);
+        }
       } else {
         SplitReqs_hasWrite.push_back(Req);
         rememberOfflineSplitWrite(PendingSplit, Req->MSYCLMemObj);
@@ -3131,6 +3515,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     PendingSplit.SplitReqsCopy = std::move(SplitReqs_Copy);
     PendingSplit.SplitReqOwners = std::move(SplitReqOwners);
     cacheOfflineSplitReadReplicas(PendingSplit);
+    supersedeOlderResidentWrites(PendingSplit);
     pendingOfflineSplitMerges().push_back(std::move(PendingSplit));
     HANDLER_TRACE_STREAM << "=== handler === Split submitted async, merge deferred for kernel_count: "
               << sycl_kernel_cg.kernel_count << std::endl;
@@ -3208,6 +3593,10 @@ event handler::scheduleOffline() {
          offlineSubmittedNumParts(sycl_kernel_cg->kernel_count),
          HostStart, HostEnd, last_event,
          findOfflineKernelProfileKey(sycl_kernel_cg->kernel_count)});
+#ifdef SNMD_OFFLINE
+    profile_events.back().PersistentSplit =
+        offlineSubmittedPersistentSplit(sycl_kernel_cg->kernel_count);
+#endif
   }
 #ifdef SNMD_OFFLINE
   finalizeAllPendingOfflineSplits();
@@ -3323,6 +3712,15 @@ event handler::scheduleOffline() {
       detail::SyclKernelCg *sycl_kernel_cg =
           findOfflineKernelCg(kernel_cgs, kernel_count);
 #ifdef SNMD_OFFLINE
+      if (kernel_exec_info.exec) {
+        applyOfflineSplitDecision(
+            kernel_exec_info,
+            clampOfflineDeviceIndex(kernel_exec_info.device_index));
+      } else {
+        detail::ProgramManager::getInstance().NumParts = 1;
+        detail::ProgramManager::getInstance().PersistentSplit = false;
+        detail::ProgramManager::getInstance().SplitDevices.clear();
+      }
       finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
 #endif
 
@@ -3413,9 +3811,6 @@ event handler::scheduleOffline() {
       if (kernel_exec_info.exec) {
         const int ActualDeviceIndex =
             clampOfflineDeviceIndex(kernel_exec_info.device_index);
-#ifdef SNMD_OFFLINE
-        applyOfflineSplitDecision(kernel_exec_info, ActualDeviceIndex);
-#endif
         std::shared_ptr<detail::queue_impl> &kernel_queue = sycl_kernel_cg->kernel_queue;
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
@@ -3440,6 +3835,10 @@ event handler::scheduleOffline() {
                                   std::max(1, ProfileNumParts), HostStart,
                                   HostEnd, last_event,
                                   findOfflineKernelProfileKey(kernel_count)});
+#ifdef SNMD_OFFLINE
+        profile_events.back().PersistentSplit =
+            offlineSubmittedPersistentSplit(kernel_count);
+#endif
         HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === resubmit kernel: " << kernel_count << std::endl;
       }
       else {
@@ -3573,10 +3972,9 @@ event handler::scheduleOffline() {
                 clampOfflineDeviceIndex(kernel_exec_info.device_index);
 
 #ifdef SNMD_OFFLINE
-            // Install the new decision before materializing an older Split. A
-            // future partition-resident path can use both decisions to retain
-            // compatible partitions; the current safe path still canonicalizes
-            // any conflicting producer before this submission.
+            // Install the new decision before resolving an older Split so a
+            // compatible partition-local successor can retain its resident
+            // version; incompatible consumers still canonicalize first.
             applyOfflineSplitDecision(kernel_exec_info, ActualDeviceIndex);
             finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
 #endif
@@ -3598,6 +3996,8 @@ event handler::scheduleOffline() {
                 kernel_count, ActualDeviceIndex, ProfileNumParts,
                 HostStart,   HostEnd,          last_event,
                 findOfflineKernelProfileKey(kernel_count)};
+            profile_event.PersistentSplit =
+                offlineSubmittedPersistentSplit(kernel_count);
             if (!in_flight.emplace(kernel_count, std::move(profile_event))
                      .second) {
               throw sycl::runtime_error(
@@ -3725,6 +4125,15 @@ event handler::scheduleOffline() {
           findOfflineKernelCg(kernel_cgs, kernel_count);
       HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === kernel_count: " << kernel_count << std::endl;
 #ifdef SNMD_OFFLINE
+      if (kernel_exec_info.exec) {
+        applyOfflineSplitDecision(
+            kernel_exec_info,
+            clampOfflineDeviceIndex(kernel_exec_info.device_index));
+      } else {
+        detail::ProgramManager::getInstance().NumParts = 1;
+        detail::ProgramManager::getInstance().PersistentSplit = false;
+        detail::ProgramManager::getInstance().SplitDevices.clear();
+      }
       finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
 #endif
 
@@ -3849,6 +4258,10 @@ event handler::scheduleOffline() {
                                   std::max(1, ProfileNumParts), HostStart,
                                   HostEnd, last_event,
                                   findOfflineKernelProfileKey(kernel_count)});
+#ifdef SNMD_OFFLINE
+        profile_events.back().PersistentSplit =
+            offlineSubmittedPersistentSplit(kernel_count);
+#endif
         HANDLER_TRACE_STREAM << getpid() << " === handler === resubmitted kernel: " << kernel_count << std::endl;
         if (exec_num == kernel_exec_infos.size() - 1)
           HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === resubmit last kernel: " << kernel_count << std::endl;

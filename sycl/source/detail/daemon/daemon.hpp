@@ -72,6 +72,14 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
   size_t range0 = 1;
   size_t range1 = 1;
   size_t range2 = 1;
+  size_t access_range0 = 1;
+  size_t access_range1 = 1;
+  size_t access_range2 = 1;
+  size_t offset0 = 0;
+  size_t offset1 = 0;
+  size_t offset2 = 0;
+  bool is_sub_buffer = false;
+  bool partition_local = false;
 
   // 用于map/set/sort/priority_queue
   bool operator<(const SyclReqData &other) const {
@@ -102,7 +110,15 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
         << buff_size << "\n"
         << range0 << "\n"
         << range1 << "\n"
-        << range2 << "\n";
+        << range2 << "\n"
+        << access_range0 << "\n"
+        << access_range1 << "\n"
+        << access_range2 << "\n"
+        << offset0 << "\n"
+        << offset1 << "\n"
+        << offset2 << "\n"
+        << is_sub_buffer << "\n"
+        << partition_local << "\n";
     return oss.str();
   }
 
@@ -122,11 +138,19 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
     iss >> req.range0;
     iss >> req.range1;
     iss >> req.range2;
+    iss >> req.access_range0;
+    iss >> req.access_range1;
+    iss >> req.access_range2;
+    iss >> req.offset0;
+    iss >> req.offset1;
+    iss >> req.offset2;
+    iss >> req.is_sub_buffer;
+    iss >> req.partition_local;
     return req;
   }
 };
 
-static constexpr int SYCL_REQ_DATA_SERIALIZED_LINES = 9;
+static constexpr int SYCL_REQ_DATA_SERIALIZED_LINES = 17;
 
 inline bool profileKeyReadAccess(acc_mode mode) {
   return mode == acc_mode::read || mode == acc_mode::read_write ||
@@ -175,7 +199,11 @@ inline std::string buildKernelProfileKey(uint64_t kernel_identity,
     }
     oss << static_cast<int>(req.req_accmode) << ":" << req.elem_size << ":"
         << req.buff_size << ":" << req.range0 << "x" << req.range1 << "x"
-        << req.range2 << ";";
+        << req.range2 << ":a" << req.access_range0 << "x"
+        << req.access_range1 << "x" << req.access_range2 << ":o"
+        << req.offset0 << "x" << req.offset1 << "x" << req.offset2
+        << ":sub" << (req.is_sub_buffer ? 1 : 0) << ":pl"
+        << (req.partition_local ? 1 : 0) << ";";
   }
   oss << "|rb=" << read_bytes << "|wb=" << write_bytes;
   return oss.str();
@@ -254,6 +282,7 @@ struct S2DKernelProfileData {
   int kernel_count = 0;
   int device_index = 0;
   int num_parts = 1;
+  bool persistent_split = false;
   uint64_t duration_ns = 0;
   std::string kernel_key;
 
@@ -264,6 +293,7 @@ struct S2DKernelProfileData {
         << kernel_count << "\n"
         << device_index << "\n"
         << num_parts << "\n"
+        << persistent_split << "\n"
         << duration_ns << "\n"
         << kernel_key << "\n";
     return oss.str();
@@ -276,6 +306,7 @@ struct S2DKernelProfileData {
     is >> profile.kernel_count;
     is >> profile.device_index;
     is >> profile.num_parts;
+    is >> profile.persistent_split;
     is >> profile.duration_ns;
     is.ignore();
     std::getline(is, profile.kernel_key);
@@ -381,6 +412,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
   // OFFLINE daemon指定需要哪个device执行
   int exec_device = 0;
   int num_parts = 1; // >1 表示在同一rank上使用SNMD split
+  bool persistent_split = false; // writable partitions remain device-resident
   std::vector<int> split_devices; // SNMD split实际使用的SYCL device index
   std::map<SyclReqData, int> req_rank; // 需要的数据 在哪个rank上
 
@@ -416,7 +448,8 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
         << exec_order << "\n"
         << exec_rank << "\n"
         << exec_device << "\n"
-        << num_parts << "\n";
+        << num_parts << "\n"
+        << persistent_split << "\n";
 
     oss << split_devices.size() << "\n";
     for (int device : split_devices) {
@@ -441,6 +474,7 @@ struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个ra
     iss >> sched_info.exec_rank;
     iss >> sched_info.exec_device;
     iss >> sched_info.num_parts;
+    iss >> sched_info.persistent_split;
 
     size_t split_device_count = 0;
     iss >> split_device_count;
@@ -480,6 +514,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
   bool exec = false; // 是否执行
   int device_index = 0; // 执行设备
   int num_parts = 1; // >1 表示handler按SNMD split提交
+  bool persistent_split = false;
   std::vector<int> split_devices; // SNMD split实际使用的SYCL device index
 
   // 快速跳过前几个kernel
@@ -498,7 +533,8 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     oss << kernel_count << "\n"
         << exec << "\n"
         << device_index << "\n"
-        << num_parts << "\n";
+        << num_parts << "\n"
+        << persistent_split << "\n";
 
     oss << split_devices.size() << "\n";
     for (int device : split_devices) {
@@ -523,6 +559,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     iss >> kernel_info.exec;
     iss >> kernel_info.device_index;
     iss >> kernel_info.num_parts;
+    iss >> kernel_info.persistent_split;
 
     size_t split_device_count = 0;
     iss >> split_device_count;
@@ -654,6 +691,7 @@ struct DAGNode { // 一个kernel的依赖关系
   int exec_rank = -1; // 选择的rank
   int exec_proc = -1; // 选择的proc
   int num_parts = 1; // >1 表示这个kernel选择SNMD split
+  bool persistent_split = false;
   std::vector<int> split_devices; // num_parts>1时参与split的device index
   // bool executed = false; // online无法获取 --offline用于区别kernel是否已被调度 暂时用不上--
 

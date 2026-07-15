@@ -149,11 +149,12 @@ struct ProfileCostKey {
   int rank = 0;
   int device = 0;
   int num_parts = 1;
+  bool persistent_split = false;
 
   bool operator<(const ProfileCostKey &other) const {
-    return std::tie(kernel_key, rank, device, num_parts) <
+    return std::tie(kernel_key, rank, device, num_parts, persistent_split) <
            std::tie(other.kernel_key, other.rank, other.device,
-                    other.num_parts);
+                    other.num_parts, other.persistent_split);
   }
 };
 
@@ -420,6 +421,8 @@ void SendD2DKernelSchedInfos(MPI_Comm comm_daemon, int master_rank, int daemon_r
       obj_data += line + "\n";  // exec_device
       std::getline(stream, line);
       obj_data += line + "\n";  // num_parts
+      std::getline(stream, line);
+      obj_data += line + "\n";  // persistent_split
       std::getline(stream, line);
       obj_data += line + "\n";  // split_devices.size()
       int split_device_count = std::stoi(line);
@@ -822,6 +825,10 @@ static void rebaseCompletedOfflineDAG(
     }
     node->finish_time = 0.0;
     node->rank_u = 0.0;
+    // handler materializes every live partition at the user-visible wait
+    // fence. Historical nodes still anchor logical data ownership, but cannot
+    // advertise per-device resident partitions into the next wait window.
+    node->persistent_split = false;
   }
 }
 
@@ -931,6 +938,7 @@ struct TaskCandidate {
   int rank = -1;
   int proc = -1;
   int num_parts = 1;
+  bool persistent_split = false;
   double start_time = 0.0;
   double finish_time = std::numeric_limits<double>::infinity();
   CostEstimate exec_estimate;
@@ -1009,6 +1017,7 @@ struct NodePlacementState {
   int exec_rank = -1;
   int exec_proc = -1;
   int num_parts = 1;
+  bool persistent_split = false;
   double finish_time = 0.0;
   std::vector<int> split_devices;
 };
@@ -1024,10 +1033,20 @@ static double reqBytes(const SyclReqData &req) {
   return static_cast<double>(req.elem_size) * static_cast<double>(req.buff_size);
 }
 
+static double reqAccessElems(const SyclReqData &req) {
+  return static_cast<double>(req.access_range0) *
+         static_cast<double>(req.access_range1) *
+         static_cast<double>(req.access_range2);
+}
+
+static double reqAccessBytes(const SyclReqData &req) {
+  return static_cast<double>(req.elem_size) * reqAccessElems(req);
+}
+
 static double totalReqElems(const DAGNode *node) {
   double elems = 0.0;
   for (const SyclReqData &req : node->req_data) {
-    elems += req.buff_size;
+    elems += reqAccessElems(req);
   }
   return elems;
 }
@@ -1044,17 +1063,19 @@ static double totalReadElems(const DAGNode *node) {
   double elems = 0.0;
   for (const SyclReqData &req : node->req_data) {
     if (isReadAccess(req.req_accmode)) {
-      elems += req.buff_size;
+      elems += reqAccessElems(req);
     }
   }
   return elems;
 }
 
-static double totalReadBytes(const DAGNode *node) {
+static double totalReadBytesForPartitionMode(const DAGNode *node,
+                                             bool partition_local) {
   double bytes = 0.0;
   for (const SyclReqData &req : node->req_data) {
-    if (isReadAccess(req.req_accmode)) {
-      bytes += reqBytes(req);
+    if (isReadAccess(req.req_accmode) &&
+        req.partition_local == partition_local) {
+      bytes += reqAccessBytes(req);
     }
   }
   return bytes;
@@ -1064,7 +1085,7 @@ static double totalWriteElems(const DAGNode *node) {
   double elems = 0.0;
   for (const SyclReqData &req : node->req_data) {
     if (isWriteAccess(req.req_accmode)) {
-      elems += req.buff_size;
+      elems += reqAccessElems(req);
     }
   }
   return elems;
@@ -1074,22 +1095,24 @@ static double totalWriteBytes(const DAGNode *node) {
   double bytes = 0.0;
   for (const SyclReqData &req : node->req_data) {
     if (isWriteAccess(req.req_accmode)) {
-      bytes += reqBytes(req);
+      bytes += reqAccessBytes(req);
     }
   }
   return bytes;
 }
 
-static double dependentReadBytes(const DAGNode *node) {
+static double dependentReadBytesForPartitionMode(const DAGNode *node,
+                                                  bool partition_local) {
   double bytes = 0.0;
   std::unordered_set<void *> seen_mem;
   for (const auto &dep_pair : node->depend_on_mem) {
     for (const SyclReqData &req : dep_pair.second) {
-      if (!isReadAccess(req.req_accmode)) {
+      if (!isReadAccess(req.req_accmode) ||
+          req.partition_local != partition_local) {
         continue;
       }
       if (seen_mem.insert(req.mem_pointer).second) {
-        bytes += reqBytes(req);
+        bytes += reqAccessBytes(req);
       }
     }
   }
@@ -1116,10 +1139,10 @@ static double coldArithmeticIntensityFactor(const DAGNode *node) {
     if (writes) {
       ++write_reqs;
       max_write_elems =
-          std::max(max_write_elems, static_cast<double>(req.buff_size));
+          std::max(max_write_elems, reqAccessElems(req));
     }
     if (reads || writes) {
-      const double elems = static_cast<double>(req.buff_size);
+      const double elems = reqAccessElems(req);
       min_req_elems = std::min(min_req_elems, elems);
       max_req_elems = std::max(max_req_elems, elems);
     }
@@ -1155,7 +1178,8 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
   }
 
   ProfileCostKey key{profile.kernel_key, sample_rank, profile.device_index,
-                     std::max(1, profile.num_parts)};
+                     std::max(1, profile.num_parts),
+                     profile.persistent_split};
   const double sample_cost =
       static_cast<double>(profile.duration_ns) / PROFILE_NS_TO_COST;
 
@@ -1184,6 +1208,7 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
   DAEMON_TRACE_STREAM << "ProfileCostTable: key " << profile.kernel_key
             << " rank " << sample_rank << " device " << profile.device_index
             << " parts " << std::max(1, profile.num_parts)
+            << " persistent " << profile.persistent_split
             << " sample_cost " << sample_cost
             << " ewma_cost " << entry.ewma_cost
             << " mean_cost " << entry.mean_cost
@@ -1214,8 +1239,10 @@ static double profileEntryUncertainty(const ProfileCostEntry &entry) {
 
 static bool lookupExactProfileEstimate(const std::string &kernel_key,
                                        int rank, int device, int num_parts,
+                                       bool persistent_split,
                                        CostEstimate &estimate) {
-  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts)};
+  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts),
+                       persistent_split};
   std::lock_guard<std::mutex> lock(profile_cost_mutex);
   auto exact_it = profile_cost_table.find(exact);
   if (exact_it == profile_cost_table.end() || exact_it->second.samples <= 0) {
@@ -1230,22 +1257,26 @@ static bool lookupExactProfileEstimate(const std::string &kernel_key,
 }
 
 static bool hasExactProfileCost(const std::string &kernel_key, int rank,
-                                int device, int num_parts) {
+                                int device, int num_parts,
+                                bool persistent_split = false) {
   CostEstimate ignored_estimate;
   return lookupExactProfileEstimate(kernel_key, rank, device, num_parts,
-                                    ignored_estimate);
+                                    persistent_split, ignored_estimate);
 }
 
 #if defined(SNMD_OFFLINE_COLD_SPLIT_PROBE) ||                              \
     defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
     defined(SNMD_OFFLINE_SPLIT_STATS)
 static bool hasProfileCostForParts(const std::string &kernel_key,
-                                   int num_parts) {
+                                   int num_parts,
+                                   bool persistent_split = false) {
   const int parts = std::max(1, num_parts);
   std::lock_guard<std::mutex> lock(profile_cost_mutex);
   for (const auto &entry : profile_cost_table) {
     if (entry.first.kernel_key == kernel_key &&
-        entry.first.num_parts == parts && entry.second.samples > 0) {
+        entry.first.num_parts == parts &&
+        entry.first.persistent_split == persistent_split &&
+        entry.second.samples > 0) {
       return true;
     }
   }
@@ -1728,9 +1759,9 @@ static KernelPrecision inferKernelPrecisionFromReqs(
   double fp64_elems = 0.0;
   for (const SyclReqData &req : reqs) {
     if (req.elem_size == 4) {
-      fp32_elems += req.buff_size;
+      fp32_elems += reqAccessElems(req);
     } else if (req.elem_size == 8) {
-      fp64_elems += req.buff_size;
+      fp64_elems += reqAccessElems(req);
     }
   }
 
@@ -1781,10 +1812,11 @@ static bool isKernelPlacementProc(int rank, int proc) {
 
 static bool lookupScaledProfileEstimate(const std::string &kernel_key,
                                         int rank, int device, int num_parts,
+                                        bool persistent_split,
                                         KernelPrecision precision,
                                         CostEstimate &estimate) {
   if (lookupExactProfileEstimate(kernel_key, rank, device, num_parts,
-                                 estimate)) {
+                                 persistent_split, estimate)) {
     return true;
   }
 
@@ -1799,6 +1831,9 @@ static bool lookupScaledProfileEstimate(const std::string &kernel_key,
   for (const auto &entry : profile_cost_table) {
     const ProfileCostKey &sample_key = entry.first;
     if (sample_key.kernel_key != kernel_key || sample_key.num_parts != parts) {
+      continue;
+    }
+    if (sample_key.persistent_split != persistent_split) {
       continue;
     }
 
@@ -1848,7 +1883,10 @@ static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
   // on the device. Until residency-aware allocation deltas are tracked, do not
   // double-count its existing buffers against current free memory.
   if (proc > 0 &&
-      hasExactProfileCost(profileKeyForNode(node), rank, proc, num_parts)) {
+      (hasExactProfileCost(profileKeyForNode(node), rank, proc, num_parts,
+                           false) ||
+       hasExactProfileCost(profileKeyForNode(node), rank, proc, num_parts,
+                           true))) {
     return true;
   }
 
@@ -1859,19 +1897,11 @@ static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
     return true;
   }
 
-  double required_bytes = totalReqBytes(node);
-  if (num_parts > 1 && !node->req_data.empty()) {
-    required_bytes = 0.0;
-    for (const SyclReqData &req : node->req_data) {
-      const double bytes = reqBytes(req);
-      // Read-only inputs are replicated by the current Split data path. A
-      // writable range is partitioned along dim0 and contributes one part on
-      // each participating device.
-      required_bytes += isWriteAccess(req.req_accmode)
-                            ? bytes / static_cast<double>(num_parts)
-                            : bytes;
-    }
-  }
+  // Split currently keeps a full virtual buffer allocation on every part
+  // device so an unchanged kernel can continue to index by global id. Only
+  // data validity and transfers are partitioned; counting writable storage as
+  // bytes/parts would admit a gang that can OOM during allocation.
+  const double required_bytes = totalReqBytes(node);
   const double available_bytes =
       gpu_memory_available_kib[rank][proc] * 1024.0;
   return required_bytes < available_bytes * 0.85;
@@ -1881,7 +1911,8 @@ static CostEstimate estimateSingleExecCost(DAGNode *node, int rank, int proc) {
   CostEstimate estimate;
   const std::string key = profileKeyForNode(node);
   const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
-  if (lookupScaledProfileEstimate(key, rank, proc, 1, precision, estimate)) {
+  if (lookupScaledProfileEstimate(key, rank, proc, 1, false, precision,
+                                  estimate)) {
     const double scale = deviceServiceTimeScale(rank, proc);
     estimate.mean = std::max(0.001, estimate.mean) * scale;
     estimate.uncertainty *= scale;
@@ -1902,6 +1933,9 @@ static CostEstimate estimateSingleExecCost(DAGNode *node, int rank, int proc) {
 static std::vector<int> producerSourceProcs(const DAGNode *pre_node) {
   std::vector<int> source_procs;
   if (pre_node->num_parts > 1 && !pre_node->split_devices.empty()) {
+    if (pre_node->persistent_split) {
+      return pre_node->split_devices;
+    }
 #ifdef SNMD_OFFLINE_CANONICAL_MERGE
     const bool exec_proc_is_part =
         std::find(pre_node->split_devices.begin(),
@@ -1934,6 +1968,31 @@ static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
   if (pre_node->exec_rank != rank) {
     return heftCostFromSeconds(secondsForBytesAtBandwidth(
         comm_bytes, crossRankBandwidthGiB(pre_node->exec_rank, rank)));
+  }
+
+  if (pre_node->persistent_split && pre_node->num_parts > 1 &&
+      !pre_node->split_devices.empty()) {
+    // The handler always gathers to the producer's first ordered Split
+    // device, then serves an incompatible consumer from that complete
+    // canonical version. Keep the estimator and endpoint reservations aligned
+    // with that physical path even when the consumer's first device differs.
+    const int canonical_proc = pre_node->split_devices.front();
+    const double part_bytes =
+        comm_bytes / static_cast<double>(pre_node->num_parts);
+    double seconds = 0.0;
+    for (int src_proc : pre_node->split_devices) {
+      if (src_proc != canonical_proc) {
+        seconds += sameRankCopySeconds(rank, src_proc, canonical_proc,
+                                       part_bytes);
+      }
+    }
+    for (int target_proc : target_procs) {
+      if (target_proc != canonical_proc) {
+        seconds += sameRankCopySeconds(rank, canonical_proc, target_proc,
+                                       comm_bytes);
+      }
+    }
+    return heftCostFromSeconds(seconds);
   }
 
   // The handler exposes one complete version on the canonical merge device;
@@ -1996,6 +2055,10 @@ static void addTransferEstimate(DependencyTransferPlan &plan, double cost) {
   plan.uncertainty = std::hypot(plan.uncertainty, uncertainty);
 }
 
+static bool persistentEdgeCompatible(
+    const DAGNode *node, const DAGNode *pre_node, int target_rank,
+    const std::vector<int> &target_procs);
+
 static DependencyTransferPlan buildDependencyTransferPlan(
     DAGNode *node, int target_rank, const std::vector<int> &target_procs) {
   DependencyTransferPlan plan;
@@ -2012,6 +2075,67 @@ static DependencyTransferPlan buildDependencyTransferPlan(
     const double comm_bytes = getCommBytes(node, pre_node);
     plan.ready_time = std::max(plan.ready_time, pre_node->finish_time);
     if (comm_bytes <= 0.0) {
+      continue;
+    }
+
+    if (persistentEdgeCompatible(node, pre_node, target_rank, target_procs)) {
+      DAEMON_TRACE_STREAM
+          << "buildDependencyTransferPlan: Kernel " << node->kernel_count
+          << " consumes resident partitions from Kernel "
+          << pre_node->kernel_count << " without materialization" << std::endl;
+      continue;
+    }
+
+    if (pre_node->persistent_split && pre_node->num_parts > 1) {
+      // An incompatible consumer forces the handler's canonical fallback.
+      // Model the gather plus any full replicas as one conservative transfer
+      // and reserve every hidden materialization endpoint for this wave.
+      double transfer_start = pre_node->finish_time;
+      for (int src_proc : pre_node->split_devices) {
+        transfer_start = std::max(
+            transfer_start,
+            calendarReadyTime(transfer_calendar, pre_node->exec_rank,
+                              src_proc));
+      }
+      for (int dst_proc : target_procs) {
+        transfer_start = std::max(
+            transfer_start,
+            calendarReadyTime(transfer_calendar, target_rank, dst_proc));
+      }
+      if (!std::isfinite(transfer_start)) {
+        // A compatible successor selected earlier in this dispatch wave can
+        // already own the resident source queues. Delay this incompatible
+        // gather until that successor completes instead of admitting two
+        // commands whose hidden materialization endpoints conflict.
+        plan.ready_time = std::numeric_limits<double>::infinity();
+        continue;
+      }
+      const double transfer_cost = estimateCommCostForDevices(
+          node, pre_node, target_rank, target_procs);
+      const double transfer_end = transfer_start + transfer_cost;
+      plan.ready_time = std::max(plan.ready_time, transfer_end);
+      addTransferEstimate(plan, transfer_cost);
+      for (int src_proc : pre_node->split_devices) {
+        reserveCalendar(transfer_calendar, pre_node->exec_rank, src_proc,
+                        transfer_end);
+      }
+      for (int dst_proc : target_procs) {
+        reserveCalendar(transfer_calendar, target_rank, dst_proc,
+                        transfer_end);
+      }
+      const double gather_bytes =
+          comm_bytes * static_cast<double>(pre_node->num_parts - 1) /
+          static_cast<double>(pre_node->num_parts);
+      size_t replica_count = 0;
+      const int canonical_proc = pre_node->split_devices.empty()
+                                     ? -1
+                                     : pre_node->split_devices.front();
+      for (int dst_proc : target_procs) {
+        replica_count += dst_proc == canonical_proc ? 0 : 1;
+      }
+      const double replica_bytes =
+          comm_bytes * static_cast<double>(replica_count);
+      plan.movement_bytes += gather_bytes + replica_bytes;
       continue;
     }
 
@@ -2133,16 +2257,21 @@ static bool splitWriteRangesMatchDim0(const DAGNode *node, int num_parts) {
       continue;
     }
 
-    if (req.range0 < static_cast<size_t>(num_parts) ||
-        req.range0 % static_cast<size_t>(num_parts) != 0) {
+    if (req.is_sub_buffer || req.access_range0 != node->global_size0 ||
+        req.access_range0 < static_cast<size_t>(num_parts) ||
+        req.access_range0 % static_cast<size_t>(num_parts) != 0 ||
+        req.offset1 != 0 || req.offset2 != 0 ||
+        req.access_range1 != req.range1 || req.access_range2 != req.range2) {
       return false;
     }
 
-    if (kernel_splits_only_dim0 && (req.range1 > 1 || req.range2 > 1)) {
+    if (kernel_splits_only_dim0 &&
+        (req.access_range1 > 1 || req.access_range2 > 1)) {
       DAEMON_TRACE_STREAM
           << "algorithmHEFT: Kernel " << node->kernel_count
           << " split rejected: dim0-only kernel writes non-contiguous range "
-          << req.range0 << "x" << req.range1 << "x" << req.range2
+          << req.access_range0 << "x" << req.access_range1 << "x"
+          << req.access_range2
           << std::endl;
       return false;
     }
@@ -2187,6 +2316,92 @@ static bool worthConsideringSplit(DAGNode *node, int num_parts) {
 #endif
 }
 
+static bool supportsPersistentSplit(const DAGNode *node, int num_parts) {
+  if (node == nullptr || num_parts <= 1 ||
+      node->global_size0 < static_cast<size_t>(num_parts) ||
+      node->global_size0 % static_cast<size_t>(num_parts) != 0) {
+    return false;
+  }
+
+  bool has_write = false;
+  for (const SyclReqData &req : node->req_data) {
+    if (!isWriteAccess(req.req_accmode)) {
+      if (!req.partition_local) {
+        continue;
+      }
+    } else {
+      has_write = true;
+      // Cross-partition atomics require a reduction/ownership protocol that the
+      // dim-0 resident mode intentionally does not claim to provide.
+      if (!req.partition_local || req.req_accmode == acc_mode::atomic) {
+        return false;
+      }
+    }
+    if (req.partition_local &&
+        (req.is_sub_buffer || req.offset0 != 0 || req.offset1 != 0 ||
+         req.offset2 != 0 || req.access_range0 != node->global_size0 ||
+         req.access_range0 < static_cast<size_t>(num_parts) ||
+         req.access_range0 % static_cast<size_t>(num_parts) != 0 ||
+         req.access_range1 != req.range1 ||
+         req.access_range2 != req.range2)) {
+      return false;
+    }
+  }
+  return has_write;
+}
+
+static bool hasPartitionLocalSuccessor(const DAGNode *node, int num_parts) {
+  if (node == nullptr) {
+    return false;
+  }
+  for (const DAGNode *successor : node->depend_by) {
+    if (!supportsPersistentSplit(successor, num_parts) ||
+        successor->global_size0 != node->global_size0) {
+      continue;
+    }
+    const auto dep_it = successor->depend_on_mem.find(
+        const_cast<DAGNode *>(node));
+    if (dep_it == successor->depend_on_mem.end() || dep_it->second.empty()) {
+      continue;
+    }
+    const bool all_partition_local =
+        std::all_of(dep_it->second.begin(), dep_it->second.end(),
+                    [](const SyclReqData &req) {
+                      return req.partition_local;
+                    });
+    if (all_partition_local) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool persistentEdgeCompatible(
+    const DAGNode *node, const DAGNode *pre_node, int target_rank,
+    const std::vector<int> &target_procs) {
+  if (node == nullptr || pre_node == nullptr || !pre_node->persistent_split ||
+      !supportsPersistentSplit(node, pre_node->num_parts) ||
+      pre_node->exec_rank != target_rank ||
+      pre_node->num_parts <= 1 ||
+      pre_node->global_size0 != node->global_size0 ||
+      static_cast<int>(target_procs.size()) != pre_node->num_parts ||
+      pre_node->split_devices != target_procs) {
+    return false;
+  }
+
+  const auto dep_it = node->depend_on_mem.find(
+      const_cast<DAGNode *>(pre_node));
+  if (dep_it == node->depend_on_mem.end() || dep_it->second.empty()) {
+    return false;
+  }
+  for (const SyclReqData &req : dep_it->second) {
+    if (!req.partition_local) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static int countMaskBits(uint64_t mask) {
   int count = 0;
   while (mask != 0) {
@@ -2197,21 +2412,33 @@ static int countMaskBits(uint64_t mask) {
 }
 
 static double estimateSplitInternalCopyCost(
-    DAGNode *node, int rank, const std::vector<int> &split_devices) {
+    DAGNode *node, int rank, const std::vector<int> &split_devices,
+    bool persistent_split) {
   if (split_devices.size() <= 1) {
     return 0.0;
   }
 
   const int main_proc = split_devices.front();
-  const double read_bytes =
-      std::max(0.0, totalReadBytes(node) - dependentReadBytes(node));
+  const double replicated_read_bytes =
+      std::max(0.0, totalReadBytesForPartitionMode(node, false) -
+                        dependentReadBytesForPartitionMode(node, false));
+  const double partition_local_read_bytes =
+      std::max(0.0, totalReadBytesForPartitionMode(node, true) -
+                        dependentReadBytesForPartitionMode(node, true));
+  const double read_bytes_per_extra_device =
+      replicated_read_bytes +
+      partition_local_read_bytes / static_cast<double>(split_devices.size());
   const double write_part_bytes =
-      totalWriteBytes(node) / static_cast<double>(split_devices.size());
+      persistent_split
+          ? 0.0
+          : totalWriteBytes(node) /
+                static_cast<double>(split_devices.size());
 
   double seconds = 0.0;
   for (size_t i = 1; i < split_devices.size(); ++i) {
     const int proc = split_devices[i];
-    seconds += sameRankCopySeconds(rank, main_proc, proc, read_bytes);
+    seconds += sameRankCopySeconds(rank, main_proc, proc,
+                                   read_bytes_per_extra_device);
     seconds += sameRankCopySeconds(rank, proc, main_proc, write_part_bytes);
   }
 
@@ -2220,7 +2447,8 @@ static double estimateSplitInternalCopyCost(
 
 static CostEstimate
 estimateSplitExecCost(DAGNode *node, int rank,
-                      const std::vector<int> &split_devices) {
+                      const std::vector<int> &split_devices,
+                      bool persistent_split) {
   const int num_parts = static_cast<int>(split_devices.size());
   if (num_parts <= 1) {
     return estimateSingleExecCost(
@@ -2231,7 +2459,7 @@ estimateSplitExecCost(DAGNode *node, int rank,
   const std::string key = profileKeyForNode(node);
   const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
   if (lookupScaledProfileEstimate(key, rank, split_devices.front(), num_parts,
-                                  precision, estimate)) {
+                                  persistent_split, precision, estimate)) {
     double penalty = 1.0;
     for (int proc : split_devices) {
       penalty = std::max(penalty, deviceServiceTimeScale(rank, proc));
@@ -2254,7 +2482,8 @@ estimateSplitExecCost(DAGNode *node, int rank,
   }
 
   const double copy_overhead =
-      estimateSplitInternalCopyCost(node, rank, split_devices);
+      estimateSplitInternalCopyCost(node, rank, split_devices,
+                                    persistent_split);
   const double launch_overhead = 0.2 * num_parts;
   estimate.mean = best_single.mean / (num_parts * SPLIT_EFFICIENCY) +
                   copy_overhead + launch_overhead;
@@ -2341,9 +2570,9 @@ saveNodePlacementStates(const std::vector<DAGNode *> &nodes) {
   std::vector<NodePlacementState> states;
   states.reserve(nodes.size());
   for (const DAGNode *node : nodes) {
-    states.push_back(NodePlacementState{node->exec_rank, node->exec_proc,
-                                        node->num_parts, node->finish_time,
-                                        node->split_devices});
+    states.push_back(NodePlacementState{
+        node->exec_rank, node->exec_proc, node->num_parts,
+        node->persistent_split, node->finish_time, node->split_devices});
   }
   return states;
 }
@@ -2357,6 +2586,7 @@ static void restoreNodePlacementStates(
     node->exec_rank = state.exec_rank;
     node->exec_proc = state.exec_proc;
     node->num_parts = state.num_parts;
+    node->persistent_split = state.persistent_split;
     node->finish_time = state.finish_time;
     node->split_devices = state.split_devices;
   }
@@ -2389,6 +2619,7 @@ static void rebuildKernelSchedInfos(
     kernel_sched_info.exec_rank = node->exec_rank;
     kernel_sched_info.exec_device = node->exec_proc;
     kernel_sched_info.num_parts = node->num_parts;
+    kernel_sched_info.persistent_split = node->persistent_split;
     kernel_sched_info.split_devices = node->split_devices;
     kernel_sched_order_infos.push_back(kernel_sched_info);
   }
@@ -2439,6 +2670,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
         node->exec_rank = candidate.rank;
         node->exec_proc = candidate.proc;
         node->num_parts = candidate.num_parts;
+        node->persistent_split = candidate.persistent_split;
         node->split_devices = candidate.occupied_procs;
         node->finish_time = candidate.finish_time;
         commitCandidateReservations(candidate);
@@ -2498,6 +2730,10 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
   TaskCandidate candidate;
   candidate.rank = rank;
   candidate.num_parts = num_parts;
+  const bool persistent_split =
+      gpu_available_time.size() == 1 &&
+      supportsPersistentSplit(node, num_parts) &&
+      hasPartitionLocalSuccessor(node, num_parts);
 
   if (!worthConsideringSplit(node, num_parts)) {
     return candidate;
@@ -2543,7 +2779,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     const double start_time =
         std::max(device_ready, transfer_plan.ready_time);
     const CostEstimate exec_estimate =
-        estimateSplitExecCost(node, rank, split_devices);
+        estimateSplitExecCost(node, rank, split_devices, persistent_split);
 
 #if defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
     defined(SNMD_OFFLINE_COLD_SPLIT_PROBE)
@@ -2558,7 +2794,8 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     }
 
     const bool has_split_profile =
-        hasProfileCostForParts(profileKeyForNode(node), num_parts);
+        hasProfileCostForParts(profileKeyForNode(node), num_parts,
+                               persistent_split);
 #endif
 #ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
     if (!has_split_profile && std::isfinite(best_single_estimate.mean)) {
@@ -2606,6 +2843,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     split_candidate.rank = rank;
     split_candidate.proc = split_devices.front();
     split_candidate.num_parts = num_parts;
+    split_candidate.persistent_split = persistent_split;
     split_candidate.occupied_procs = split_devices;
     split_candidate.start_time = start_time;
     split_candidate.exec_estimate = exec_estimate;
@@ -2824,7 +3062,7 @@ void algorithmHEFT(
     // 1.1. 计算每个任务的平均计算时间
     double total_elem = 0;
     for (const SyclReqData &req : node->req_data) {
-      total_elem += req.buff_size; // buff_size就是总数据量 不需要除以elem_size
+      total_elem += reqAccessElems(req);
     }
     node->total_elem = total_elem / 1000; // TODO 归一化
     DAEMON_TRACE_STREAM << "algorithmHEFT: Kernel " << node->kernel_count
@@ -2895,6 +3133,7 @@ void algorithmHEFT(
     node->exec_rank = best_candidate.rank;
     node->exec_proc = best_candidate.proc;
     node->num_parts = best_candidate.num_parts;
+    node->persistent_split = best_candidate.persistent_split;
     node->split_devices = best_candidate.occupied_procs;
     node->finish_time = best_candidate.finish_time;
     heft_risk_finish_time =
@@ -2910,6 +3149,7 @@ void algorithmHEFT(
     kernel_sched_info.exec_rank = node->exec_rank;
     kernel_sched_info.exec_device = node->exec_proc;
     kernel_sched_info.num_parts = node->num_parts;
+    kernel_sched_info.persistent_split = node->persistent_split;
     kernel_sched_info.split_devices = node->split_devices;
     kernel_sched_order_infos.push_back(kernel_sched_info);
 
@@ -2917,6 +3157,7 @@ void algorithmHEFT(
               << " assigned to Rank " << node->exec_rank
               << " Proc " << node->exec_proc
               << " NumParts " << node->num_parts
+              << " PersistentSplit " << node->persistent_split
               << " SplitDevices";
     for (int split_device : node->split_devices) {
       DAEMON_TRACE_STREAM << " " << split_device;
@@ -2959,16 +3200,27 @@ void algorithmHEFT(
     if (node->num_parts > 1) {
       selected_split_kernels++;
       selected_exec_estimate =
-          estimateSplitExecCost(node, node->exec_rank, node->split_devices);
+          estimateSplitExecCost(node, node->exec_rank, node->split_devices,
+                                node->persistent_split);
       has_selected_profile = hasProfileCostForParts(
-          profileKeyForNode(node), node->num_parts);
+          profileKeyForNode(node), node->num_parts,
+          node->persistent_split);
+      const long double replicated_read_bytes =
+          totalReadBytesForPartitionMode(node, false);
+      const long double partition_local_read_bytes =
+          totalReadBytesForPartitionMode(node, true);
       estimated_split_extra_input_bytes +=
-          static_cast<long double>(totalReadBytes(node)) *
-          static_cast<long double>(node->num_parts - 1);
-      estimated_split_merge_bytes +=
-          static_cast<long double>(totalWriteBytes(node)) *
-          static_cast<long double>(node->num_parts - 1) /
-          static_cast<long double>(node->num_parts);
+          replicated_read_bytes *
+              static_cast<long double>(node->num_parts - 1) +
+          partition_local_read_bytes *
+              static_cast<long double>(node->num_parts - 1) /
+              static_cast<long double>(node->num_parts);
+      if (!node->persistent_split) {
+        estimated_split_merge_bytes +=
+            static_cast<long double>(totalWriteBytes(node)) *
+            static_cast<long double>(node->num_parts - 1) /
+            static_cast<long double>(node->num_parts);
+      }
     } else {
       selected_single_kernels++;
     }
@@ -2978,6 +3230,7 @@ void algorithmHEFT(
               << " rank=" << node->exec_rank
               << " device=" << node->exec_proc
               << " parts=" << node->num_parts
+              << " persistent=" << (node->persistent_split ? 1 : 0)
               << " single_exec_cost=" << single_exec_estimate.mean
               << " single_exec_uncertainty="
               << single_exec_estimate.uncertainty
@@ -3055,6 +3308,7 @@ static void resetCompletionWindowCalendar(const std::vector<DAGNode *> &nodes) {
     node->exec_rank = -1;
     node->exec_proc = -1;
     node->num_parts = 1;
+    node->persistent_split = false;
     node->split_devices.clear();
     node->finish_time = 0.0;
   }
@@ -3141,6 +3395,7 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     selected_node->exec_rank = selected_candidate.rank;
     selected_node->exec_proc = selected_candidate.proc;
     selected_node->num_parts = selected_candidate.num_parts;
+    selected_node->persistent_split = selected_candidate.persistent_split;
     selected_node->split_devices = selected_candidate.occupied_procs;
     selected_node->finish_time = selected_candidate.finish_time;
 
@@ -3160,6 +3415,7 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     exec_info.exec = true;
     exec_info.device_index = selected_node->exec_proc;
     exec_info.num_parts = selected_node->num_parts;
+    exec_info.persistent_split = selected_node->persistent_split;
     exec_info.split_devices = selected_node->split_devices;
     planned_dispatches.push_back(
         {std::move(exec_info), selected_candidate.movement_bytes,
@@ -3185,7 +3441,8 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
         << "CompletionQueue: dispatch_order " << ++dispatch_order
         << " kernel " << dispatch.exec_info.kernel_count << " rank 0 proc "
         << dispatch.exec_info.device_index << " parts "
-        << dispatch.exec_info.num_parts << " movement_bytes "
+        << dispatch.exec_info.num_parts << " persistent "
+        << dispatch.exec_info.persistent_split << " movement_bytes "
         << dispatch.movement_bytes << " reserved_devices "
         << dispatch.compute_reservations << std::endl;
     dispatches.push_back(std::move(dispatch.exec_info));
@@ -3365,17 +3622,21 @@ static CompletionWindowResult runCompletionDrivenWindow(
       state.phase = CompletionNodePhase::Complete;
       const int actual_parts = std::max(1, completion.num_parts);
       if (node->exec_proc != completion.device_index ||
-          node->num_parts != actual_parts) {
+          node->num_parts != actual_parts ||
+          node->persistent_split != completion.persistent_split) {
         DAEMON_TRACE_STREAM
             << "CompletionQueue: handler adjusted kernel "
             << completion.kernel_count << " from proc " << node->exec_proc
             << " parts " << node->num_parts << " to proc "
             << completion.device_index << " parts " << actual_parts
+            << " persistent " << completion.persistent_split
             << std::endl;
       }
       node->exec_rank = 0;
       node->exec_proc = completion.device_index;
       node->num_parts = actual_parts;
+      node->persistent_split =
+          actual_parts > 1 && completion.persistent_split;
       if (actual_parts <= 1) {
         node->split_devices.clear();
       } else if (node->split_devices.size() >
@@ -3387,7 +3648,8 @@ static CompletionWindowResult runCompletionDrivenWindow(
       DAEMON_TRACE_STREAM << "CompletionQueue: complete kernel "
                           << completion.kernel_count << " device "
                           << completion.device_index << " parts "
-                          << completion.num_parts << " duration_ns "
+                          << completion.num_parts << " persistent "
+                          << completion.persistent_split << " duration_ns "
                           << completion.duration_ns << std::endl;
     }
   }
@@ -3441,7 +3703,7 @@ void CPUMonitor() {
 
   while (std::getline(file, line)) {
       if (line.find("MemAvailable:") == 0) {
-          std::sscanf(line.c_str(), "MemAvailable: %llu kB", &mem_available);
+          std::sscanf(line.c_str(), "MemAvailable: %zu kB", &mem_available);
           break;
       }
   }
@@ -4222,6 +4484,8 @@ void commExecInfo(std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos, int
 
         kernel_exec_info.device_index = kernel_sched_info.exec_device;
         kernel_exec_info.num_parts = kernel_sched_info.num_parts;
+        kernel_exec_info.persistent_split =
+            kernel_sched_info.persistent_split;
         kernel_exec_info.split_devices = kernel_sched_info.split_devices;
       }
       else {

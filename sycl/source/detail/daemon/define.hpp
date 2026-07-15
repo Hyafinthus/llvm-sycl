@@ -65,8 +65,10 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 // run an ablation without changing the Split execution/merge implementation.
 #if defined(SCHEDULE_OFFLINE) && defined(SNMD_OFFLINE)
 
-// P1: A Split producer exposes one complete version on a deterministic merge
-// device. The daemon and handler must use the same source-of-truth device.
+// P1: Ordinary Split exposes one complete version on a deterministic merge
+// device. An explicitly contracted persistent Split may instead expose the
+// ordered set of part devices until an incompatible edge or user fence forces
+// that same canonical fallback.
 #define SNMD_OFFLINE_CANONICAL_MERGE 1
 
 // P2: Permit one bounded cold Split mode only for a long, narrow-DAG kernel

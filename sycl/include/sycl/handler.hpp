@@ -37,6 +37,7 @@
 #include <sycl/stl.hpp>
 #include <sycl/usm/usm_pointer_info.hpp>
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1495,6 +1496,31 @@ public:
   event resubmit(detail::SyclKernelCg &sycl_kernel_cg);
   event scheduleOffline();
 
+  /// Declares that this kernel accesses the given accessor only inside the
+  /// dim-0 partition owned by the work-item's Split part. This experimental
+  /// SNMD contract lets the runtime retain a writable partition on its device
+  /// across compatible Split kernels. The declaration is intentionally per
+  /// accessor: replicated coefficient tables and halo/global reads must not be
+  /// marked partition-local.
+  template <typename DataT, int Dims, access::mode AccMode,
+            access::target AccTarget, access::placeholder IsPlaceholder>
+  void ext_snmd_partition_local(
+      accessor<DataT, Dims, AccMode, AccTarget, IsPlaceholder> Acc) {
+#ifndef __SYCL_DEVICE_ONLY__
+    static_assert(AccTarget != access::target::local,
+                  "local accessors cannot be SNMD buffer partitions");
+    detail::AccessorBaseHost *AccBase =
+        reinterpret_cast<detail::AccessorBaseHost *>(&Acc);
+    detail::AccessorImplPtr AccImpl = detail::getSyclObjImpl(*AccBase);
+    if (AccImpl && AccImpl->MSYCLMemObj != nullptr &&
+        std::find(MSNMDPartitionLocalReqs.begin(),
+                  MSNMDPartitionLocalReqs.end(), AccImpl.get()) ==
+            MSNMDPartitionLocalReqs.end()) {
+      MSNMDPartitionLocalReqs.push_back(AccImpl.get());
+    }
+#endif
+  }
+
   template <auto &SpecName>
   void set_specialization_constant(
       typename std::remove_reference_t<decltype(SpecName)>::value_type Value) {
@@ -2825,6 +2851,8 @@ private:
   std::vector<detail::ArgDesc> MAssociatedAccesors;
   /// The list of requirements to the memory objects for the scheduling.
   std::vector<detail::AccessorImplHost *> MRequirements;
+  /// Accessor requirements covered by the explicit dim-0 partition contract.
+  std::vector<detail::AccessorImplHost *> MSNMDPartitionLocalReqs;
   /// Struct that encodes global size, local size, ...
   detail::NDRDescT MNDRDesc;
   std::string MKernelName;

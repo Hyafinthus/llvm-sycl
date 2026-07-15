@@ -110,6 +110,12 @@ CGExecKernel::cloneForSplit(const NDRDescT &NewNDR) const {
     if (AccessorImplHost *MappedReq = FindMappedReq(Req))
       Req = MappedReq;
   }
+  std::vector<AccessorImplHost *> PartitionLocalReqsCopy;
+  PartitionLocalReqsCopy.reserve(MSNMDPartitionLocalReqs.size());
+  for (AccessorImplHost *Req : MSNMDPartitionLocalReqs) {
+    if (AccessorImplHost *MappedReq = FindMappedReq(Req))
+      PartitionLocalReqsCopy.push_back(MappedReq);
+  }
 
   auto ArgsCopy = MArgs; // vector<ArgDesc>
   auto RemapReqArgPtr = [&ReqMap](void *Ptr) -> void * {
@@ -170,7 +176,9 @@ CGExecKernel::cloneForSplit(const NDRDescT &NewNDR) const {
       MStreams, // vector<shared_ptr<...>> 值拷贝 共享资源
       MAuxiliaryResources, // vector<shared_ptr<const void>> 共享资源
       MType,
-      MKernelCacheConfig);
+      MKernelCacheConfig,
+      {},
+      std::move(PartitionLocalReqsCopy));
 }
 
 } // namespace detail

@@ -147,6 +147,7 @@ public:
   std::vector<std::shared_ptr<detail::stream_impl>> MStreams;
   std::vector<std::shared_ptr<const void>> MAuxiliaryResources;
   RT::PiKernelCacheConfig MKernelCacheConfig;
+  std::vector<AccessorImplHost *> MSNMDPartitionLocalReqs;
 
   CGExecKernel(NDRDescT NDRDesc, std::unique_ptr<HostKernelBase> HKernel,
                std::shared_ptr<detail::kernel_impl> SyclKernel,
@@ -161,7 +162,8 @@ public:
                std::vector<std::shared_ptr<detail::stream_impl>> Streams,
                std::vector<std::shared_ptr<const void>> AuxiliaryResources,
                CGTYPE Type, RT::PiKernelCacheConfig KernelCacheConfig,
-               detail::code_location loc = {})
+               detail::code_location loc = {},
+               std::vector<AccessorImplHost *> SNMDPartitionLocalReqs = {})
       : CG(Type, std::move(ArgsStorage), std::move(AccStorage),
            std::move(SharedPtrStorage), std::move(Requirements),
            std::move(Events), std::move(loc)),
@@ -171,7 +173,8 @@ public:
         MKernelName(std::move(KernelName)), MOSModuleHandle(OSModuleHandle),
         MStreams(std::move(Streams)),
         MAuxiliaryResources(std::move(AuxiliaryResources)),
-        MKernelCacheConfig(std::move(KernelCacheConfig)) {
+        MKernelCacheConfig(std::move(KernelCacheConfig)),
+        MSNMDPartitionLocalReqs(std::move(SNMDPartitionLocalReqs)) {
     assert((getType() == RunOnHostIntel || getType() == Kernel) &&
            "Wrong type of exec kernel CG.");
   }

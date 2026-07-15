@@ -323,6 +323,7 @@ public:
 
 #ifdef SNMD_OFFLINE
   size_t NumParts = 1; // 默认值 由hanlder修改 在addCG中读取并重置
+  bool PersistentSplit = false;
   std::vector<int> SplitDevices; // daemon选择的实际split设备index
   std::vector<detail::QueueImplPtr> SplitQueues_Write; // Q_G0 Q_G1
   std::vector<detail::EventImplPtr> SplitEvents; // events for async split parts
