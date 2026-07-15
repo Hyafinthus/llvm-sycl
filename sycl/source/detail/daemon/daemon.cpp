@@ -64,12 +64,15 @@ std::vector<int> ranks_idle;
 std::mutex monitor_state_mutex;
 
 // ====【Algorithm】
-std::vector<std::vector<ComputeCapability>> gpu_capability; // 不同rank的设备算力, 包含fp32/fp64两套归一化能力
-std::vector<std::vector<double>> gpu_available_time; // 不同gpu的可用时间 monitor查看空闲？不空闲怎么做
-std::vector<std::vector<double>> gpu_service_time_scale;
-std::vector<std::vector<double>> gpu_memory_available_kib;
-std::vector<int> gpu_comm_profile_ids;
-std::mutex offline_scheduler_mutex;
+// Each application daemon thread owns one scheduling context. Shared monitor
+// and profile tables are sampled into these thread-local vectors; keeping the
+// mutable HEFT/completion calendar process-global would either race between
+// applications or require holding a global lock for the full kernel window.
+thread_local std::vector<std::vector<ComputeCapability>> gpu_capability;
+thread_local std::vector<std::vector<double>> gpu_available_time;
+thread_local std::vector<std::vector<double>> gpu_service_time_scale;
+thread_local std::vector<std::vector<double>> gpu_memory_available_kib;
+thread_local std::vector<int> gpu_comm_profile_ids;
 int local_comm_profile_id = -1;
 
 static std::vector<MonitorInfo> snapshotLocalMonitorInfo() {
@@ -891,13 +894,28 @@ crossNodeCommProfiles() {
 }
 
 struct TaskCandidate {
+  struct DeviceReservation {
+    int rank = -1;
+    int proc = -1;
+    double ready_time = 0.0;
+  };
+
   int rank = -1;
   int proc = -1;
   int num_parts = 1;
   double start_time = 0.0;
   double finish_time = std::numeric_limits<double>::infinity();
   double exec_cost = std::numeric_limits<double>::infinity();
+  double exec_uncertainty = 0.0;
+  double movement_bytes = 0.0;
   std::vector<int> occupied_procs;
+  std::vector<DeviceReservation> transfer_reservations;
+};
+
+struct DependencyTransferPlan {
+  double ready_time = 0.0;
+  double movement_bytes = 0.0;
+  std::vector<TaskCandidate::DeviceReservation> reservations;
 };
 
 struct NodePlacementState {
@@ -1099,6 +1117,36 @@ static bool lookupExactProfileCost(const std::string &kernel_key, int rank,
   return true;
 }
 
+static bool lookupExactProfileUncertainty(const std::string &kernel_key,
+                                          int rank, int device,
+                                          int num_parts, double &uncertainty,
+                                          int &samples) {
+  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts)};
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
+  auto exact_it = profile_cost_table.find(exact);
+  if (exact_it == profile_cost_table.end() || exact_it->second.samples <= 0) {
+    return false;
+  }
+
+  const ProfileCostEntry &entry = exact_it->second;
+  samples = entry.samples;
+  // We predict the next service time, not only the mean. Runtime jitter is
+  // therefore aleatoric uncertainty and must not vanish as samples grow.
+  const double observed_prediction_uncertainty =
+      samples > 1
+          ? std::sqrt(entry.m2_cost / static_cast<double>(samples - 1))
+          : 0.0;
+  // The capability/profile prior represents epistemic cold-start error and
+  // does shrink as exact observations make this device/mode estimate known.
+  const double prior_uncertainty =
+      std::max(0.001, entry.ewma_cost) *
+      (static_cast<double>(SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT) / 100.0) /
+      std::sqrt(static_cast<double>(samples));
+  uncertainty =
+      std::hypot(observed_prediction_uncertainty, prior_uncertainty);
+  return true;
+}
+
 static bool hasExactProfileCost(const std::string &kernel_key, int rank,
                                 int device, int num_parts) {
   double ignored_cost = 0.0;
@@ -1106,7 +1154,7 @@ static bool hasExactProfileCost(const std::string &kernel_key, int rank,
                                 ignored_cost);
 }
 
-#if defined(SNMD_OFFLINE_SINGLE_FIRST) ||                                  \
+#if defined(SNMD_OFFLINE_COLD_SPLIT_PROBE) ||                              \
     defined(SNMD_OFFLINE_SPLIT_HYSTERESIS) ||                              \
     defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
     defined(SNMD_OFFLINE_SPLIT_STATS)
@@ -1746,6 +1794,41 @@ static double estimateSingleExecCost(DAGNode *node, int rank, int proc) {
   return cold_cost * deviceServiceTimeScale(rank, proc);
 }
 
+static double estimateSingleExecUncertainty(DAGNode *node, int rank, int proc,
+                                            double estimated_cost) {
+  double uncertainty = 0.0;
+  int samples = 0;
+  if (lookupExactProfileUncertainty(profileKeyForNode(node), rank, proc, 1,
+                                    uncertainty, samples)) {
+    return uncertainty * deviceServiceTimeScale(rank, proc);
+  }
+
+  // A capability-scaled profile or a cold estimate has no direct residuals on
+  // this device. Keep its confidence deliberately broad so it cannot trigger
+  // a speculative migration merely because the point estimate is optimistic.
+  return std::max(0.001, estimated_cost) * 0.5;
+}
+
+static std::vector<int> producerSourceProcs(const DAGNode *pre_node) {
+  std::vector<int> source_procs;
+  if (pre_node->num_parts > 1 && !pre_node->split_devices.empty()) {
+#ifdef SNMD_OFFLINE_CANONICAL_MERGE
+    const bool exec_proc_is_part =
+        std::find(pre_node->split_devices.begin(),
+                  pre_node->split_devices.end(), pre_node->exec_proc) !=
+        pre_node->split_devices.end();
+    source_procs.push_back(exec_proc_is_part
+                               ? pre_node->exec_proc
+                               : pre_node->split_devices.front());
+#else
+    source_procs = pre_node->split_devices;
+#endif
+  } else if (pre_node->exec_proc >= 0) {
+    source_procs.push_back(pre_node->exec_proc);
+  }
+  return source_procs;
+}
+
 static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
                                          int rank,
                                          const std::vector<int> &target_procs) {
@@ -1763,25 +1846,9 @@ static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
         comm_bytes, crossRankBandwidthGiB(pre_node->exec_rank, rank)));
   }
 
-  std::vector<int> source_procs;
-  if (pre_node->num_parts > 1 && !pre_node->split_devices.empty()) {
-#ifdef SNMD_OFFLINE_CANONICAL_MERGE
-    // The handler merges all owned write ranges into the scheduler-selected
-    // primary device. Other part devices contain only partition output, not a
-    // complete current version that can satisfy an arbitrary consumer read.
-    const bool exec_proc_is_part =
-        std::find(pre_node->split_devices.begin(),
-                  pre_node->split_devices.end(), pre_node->exec_proc) !=
-        pre_node->split_devices.end();
-    source_procs.push_back(exec_proc_is_part
-                               ? pre_node->exec_proc
-                               : pre_node->split_devices.front());
-#else
-    source_procs = pre_node->split_devices;
-#endif
-  } else {
-    source_procs.push_back(pre_node->exec_proc);
-  }
+  // The handler exposes one complete version on the canonical merge device;
+  // other Split devices contain only their owned partition.
+  const std::vector<int> source_procs = producerSourceProcs(pre_node);
 
   double total_seconds = 0.0;
   for (int dst_proc : target_procs) {
@@ -1810,21 +1877,139 @@ static double estimateCommCostForDevices(DAGNode *node, DAGNode *pre_node,
   return heftCostFromSeconds(total_seconds);
 }
 
-static double dependencyReadyTimeForDevices(DAGNode *node, int rank,
-                                            const std::vector<int> &target_procs) {
-  double latest_predecessor_finish = 0.0;
-  double total_comm_cost = 0.0;
-  for (DAGNode *pre_node : node->depend_on) {
-    latest_predecessor_finish =
-        std::max(latest_predecessor_finish, pre_node->finish_time);
-    total_comm_cost += estimateCommCostForDevices(node, pre_node, rank,
-                                                  target_procs);
+static double calendarReadyTime(
+    const std::vector<std::vector<double>> &calendar, int rank, int proc) {
+  if (rank < 0 || rank >= static_cast<int>(calendar.size()) || proc < 0 ||
+      proc >= static_cast<int>(calendar[rank].size())) {
+    return 0.0;
   }
-  return latest_predecessor_finish + total_comm_cost;
+  return calendar[rank][proc];
 }
 
-static double dependencyReadyTime(DAGNode *node, int rank, int proc) {
-  return dependencyReadyTimeForDevices(node, rank, std::vector<int>{proc});
+static void reserveCalendar(std::vector<std::vector<double>> &calendar,
+                            int rank, int proc, double ready_time) {
+  if (rank < 0 || rank >= static_cast<int>(calendar.size()) || proc < 0 ||
+      proc >= static_cast<int>(calendar[rank].size())) {
+    return;
+  }
+  calendar[rank][proc] = std::max(calendar[rank][proc], ready_time);
+}
+
+static DependencyTransferPlan buildDependencyTransferPlan(
+    DAGNode *node, int target_rank, const std::vector<int> &target_procs) {
+  DependencyTransferPlan plan;
+  if (target_procs.empty()) {
+    return plan;
+  }
+
+  std::vector<std::vector<double>> transfer_calendar = gpu_available_time;
+  for (DAGNode *pre_node : node->depend_on) {
+    if (pre_node == nullptr || pre_node->exec_rank < 0) {
+      continue;
+    }
+
+    const double comm_bytes = getCommBytes(node, pre_node);
+    plan.ready_time = std::max(plan.ready_time, pre_node->finish_time);
+    if (comm_bytes <= 0.0) {
+      continue;
+    }
+
+    const std::vector<int> source_procs = producerSourceProcs(pre_node);
+    if (source_procs.empty()) {
+      plan.ready_time = std::max(
+          plan.ready_time,
+          pre_node->finish_time + estimateCommCostForDevices(
+                                      node, pre_node, target_rank,
+                                      target_procs));
+      plan.movement_bytes += comm_bytes;
+      continue;
+    }
+
+    if (pre_node->exec_rank != target_rank) {
+      // Cross-rank data is materialized once on the primary target. Split's
+      // additional local replication is accounted for by its internal-copy
+      // model.
+      const int dst_proc = target_procs.front();
+      double best_end = std::numeric_limits<double>::infinity();
+      int best_src_proc = -1;
+      for (int src_proc : source_procs) {
+        const double transfer_start = std::max(
+            {pre_node->finish_time,
+             calendarReadyTime(transfer_calendar, pre_node->exec_rank,
+                               src_proc),
+             calendarReadyTime(transfer_calendar, target_rank, dst_proc)});
+        const double transfer_end =
+            transfer_start + heftCostFromSeconds(secondsForBytesAtBandwidth(
+                                 comm_bytes,
+                                 crossRankBandwidthGiB(pre_node->exec_rank,
+                                                       target_rank)));
+        if (transfer_end < best_end) {
+          best_end = transfer_end;
+          best_src_proc = src_proc;
+        }
+      }
+      if (std::isfinite(best_end)) {
+        reserveCalendar(transfer_calendar, pre_node->exec_rank, best_src_proc,
+                        best_end);
+        reserveCalendar(transfer_calendar, target_rank, dst_proc, best_end);
+        plan.ready_time = std::max(plan.ready_time, best_end);
+        plan.movement_bytes += comm_bytes;
+      } else {
+        // In completion-driven mode infinity denotes a genuinely busy
+        // endpoint. Do not silently drop this transfer and dispatch against a
+        // different idle target; wait until a completion releases the source.
+        plan.ready_time = std::numeric_limits<double>::infinity();
+      }
+      continue;
+    }
+
+    for (int dst_proc : target_procs) {
+      if (std::find(source_procs.begin(), source_procs.end(), dst_proc) !=
+          source_procs.end()) {
+        continue;
+      }
+
+      double best_end = std::numeric_limits<double>::infinity();
+      int best_src_proc = -1;
+      for (int src_proc : source_procs) {
+        const double transfer_start = std::max(
+            {pre_node->finish_time,
+             calendarReadyTime(transfer_calendar, target_rank, src_proc),
+             calendarReadyTime(transfer_calendar, target_rank, dst_proc)});
+        const double transfer_end =
+            transfer_start +
+            heftCostFromSeconds(sameRankCopySeconds(
+                target_rank, src_proc, dst_proc, comm_bytes));
+        if (transfer_end < best_end) {
+          best_end = transfer_end;
+          best_src_proc = src_proc;
+        }
+      }
+      if (std::isfinite(best_end)) {
+        reserveCalendar(transfer_calendar, target_rank, best_src_proc,
+                        best_end);
+        reserveCalendar(transfer_calendar, target_rank, dst_proc, best_end);
+        plan.ready_time = std::max(plan.ready_time, best_end);
+        plan.movement_bytes += comm_bytes;
+      } else {
+        plan.ready_time = std::numeric_limits<double>::infinity();
+      }
+    }
+  }
+
+  for (int rank = 0; rank < static_cast<int>(transfer_calendar.size()); ++rank) {
+    for (int proc = 0;
+         proc < static_cast<int>(transfer_calendar[rank].size()); ++proc) {
+      const double original_ready =
+          calendarReadyTime(gpu_available_time, rank, proc);
+      if (transfer_calendar[rank][proc] > original_ready) {
+        plan.reservations.push_back(
+            TaskCandidate::DeviceReservation{rank, proc,
+                                             transfer_calendar[rank][proc]});
+      }
+    }
+  }
+  return plan;
 }
 
 static bool splitWriteRangesMatchDim0(const DAGNode *node, int num_parts) {
@@ -1978,9 +2163,14 @@ static TaskCandidate makeSingleCandidate(DAGNode *node, int rank, int proc) {
   }
 
   const double device_ready = gpu_available_time[rank][proc];
-  const double dep_ready = dependencyReadyTime(node, rank, proc);
-  candidate.start_time = std::max(device_ready, dep_ready);
+  const DependencyTransferPlan transfer_plan =
+      buildDependencyTransferPlan(node, rank, std::vector<int>{proc});
+  candidate.start_time = std::max(device_ready, transfer_plan.ready_time);
   candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
+  candidate.exec_uncertainty =
+      estimateSingleExecUncertainty(node, rank, proc, candidate.exec_cost);
+  candidate.movement_bytes = transfer_plan.movement_bytes;
+  candidate.transfer_reservations = transfer_plan.reservations;
   candidate.finish_time = candidate.start_time + candidate.exec_cost;
   return candidate;
 }
@@ -1998,11 +2188,62 @@ static TaskCandidate makeSingleCandidateNoMemoryFilter(DAGNode *node, int rank,
   }
 
   const double device_ready = gpu_available_time[rank][proc];
-  const double dep_ready = dependencyReadyTime(node, rank, proc);
-  candidate.start_time = std::max(device_ready, dep_ready);
+  const DependencyTransferPlan transfer_plan =
+      buildDependencyTransferPlan(node, rank, std::vector<int>{proc});
+  candidate.start_time = std::max(device_ready, transfer_plan.ready_time);
   candidate.exec_cost = estimateSingleExecCost(node, rank, proc);
+  candidate.exec_uncertainty =
+      estimateSingleExecUncertainty(node, rank, proc, candidate.exec_cost);
+  candidate.movement_bytes = transfer_plan.movement_bytes;
+  candidate.transfer_reservations = transfer_plan.reservations;
   candidate.finish_time = candidate.start_time + candidate.exec_cost;
   return candidate;
+}
+
+static void commitCandidateReservations(const TaskCandidate &candidate) {
+  for (const TaskCandidate::DeviceReservation &reservation :
+       candidate.transfer_reservations) {
+    if (reservation.rank < 0 ||
+        reservation.rank >= static_cast<int>(gpu_available_time.size()) ||
+        reservation.proc < 0 ||
+        reservation.proc >=
+            static_cast<int>(gpu_available_time[reservation.rank].size())) {
+      continue;
+    }
+    gpu_available_time[reservation.rank][reservation.proc] =
+        std::max(gpu_available_time[reservation.rank][reservation.proc],
+                 reservation.ready_time);
+  }
+}
+
+static bool shouldPreferDataLocalCandidate(
+    const TaskCandidate &best_candidate,
+    const TaskCandidate &data_local_candidate) {
+#ifndef SNMD_OFFLINE_UNCERTAINTY_AWARE_MIGRATION
+  (void)best_candidate;
+  (void)data_local_candidate;
+  return false;
+#else
+  if (!std::isfinite(best_candidate.finish_time) ||
+      !std::isfinite(data_local_candidate.finish_time) ||
+      best_candidate.movement_bytes <= 0.0 ||
+      data_local_candidate.movement_bytes > 0.0) {
+    return false;
+  }
+
+  const double predicted_gain =
+      data_local_candidate.finish_time - best_candidate.finish_time;
+  if (predicted_gain <= 0.0) {
+    return true;
+  }
+
+  const double combined_uncertainty =
+      std::hypot(best_candidate.exec_uncertainty,
+                 data_local_candidate.exec_uncertainty);
+  const double confidence_multiplier =
+      static_cast<double>(SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT) / 100.0;
+  return predicted_gain <= confidence_multiplier * combined_uncertainty;
+#endif
 }
 
 static std::vector<NodePlacementState>
@@ -2108,6 +2349,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
         node->num_parts = candidate.num_parts;
         node->split_devices = candidate.occupied_procs;
         node->finish_time = candidate.finish_time;
+        commitCandidateReservations(candidate);
         gpu_available_time[rank][proc] = candidate.finish_time;
       }
 
@@ -2159,15 +2401,6 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
   if (!worthConsideringSplit(node, num_parts)) {
     return candidate;
   }
-#ifdef SNMD_OFFLINE_SINGLE_FIRST
-  const std::string kernel_key = profileKeyForNode(node);
-  if (!hasProfileCostForParts(kernel_key, 1)) {
-    DAEMON_TRACE_STREAM
-        << "algorithmHEFT: Kernel " << node->kernel_count
-        << " split rejected until a single-device profile exists" << std::endl;
-    return candidate;
-  }
-#endif
   if (rank < 0 || rank >= static_cast<int>(gpu_available_time.size()) ||
       static_cast<int>(gpu_available_time[rank].size()) <= num_parts) {
     return candidate;
@@ -2204,13 +2437,15 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
       device_ready = std::max(device_ready, gpu_available_time[rank][proc]);
     }
 
-    const double dep_ready =
-        dependencyReadyTimeForDevices(node, rank, split_devices);
-    const double start_time = std::max(device_ready, dep_ready);
+    const DependencyTransferPlan transfer_plan =
+        buildDependencyTransferPlan(node, rank, split_devices);
+    const double start_time =
+        std::max(device_ready, transfer_plan.ready_time);
     const double exec_cost = estimateSplitExecCost(node, rank, split_devices);
 
 #if defined(SNMD_OFFLINE_SPLIT_HYSTERESIS) ||                              \
-    defined(SNMD_OFFLINE_WIDE_DAG_GUARD)
+    defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
+    defined(SNMD_OFFLINE_COLD_SPLIT_PROBE)
     double best_single_exec = std::numeric_limits<double>::infinity();
     for (int proc : split_devices) {
       best_single_exec =
@@ -2219,6 +2454,22 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
 
     const bool has_split_profile =
         hasProfileCostForParts(profileKeyForNode(node), num_parts);
+#endif
+#ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
+    if (!has_split_profile && std::isfinite(best_single_exec)) {
+      const double max_cold_split_cost =
+          best_single_exec *
+          (100.0 - SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT) / 100.0;
+      if (best_single_exec < SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST ||
+          exec_cost > max_cold_split_cost) {
+        DAEMON_TRACE_STREAM
+            << "algorithmHEFT: Kernel " << node->kernel_count
+            << " cold split probe rejected: split " << exec_cost
+            << " single " << best_single_exec << " min_single "
+            << SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST << std::endl;
+        continue;
+      }
+    }
 #endif
 #ifdef SNMD_OFFLINE_SPLIT_HYSTERESIS
     if (has_split_profile && std::isfinite(best_single_exec)) {
@@ -2264,10 +2515,105 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
       candidate.occupied_procs = split_devices;
       candidate.start_time = start_time;
       candidate.exec_cost = exec_cost;
+      double split_uncertainty = 0.0;
+      int split_samples = 0;
+      if (!lookupExactProfileUncertainty(
+              profileKeyForNode(node), rank, split_devices.front(), num_parts,
+              split_uncertainty, split_samples)) {
+        split_uncertainty = exec_cost * 0.5;
+      } else {
+        double service_scale = 1.0;
+        for (int proc : split_devices) {
+          service_scale =
+              std::max(service_scale, deviceServiceTimeScale(rank, proc));
+        }
+        split_uncertainty *= service_scale;
+      }
+      candidate.exec_uncertainty = split_uncertainty;
+      candidate.movement_bytes = transfer_plan.movement_bytes;
+      candidate.transfer_reservations = transfer_plan.reservations;
       candidate.finish_time = finish_time;
     }
   }
   return candidate;
+}
+
+// Single, Split, monitor scale, profile uncertainty, data movement, and
+// device calendars all meet at this one admission point. Both batch HEFT and
+// the completion-driven dispatcher use it, preventing a second queue-local
+// policy from silently overriding the global scheduler.
+static TaskCandidate selectUnifiedTaskCandidate(DAGNode *node) {
+  TaskCandidate best_candidate;
+  TaskCandidate best_data_local_candidate;
+
+  for (int rank = 0; rank < static_cast<int>(gpu_available_time.size());
+       ++rank) {
+    for (int proc = 0;
+         proc < static_cast<int>(gpu_available_time[rank].size()); ++proc) {
+      TaskCandidate candidate = makeSingleCandidate(node, rank, proc);
+      if (candidate.finish_time < best_candidate.finish_time) {
+        best_candidate = candidate;
+      }
+      if (candidate.movement_bytes <= 0.0 &&
+          candidate.finish_time < best_data_local_candidate.finish_time) {
+        best_data_local_candidate = candidate;
+      }
+    }
+
+    const int max_split_parts =
+        std::min<int>(4,
+                      static_cast<int>(gpu_available_time[rank].size()) - 1);
+    for (int num_parts = 2; num_parts <= max_split_parts; ++num_parts) {
+      if (num_parts % 2 != 0) {
+        continue;
+      }
+      TaskCandidate candidate = makeSplitCandidate(node, rank, num_parts);
+      if (candidate.finish_time < best_candidate.finish_time) {
+        best_candidate = candidate;
+      }
+    }
+  }
+
+#ifdef SNMD_OFFLINE_UNCERTAINTY_AWARE_MIGRATION
+  if (shouldPreferDataLocalCandidate(best_candidate,
+                                     best_data_local_candidate)) {
+    DAEMON_TRACE_STREAM
+        << "selectUnifiedTaskCandidate: Kernel " << node->kernel_count
+        << " keeps data-local placement on Rank "
+        << best_data_local_candidate.rank << " Proc "
+        << best_data_local_candidate.proc << " local_finish "
+        << best_data_local_candidate.finish_time << " migrant_finish "
+        << best_candidate.finish_time << " confidence_margin "
+        << (static_cast<double>(
+                SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT) /
+            100.0) *
+               std::hypot(best_candidate.exec_uncertainty,
+                          best_data_local_candidate.exec_uncertainty)
+        << " avoided_bytes " << best_candidate.movement_bytes << std::endl;
+    best_candidate = best_data_local_candidate;
+  }
+#endif
+
+  if (best_candidate.rank < 0 || best_candidate.proc < 0) {
+    for (int rank = 0;
+         rank < static_cast<int>(gpu_available_time.size()) &&
+         (best_candidate.rank < 0 || best_candidate.proc < 0);
+         ++rank) {
+      for (int proc = 0;
+           proc < static_cast<int>(gpu_available_time[rank].size()); ++proc) {
+        if (!isKernelPlacementProc(rank, proc)) {
+          continue;
+        }
+        best_candidate = makeSingleCandidateNoMemoryFilter(node, rank, proc);
+        break;
+      }
+    }
+  }
+
+  if (best_candidate.rank < 0 || best_candidate.proc < 0) {
+    best_candidate = makeSingleCandidateNoMemoryFilter(node, 0, 0);
+  }
+  return best_candidate;
 }
 
 static double estimateAverageRankCost(DAGNode *node) {
@@ -2336,10 +2682,6 @@ static double estimateAverageCommCost(DAGNode *node, DAGNode *pre_node) {
 void algorithmHEFT(
     std::vector<DAGNode *> &nodes,
     std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
-  // The legacy implementation stores the current HEFT calendar in globals.
-  // Serialize only this short metadata calculation so concurrent application
-  // daemon threads cannot overwrite each other's scheduling context.
-  std::lock_guard<std::mutex> scheduler_lock(offline_scheduler_mutex);
   // Build one scheduling context for this wait-delimited batch. A confirmed
   // completion frontier resets runtime-owned calendars; monitor load appears
   // once as a service-time scale. Device numbering remains aligned with
@@ -2455,55 +2797,14 @@ void algorithmHEFT(
   // 同时把SNMD split作为候选放置方式，选择earliest_finish_p(v)最小者。
   for (int order = 0; order < visited.size(); order++) {
     DAGNode *node = visited[order];
-    TaskCandidate best_candidate;
-
-    for (int rank = 0; rank < gpu_available_time.size(); rank++) {
-      for (int proc = 0; proc < gpu_available_time[rank].size(); proc++) {
-        TaskCandidate candidate = makeSingleCandidate(node, rank, proc);
-        if (candidate.finish_time < best_candidate.finish_time) {
-          best_candidate = candidate;
-        }
-      }
-
-      const int max_split_parts =
-          std::min<int>(4, static_cast<int>(gpu_available_time[rank].size()) - 1);
-      for (int num_parts = 2; num_parts <= max_split_parts; ++num_parts) {
-        if (num_parts % 2 != 0) {
-          continue;
-        }
-        TaskCandidate candidate = makeSplitCandidate(node, rank, num_parts);
-        if (candidate.finish_time < best_candidate.finish_time) {
-          best_candidate = candidate;
-        }
-      }
-    }
-
-    if (best_candidate.rank < 0 || best_candidate.proc < 0) {
-      for (int rank = 0; rank < static_cast<int>(gpu_available_time.size()) &&
-                         (best_candidate.rank < 0 ||
-                          best_candidate.proc < 0);
-           rank++) {
-        for (int proc = 0;
-             proc < static_cast<int>(gpu_available_time[rank].size());
-             proc++) {
-          if (!isKernelPlacementProc(rank, proc)) {
-            continue;
-          }
-          best_candidate = makeSingleCandidateNoMemoryFilter(node, rank, proc);
-          break;
-        }
-      }
-    }
-
-    if (best_candidate.rank < 0 || best_candidate.proc < 0) {
-      best_candidate = makeSingleCandidateNoMemoryFilter(node, 0, 0);
-    }
+    TaskCandidate best_candidate = selectUnifiedTaskCandidate(node);
 
     node->exec_rank = best_candidate.rank;
     node->exec_proc = best_candidate.proc;
     node->num_parts = best_candidate.num_parts;
     node->split_devices = best_candidate.occupied_procs;
     node->finish_time = best_candidate.finish_time;
+    commitCandidateReservations(best_candidate);
     for (int proc : best_candidate.occupied_procs) {
       gpu_available_time[node->exec_rank][proc] = node->finish_time;
     }
@@ -2528,6 +2829,10 @@ void algorithmHEFT(
     DAEMON_TRACE_STREAM
               << " start_time " << best_candidate.start_time
               << " exec_cost " << best_candidate.exec_cost
+              << " exec_uncertainty " << best_candidate.exec_uncertainty
+              << " movement_bytes " << best_candidate.movement_bytes
+              << " transfer_reservations "
+              << best_candidate.transfer_reservations.size()
               << " finish_time " << node->finish_time << std::endl;
   }
 
@@ -2591,6 +2896,396 @@ void algorithmHEFT(
   // 通信代价和贪心避免了扩张代价大于运行代价
 
 }
+
+#ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
+enum class CompletionNodePhase { Pending, Dispatched, Complete };
+
+struct CompletionNodeRuntimeState {
+  CompletionNodePhase phase = CompletionNodePhase::Pending;
+  std::vector<std::pair<int, int>> reserved_devices;
+};
+
+enum class CompletionWindowResult {
+  Completed,
+  ExitRequested,
+  FailedBeforeStart,
+  FailedAfterStart
+};
+
+static bool completionDrivenQueueRuntimeEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("SYCL_SNMD_COMPLETION_QUEUE");
+    if (env == nullptr) {
+      return true;
+    }
+    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+           std::strcmp(env, "FALSE") != 0;
+  }();
+  return enabled;
+}
+
+static bool completionNodeReady(
+    DAGNode *node, const std::unordered_set<DAGNode *> &window_nodes,
+    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states) {
+  for (DAGNode *predecessor : node->depend_on) {
+    if (!window_nodes.count(predecessor)) {
+      continue;
+    }
+    auto state_it = states.find(predecessor);
+    if (state_it == states.end() ||
+        state_it->second.phase != CompletionNodePhase::Complete) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void resetCompletionWindowCalendar(const std::vector<DAGNode *> &nodes) {
+  for (std::vector<double> &rank_calendar : gpu_available_time) {
+    std::fill(rank_calendar.begin(), rank_calendar.end(), 0.0);
+  }
+  for (DAGNode *node : nodes) {
+    node->exec_rank = -1;
+    node->exec_proc = -1;
+    node->num_parts = 1;
+    node->split_devices.clear();
+    node->finish_time = 0.0;
+  }
+}
+
+static std::vector<std::pair<int, int>>
+completionCandidateReservations(const TaskCandidate &candidate) {
+  std::set<std::pair<int, int>> unique_devices;
+  for (int proc : candidate.occupied_procs) {
+    unique_devices.insert({candidate.rank, proc});
+  }
+  return std::vector<std::pair<int, int>>(unique_devices.begin(),
+                                          unique_devices.end());
+}
+
+static void clearCompletionEphemeralTransferCalendar() {
+  for (std::vector<double> &rank_calendar : gpu_available_time) {
+    for (double &ready_time : rank_calendar) {
+      // Infinity is an in-flight compute/gang reservation and survives until
+      // completion. Finite transfer times only serialize admission within the
+      // dispatch wave; stable in-order queues preserve the actual copy order.
+      if (std::isfinite(ready_time)) {
+        ready_time = 0.0;
+      }
+    }
+  }
+}
+
+static void setCompletionDevicesBusy(
+    const std::vector<std::pair<int, int>> &devices, bool busy) {
+  for (const std::pair<int, int> &device : devices) {
+    const int rank = device.first;
+    const int proc = device.second;
+    if (rank < 0 || rank >= static_cast<int>(gpu_available_time.size()) ||
+        proc < 0 ||
+        proc >= static_cast<int>(gpu_available_time[rank].size())) {
+      continue;
+    }
+    gpu_available_time[rank][proc] =
+        busy ? std::numeric_limits<double>::infinity() : 0.0;
+  }
+}
+
+static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
+    const std::vector<DAGNode *> &priority_order,
+    const std::unordered_set<DAGNode *> &window_nodes,
+    std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states,
+    int &dispatch_order) {
+  struct PlannedDispatch {
+    D2SKernelExecInfo exec_info;
+    double movement_bytes = 0.0;
+    size_t compute_reservations = 0;
+  };
+  std::vector<PlannedDispatch> planned_dispatches;
+  while (true) {
+    DAGNode *selected_node = nullptr;
+    TaskCandidate selected_candidate;
+
+    for (DAGNode *node : priority_order) {
+      CompletionNodeRuntimeState &state = states[node];
+      if (state.phase != CompletionNodePhase::Pending ||
+          !completionNodeReady(node, window_nodes, states)) {
+        continue;
+      }
+
+      TaskCandidate candidate = selectUnifiedTaskCandidate(node);
+      if (!std::isfinite(candidate.finish_time)) {
+        continue;
+      }
+      // The completion-driven path is deliberately single-rank until remote
+      // completion acknowledgements and failure recovery are implemented.
+      if (candidate.rank != 0) {
+        continue;
+      }
+      selected_node = node;
+      selected_candidate = std::move(candidate);
+      break;
+    }
+
+    if (selected_node == nullptr) {
+      break;
+    }
+
+    selected_node->exec_rank = selected_candidate.rank;
+    selected_node->exec_proc = selected_candidate.proc;
+    selected_node->num_parts = selected_candidate.num_parts;
+    selected_node->split_devices = selected_candidate.occupied_procs;
+    selected_node->finish_time = selected_candidate.finish_time;
+
+    CompletionNodeRuntimeState &selected_state = states[selected_node];
+    selected_state.phase = CompletionNodePhase::Dispatched;
+    selected_state.reserved_devices =
+        completionCandidateReservations(selected_candidate);
+    // Reserve copy endpoints while selecting the remainder of this dispatch
+    // wave, but do not hold a source GPU for the target kernel's full compute
+    // duration. That old lifetime turns a millisecond migration into a
+    // multi-second false occupancy and recreates the skipped-GPU symptom.
+    commitCandidateReservations(selected_candidate);
+    setCompletionDevicesBusy(selected_state.reserved_devices, true);
+
+    D2SKernelExecInfo exec_info;
+    exec_info.kernel_count = selected_node->kernel_count;
+    exec_info.exec = true;
+    exec_info.device_index = selected_node->exec_proc;
+    exec_info.num_parts = selected_node->num_parts;
+    exec_info.split_devices = selected_node->split_devices;
+    planned_dispatches.push_back(
+        {std::move(exec_info), selected_candidate.movement_bytes,
+         selected_state.reserved_devices.size()});
+  }
+  clearCompletionEphemeralTransferCalendar();
+
+  // resubmit() may synchronously prepare cross-context data. Submit all
+  // zero-movement work first so one legitimate migration cannot delay host
+  // submission to otherwise idle GPUs in the same ready wave. Candidates and
+  // resource ownership are unchanged; this is an execution order of the
+  // daemon-approved set, not a second placement policy in the handler.
+  std::stable_partition(
+      planned_dispatches.begin(), planned_dispatches.end(),
+      [](const PlannedDispatch &dispatch) {
+        return dispatch.movement_bytes <= 0.0;
+      });
+
+  std::vector<D2SKernelExecInfo> dispatches;
+  dispatches.reserve(planned_dispatches.size());
+  for (PlannedDispatch &dispatch : planned_dispatches) {
+    DAEMON_TRACE_STREAM
+        << "CompletionQueue: dispatch_order " << ++dispatch_order
+        << " kernel " << dispatch.exec_info.kernel_count << " rank 0 proc "
+        << dispatch.exec_info.device_index << " parts "
+        << dispatch.exec_info.num_parts << " movement_bytes "
+        << dispatch.movement_bytes << " reserved_devices "
+        << dispatch.compute_reservations << std::endl;
+    dispatches.push_back(std::move(dispatch.exec_info));
+  }
+  return dispatches;
+}
+
+static size_t countCompletionPhase(
+    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states,
+    CompletionNodePhase phase) {
+  size_t count = 0;
+  for (const auto &entry : states) {
+    count += entry.second.phase == phase ? 1 : 0;
+  }
+  return count;
+}
+
+static bool sendCompletionDispatchBatch(
+    mqd_t mq_id_program, const std::vector<D2SKernelExecInfo> &dispatches,
+    bool window_complete, bool window_failed = false) {
+  D2SDispatchBatchData batch;
+  batch.completion_driven = true;
+  batch.window_complete = window_complete;
+  batch.window_failed = window_failed;
+  batch.kernel_exec_infos = dispatches;
+  const std::string payload = batch.serialize();
+  sendOfflineMqPayload(mq_id_program, payload, MAX_MSG_PROGRAM_SIZE,
+                       "completion dispatch batch");
+  return true;
+}
+
+static CompletionWindowResult runCompletionDrivenWindow(
+    const std::vector<DAGNode *> &nodes, int daemon_wait_count, int local_pid,
+    mqd_t mq_id_daemon) {
+  if (nodes.empty()) {
+    return CompletionWindowResult::FailedBeforeStart;
+  }
+
+  char queue_name[MESSAGE_QUEUE_PROGRAM_NAME_MAX];
+  std::snprintf(queue_name, sizeof(queue_name), MESSAGE_QUEUE_PROGRAM_PATTERN,
+                local_pid);
+  mqd_t mq_id_program = mq_open(queue_name, O_WRONLY);
+  if (mq_id_program == static_cast<mqd_t>(-1)) {
+    perror("completion queue mq_id_program open failed");
+    return CompletionWindowResult::FailedBeforeStart;
+  }
+
+  std::vector<DAGNode *> priority_order = nodes;
+  std::stable_sort(priority_order.begin(), priority_order.end(),
+                   [](const DAGNode *lhs, const DAGNode *rhs) {
+                     return lhs->rank_u > rhs->rank_u;
+                   });
+  std::unordered_set<DAGNode *> window_nodes(nodes.begin(), nodes.end());
+  std::unordered_map<DAGNode *, CompletionNodeRuntimeState> states;
+  for (DAGNode *node : nodes) {
+    states.emplace(node, CompletionNodeRuntimeState{});
+  }
+  // algorithmHEFT has already produced the batch-static fallback before this
+  // function is entered. Preserve its DAG placement as well as its serialized
+  // exec infos until the first dynamic dispatch commits the new protocol.
+  const std::vector<NodePlacementState> static_fallback_states =
+      saveNodePlacementStates(nodes);
+  const std::vector<std::vector<double>> static_fallback_calendar =
+      gpu_available_time;
+  resetCompletionWindowCalendar(nodes);
+
+  int dispatch_order = 0;
+  bool protocol_started = false;
+  while (true) {
+    std::vector<D2SKernelExecInfo> dispatches =
+        dispatchCompletionReadyNodes(priority_order, window_nodes, states,
+                                     dispatch_order);
+    const size_t complete_count =
+        countCompletionPhase(states, CompletionNodePhase::Complete);
+    const size_t dispatched_count =
+        countCompletionPhase(states, CompletionNodePhase::Dispatched);
+    const bool window_complete = complete_count == nodes.size();
+
+    if (!window_complete && dispatches.empty() && dispatched_count == 0) {
+      std::cerr << "CompletionQueue: no ready or in-flight kernel in wait "
+                << daemon_wait_count << std::endl;
+      if (protocol_started) {
+        sendCompletionDispatchBatch(mq_id_program, {}, false, true);
+      } else {
+        restoreNodePlacementStates(nodes, static_fallback_states);
+        gpu_available_time = static_fallback_calendar;
+      }
+      mq_close(mq_id_program);
+      return protocol_started ? CompletionWindowResult::FailedAfterStart
+                              : CompletionWindowResult::FailedBeforeStart;
+    }
+
+    sendCompletionDispatchBatch(mq_id_program, dispatches, window_complete);
+    protocol_started = true;
+    if (window_complete) {
+      DAEMON_TRACE_STREAM << "CompletionQueue: wait " << daemon_wait_count
+                          << " complete kernels " << complete_count
+                          << std::endl;
+      mq_close(mq_id_program);
+      return CompletionWindowResult::Completed;
+    }
+
+    const std::string payload = receiveOfflineMqPayload(
+        mq_id_daemon, MAX_MSG_DAEMON_SIZE, "completion acknowledgement");
+    if (payload == "EXIT") {
+      mq_close(mq_id_program);
+      return CompletionWindowResult::ExitRequested;
+    }
+    if (!S2DCompletionBatchData::isCompletionBatch(payload)) {
+      std::cerr << "CompletionQueue: expected completion batch for wait "
+                << daemon_wait_count << std::endl;
+      sendCompletionDispatchBatch(mq_id_program, {}, false, true);
+      mq_close(mq_id_program);
+      return CompletionWindowResult::FailedAfterStart;
+    }
+
+    S2DCompletionBatchData completion_batch =
+        S2DCompletionBatchData::deserialize(payload);
+    if (completion_batch.wait_count != daemon_wait_count) {
+      std::cerr << "CompletionQueue: invalid completion batch wait "
+                << completion_batch.wait_count << " expected "
+                << daemon_wait_count << std::endl;
+      sendCompletionDispatchBatch(mq_id_program, {}, false, true);
+      mq_close(mq_id_program);
+      return CompletionWindowResult::FailedAfterStart;
+    }
+    if (completion_batch.window_failed) {
+      std::cerr << "CompletionQueue: handler reported failure for wait "
+                << daemon_wait_count << std::endl;
+      mq_close(mq_id_program);
+      return CompletionWindowResult::FailedAfterStart;
+    }
+    if (completion_batch.completions.empty()) {
+      std::cerr << "CompletionQueue: invalid completion batch wait "
+                << completion_batch.wait_count << " expected "
+                << daemon_wait_count << std::endl;
+      sendCompletionDispatchBatch(mq_id_program, {}, false, true);
+      mq_close(mq_id_program);
+      return CompletionWindowResult::FailedAfterStart;
+    }
+
+    std::unordered_set<int> completion_kernel_counts;
+    for (const S2DKernelProfileData &completion :
+         completion_batch.completions) {
+      auto node_it = std::find_if(
+          nodes.begin(), nodes.end(), [&](const DAGNode *node) {
+            return node->kernel_count == completion.kernel_count;
+          });
+      if (node_it == nodes.end()) {
+        std::cerr << "CompletionQueue: unknown completed kernel "
+                  << completion.kernel_count << std::endl;
+        sendCompletionDispatchBatch(mq_id_program, {}, false, true);
+        mq_close(mq_id_program);
+        return CompletionWindowResult::FailedAfterStart;
+      }
+      DAGNode *node = *node_it;
+      CompletionNodeRuntimeState &state = states[node];
+      if (state.phase != CompletionNodePhase::Dispatched ||
+          !completion_kernel_counts.insert(completion.kernel_count).second) {
+        std::cerr << "CompletionQueue: duplicate or non-dispatched completion "
+                  << completion.kernel_count << std::endl;
+        sendCompletionDispatchBatch(mq_id_program, {}, false, true);
+        mq_close(mq_id_program);
+        return CompletionWindowResult::FailedAfterStart;
+      }
+    }
+
+    for (const S2DKernelProfileData &completion :
+         completion_batch.completions) {
+      DAGNode *node = *std::find_if(
+          nodes.begin(), nodes.end(), [&](const DAGNode *candidate) {
+            return candidate->kernel_count == completion.kernel_count;
+          });
+      CompletionNodeRuntimeState &state = states[node];
+      setCompletionDevicesBusy(state.reserved_devices, false);
+      state.reserved_devices.clear();
+      state.phase = CompletionNodePhase::Complete;
+      const int actual_parts = std::max(1, completion.num_parts);
+      if (node->exec_proc != completion.device_index ||
+          node->num_parts != actual_parts) {
+        DAEMON_TRACE_STREAM
+            << "CompletionQueue: handler adjusted kernel "
+            << completion.kernel_count << " from proc " << node->exec_proc
+            << " parts " << node->num_parts << " to proc "
+            << completion.device_index << " parts " << actual_parts
+            << std::endl;
+      }
+      node->exec_rank = 0;
+      node->exec_proc = completion.device_index;
+      node->num_parts = actual_parts;
+      if (actual_parts <= 1) {
+        node->split_devices.clear();
+      } else if (node->split_devices.size() >
+                 static_cast<size_t>(actual_parts)) {
+        node->split_devices.resize(actual_parts);
+      }
+      node->finish_time = 0.0;
+      updateProfileCostTable(completion, 0);
+      DAEMON_TRACE_STREAM << "CompletionQueue: complete kernel "
+                          << completion.kernel_count << " device "
+                          << completion.device_index << " parts "
+                          << completion.num_parts << " duration_ns "
+                          << completion.duration_ns << std::endl;
+    }
+  }
+}
+#endif
 
 // ========【Offline End】
 
@@ -3892,6 +4587,9 @@ void *SystemSchedulerDaemonOffline(void *arg) {
     // ====【调度决策并发给其他rank】
     std::vector<D2DKernelSchedInfo> kernel_sched_order_infos;
     std::vector<int> scale_ranks;
+    bool completion_window_handled = false;
+    bool completion_exit_requested = false;
+    bool completion_protocol_failed = false;
     {
       // 算法计算适合的rank数 以及每个kernel的执行顺序和device 需要同时考虑每个rank的device空闲
       if (daemon_rank == master_rank) {
@@ -3913,6 +4611,23 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         // 2. 调度算法 更新node和sched_info
         algorithmHEFT(nodes, kernel_sched_order_infos);
         DAEMON_TRACE_STREAM << "Rank " << daemon_rank << " TEST kernel_sched_order_infos size: " << kernel_sched_order_infos.size() << std::endl;
+
+#ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
+        if (daemon_size == 1 && onrun_size == 1 &&
+            completionDrivenQueueRuntimeEnabled()) {
+          const CompletionWindowResult result = runCompletionDrivenWindow(
+              nodes, daemon_wait_count, local_pid, mq_id_daemon);
+          completion_window_handled =
+              result == CompletionWindowResult::Completed;
+          completion_exit_requested =
+              result == CompletionWindowResult::ExitRequested;
+          completion_protocol_failed =
+              result == CompletionWindowResult::FailedAfterStart;
+          if (completion_window_handled || completion_exit_requested) {
+            kernel_sched_order_infos.clear();
+          }
+        }
+#endif
 
         // TEST-START ===【固定测试】
         // globalDevices只取掉了加速器 0号是CPU
@@ -4010,6 +4725,25 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         //   }
         // }
         // std::sort(kernel_sched_order_infos.begin(), kernel_sched_order_infos.end());
+      }
+
+      if (completion_exit_requested) {
+        flushOfflineProfilesOnExit(
+            comm_daemon, daemon_rank, master_rank,
+            globalcount_to_onrun[syclapp_count], pending_profile_sends,
+            finished_profile_ranks);
+        mq_close(mq_id_daemon);
+        return NULL;
+      }
+      if (completion_protocol_failed) {
+        std::cerr << "CompletionQueue: terminating scheduler thread after "
+                     "an in-window protocol failure"
+                  << std::endl;
+        mq_close(mq_id_daemon);
+        return NULL;
+      }
+      if (completion_window_handled) {
+        continue;
       }
 
       // DELE 这里写错了 scale_ranks填充逻辑没写

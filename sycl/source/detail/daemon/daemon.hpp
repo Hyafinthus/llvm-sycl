@@ -49,6 +49,8 @@ enum class acc_mode {
 #define MESSAGE_QUEUE_PROGRAM_PATTERN "/sycl_mq_program_%d" // pid
 
 #define S2D_PROFILE_BATCH_TAG "PROFILE_BATCH"
+#define S2D_COMPLETION_BATCH_TAG "COMPLETION_BATCH_V1"
+#define D2S_DISPATCH_BATCH_TAG "DISPATCH_BATCH_V1"
 
 // D2D: Daemon to Daemon
 // D2S: Daemon to SYCL
@@ -321,6 +323,53 @@ struct S2DProfileBatchData {
   }
 };
 
+// A completion is also a profile sample when duration_ns is available. A
+// zero duration remains a valid completion acknowledgement and must release
+// scheduler resources without contaminating the cost model.
+struct S2DCompletionBatchData {
+  int wait_count = 0;
+  bool window_failed = false;
+  std::vector<S2DKernelProfileData> completions;
+
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << S2D_COMPLETION_BATCH_TAG << "\n"
+        << wait_count << "\n"
+        << window_failed << "\n"
+        << completions.size() << "\n";
+    for (const S2DKernelProfileData &completion : completions) {
+      oss << completion.serialize();
+    }
+    return oss.str();
+  }
+
+  static bool isCompletionBatch(const std::string &data) {
+    std::istringstream iss(data);
+    std::string tag;
+    std::getline(iss, tag);
+    return tag == S2D_COMPLETION_BATCH_TAG;
+  }
+
+  static S2DCompletionBatchData deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    std::string tag;
+    std::getline(iss, tag);
+    S2DCompletionBatchData batch;
+    if (tag != S2D_COMPLETION_BATCH_TAG) {
+      return batch;
+    }
+    size_t completion_count = 0;
+    iss >> batch.wait_count;
+    iss >> batch.window_failed;
+    iss >> completion_count;
+    iss.ignore();
+    for (size_t i = 0; i < completion_count; ++i) {
+      batch.completions.push_back(S2DKernelProfileData::deserialize(iss));
+    }
+    return batch;
+  }
+};
+
 struct D2DKernelSchedInfo { // daemon间广播(发送)的一个kernel由哪个rank执行的信息
   // std::string kernel_id; // 没有kernel这个对象 CommandGroup还未创建
   int kernel_count; // 是一个SYCL进程中kernel的唯一标识 体现在用户代码的顺序中
@@ -467,8 +516,7 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     return oss.str();
   }
 
-  static D2SKernelExecInfo deserialize(const std::string &data) {
-    std::istringstream iss(data);
+  static D2SKernelExecInfo deserialize(std::istream &iss) {
     D2SKernelExecInfo kernel_info;
 
     iss >> kernel_info.kernel_count;
@@ -498,6 +546,58 @@ struct D2SKernelExecInfo { // daemon向SYCL进程发送的一个kernel是否执�
     }
 
     return kernel_info;
+  }
+
+  static D2SKernelExecInfo deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    return deserialize(iss);
+  }
+};
+
+struct D2SDispatchBatchData {
+  bool completion_driven = false;
+  bool window_complete = false;
+  bool window_failed = false;
+  std::vector<D2SKernelExecInfo> kernel_exec_infos;
+
+  std::string serialize() const {
+    std::ostringstream oss;
+    oss << D2S_DISPATCH_BATCH_TAG << "\n"
+        << completion_driven << "\n"
+        << window_complete << "\n"
+        << window_failed << "\n"
+        << kernel_exec_infos.size() << "\n";
+    for (const D2SKernelExecInfo &info : kernel_exec_infos) {
+      oss << info.serialize();
+    }
+    return oss.str();
+  }
+
+  static bool isDispatchBatch(const std::string &data) {
+    std::istringstream iss(data);
+    std::string tag;
+    std::getline(iss, tag);
+    return tag == D2S_DISPATCH_BATCH_TAG;
+  }
+
+  static D2SDispatchBatchData deserialize(const std::string &data) {
+    std::istringstream iss(data);
+    std::string tag;
+    std::getline(iss, tag);
+    D2SDispatchBatchData batch;
+    if (tag != D2S_DISPATCH_BATCH_TAG) {
+      return batch;
+    }
+    size_t info_count = 0;
+    iss >> batch.completion_driven;
+    iss >> batch.window_complete;
+    iss >> batch.window_failed;
+    iss >> info_count;
+    iss.ignore();
+    for (size_t i = 0; i < info_count; ++i) {
+      batch.kernel_exec_infos.push_back(D2SKernelExecInfo::deserialize(iss));
+    }
+    return batch;
   }
 };
 

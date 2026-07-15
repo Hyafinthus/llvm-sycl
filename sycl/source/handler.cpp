@@ -11,8 +11,10 @@
 #include <chrono>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -65,6 +67,7 @@ struct OfflineProfileEvent {
   // makes profile collection independent of the deferred command-group
   // lifetime and is required by a future asynchronous completion path.
   std::string KernelKey;
+  uint64_t MaterializationNs = 0;
 };
 
 namespace sycl {
@@ -235,6 +238,29 @@ parseOfflineKernelExecInfos(const std::string &ReceivedData) {
   }
 
   return KernelExecInfos;
+}
+
+struct ParsedOfflineDispatchBatch {
+  bool CompletionDriven = false;
+  bool WindowComplete = false;
+  bool WindowFailed = false;
+  std::vector<D2SKernelExecInfo> KernelExecInfos;
+};
+
+static ParsedOfflineDispatchBatch
+parseOfflineDispatchBatch(const std::string &ReceivedData) {
+  ParsedOfflineDispatchBatch Parsed;
+  if (D2SDispatchBatchData::isDispatchBatch(ReceivedData)) {
+    D2SDispatchBatchData Batch =
+        D2SDispatchBatchData::deserialize(ReceivedData);
+    Parsed.CompletionDriven = Batch.completion_driven;
+    Parsed.WindowComplete = Batch.window_complete;
+    Parsed.WindowFailed = Batch.window_failed;
+    Parsed.KernelExecInfos = std::move(Batch.kernel_exec_infos);
+    return Parsed;
+  }
+  Parsed.KernelExecInfos = parseOfflineKernelExecInfos(ReceivedData);
+  return Parsed;
 }
 
 static property_list
@@ -635,6 +661,7 @@ struct OfflineSplitStats {
   uint64_t InputDirectD2DBytes = 0;
   uint64_t InputD2HBytes = 0;
   uint64_t InputH2DBytes = 0;
+  uint64_t ReusedReadReplicaBytes = 0;
   uint64_t MergeDirectD2DBytes = 0;
   uint64_t MergeD2HBytes = 0;
   uint64_t MergeH2DBytes = 0;
@@ -672,6 +699,8 @@ static void printAndResetOfflineSplitStats() {
             << " input_direct_d2d_bytes=" << Stats.InputDirectD2DBytes
             << " input_d2h_bytes=" << Stats.InputD2HBytes
             << " input_h2d_bytes=" << Stats.InputH2DBytes
+            << " reused_read_replica_bytes="
+            << Stats.ReusedReadReplicaBytes
             << " merge_direct_d2d_bytes=" << Stats.MergeDirectD2DBytes
             << " merge_d2h_bytes=" << Stats.MergeD2HBytes
             << " merge_h2d_bytes=" << Stats.MergeH2DBytes
@@ -717,6 +746,7 @@ struct PendingOfflineSplitMerge {
   detail::EventImplPtr Event;
   std::vector<detail::EventImplPtr> Events;
   bool EventsWaited = false;
+  uint64_t PartsCompleteNs = 0;
   detail::QueueImplPtr HostQueue;
   detail::ContextImplPtr HostContext;
   std::vector<detail::QueueImplPtr> SplitQueues;
@@ -726,19 +756,46 @@ struct PendingOfflineSplitMerge {
   std::vector<detail::SYCLMemObjI *> WrittenMemObjs;
 };
 
+struct OfflineSplitFinalizeTiming {
+  int KernelCount = 0;
+  uint64_t PartsCompleteNs = 0;
+  uint64_t MaterializationNs = 0;
+};
+
+struct OfflineReadReplicaCacheEntry {
+  detail::SYCLMemObjI *MemObj = nullptr;
+  std::vector<detail::QueueImplPtr> Queues;
+};
+
 static std::vector<PendingOfflineSplitMerge> &pendingOfflineSplitMerges() {
   static std::vector<PendingOfflineSplitMerge> PendingSplits;
   return PendingSplits;
 }
 
-static std::vector<std::pair<int, uint64_t>> &offlineSplitFinalizeTimes() {
-  static std::vector<std::pair<int, uint64_t>> FinalizeTimes;
+static std::vector<OfflineReadReplicaCacheEntry> &offlineReadReplicaCache() {
+  static std::vector<OfflineReadReplicaCacheEntry> Cache;
+  return Cache;
+}
+
+static int offlineSubmittedNumParts(int KernelCount) {
+  for (const PendingOfflineSplitMerge &Pending :
+       pendingOfflineSplitMerges()) {
+    if (Pending.KernelCount == KernelCount) {
+      return std::max<int>(1, static_cast<int>(Pending.SplitQueues.size()));
+    }
+  }
+  return 1;
+}
+
+static std::vector<OfflineSplitFinalizeTiming> &offlineSplitFinalizeTimes() {
+  static std::vector<OfflineSplitFinalizeTiming> FinalizeTimes;
   return FinalizeTimes;
 }
 
 static void clearPendingOfflineSplitState() {
   pendingOfflineSplitMerges().clear();
   offlineSplitFinalizeTimes().clear();
+  offlineReadReplicaCache().clear();
 }
 
 static void rememberOfflineSplitWrite(PendingOfflineSplitMerge &Pending,
@@ -763,10 +820,57 @@ static void rememberOfflineSplitRead(PendingOfflineSplitMerge &Pending,
   }
 }
 
+static void cacheOfflineSplitReadReplicas(
+    const PendingOfflineSplitMerge &Pending) {
+  for (detail::SYCLMemObjI *MemObj : Pending.ReadMemObjs) {
+    auto cache_it = std::find_if(
+        offlineReadReplicaCache().begin(), offlineReadReplicaCache().end(),
+        [MemObj](const OfflineReadReplicaCacheEntry &Entry) {
+          return Entry.MemObj == MemObj;
+        });
+    if (cache_it == offlineReadReplicaCache().end()) {
+      offlineReadReplicaCache().push_back({MemObj, Pending.SplitQueues});
+      continue;
+    }
+    for (const detail::QueueImplPtr &Queue : Pending.SplitQueues) {
+      if (std::find(cache_it->Queues.begin(), cache_it->Queues.end(), Queue) ==
+          cache_it->Queues.end()) {
+        cache_it->Queues.push_back(Queue);
+      }
+    }
+  }
+}
+
+static void invalidateOfflineReadReplica(detail::SYCLMemObjI *MemObj) {
+  std::vector<OfflineReadReplicaCacheEntry> &Cache =
+      offlineReadReplicaCache();
+  Cache.erase(std::remove_if(Cache.begin(), Cache.end(),
+                             [MemObj](const OfflineReadReplicaCacheEntry &Entry) {
+                               return Entry.MemObj == MemObj;
+                             }),
+              Cache.end());
+}
+
 static bool pendingOfflineSplitHasReadReplica(
     detail::SYCLMemObjI *MemObj, const detail::QueueImplPtr &TargetQueue) {
   if (MemObj == nullptr || TargetQueue == nullptr) {
     return false;
+  }
+
+  for (const OfflineReadReplicaCacheEntry &Entry :
+       offlineReadReplicaCache()) {
+    if (Entry.MemObj != MemObj) {
+      continue;
+    }
+    for (const detail::QueueImplPtr &ReplicaQueue : Entry.Queues) {
+      if (ReplicaQueue != nullptr &&
+          detail::sameCtx(ReplicaQueue->getContextImplPtr(),
+                          TargetQueue->getContextImplPtr()) &&
+          ReplicaQueue->getDeviceImplPtr() ==
+              TargetQueue->getDeviceImplPtr()) {
+        return true;
+      }
+    }
   }
 
   for (const PendingOfflineSplitMerge &Pending :
@@ -823,6 +927,15 @@ static bool kernelTouchesPendingOfflineSplit(
   return false;
 }
 
+static void markOfflineSplitPartsComplete(int KernelCount,
+                                          uint64_t CompleteNs) {
+  for (PendingOfflineSplitMerge &Pending : pendingOfflineSplitMerges()) {
+    if (Pending.KernelCount == KernelCount && Pending.PartsCompleteNs == 0) {
+      Pending.PartsCompleteNs = CompleteNs;
+    }
+  }
+}
+
 static void waitPendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   if (Pending.EventsWaited) {
     return;
@@ -857,6 +970,9 @@ static void waitPendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
             << Pending.KernelCount << " after wait" << std::endl;
 
   Pending.EventsWaited = true;
+  if (Pending.PartsCompleteNs == 0) {
+    Pending.PartsCompleteNs = offlineNowNs();
+  }
 }
 
 static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
@@ -864,10 +980,11 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   // multi-pending finalizers below deliberately wait every relevant kernel
   // before they enqueue the first merge copy.
   waitPendingOfflineSplit(Pending);
+  const uint64_t MaterializationStartNs = offlineNowNs();
 
   if (Pending.SplitQueues.empty()) {
     offlineSplitFinalizeTimes().push_back(
-        {Pending.KernelCount, offlineNowNs()});
+        {Pending.KernelCount, Pending.PartsCompleteNs, 0});
     return;
   }
 
@@ -980,13 +1097,29 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
     }
   }
 
-  offlineSplitFinalizeTimes().push_back({Pending.KernelCount, offlineNowNs()});
+  const uint64_t MaterializationEndNs = offlineNowNs();
+  offlineSplitFinalizeTimes().push_back(
+      {Pending.KernelCount, Pending.PartsCompleteNs,
+       MaterializationEndNs >= MaterializationStartNs
+           ? MaterializationEndNs - MaterializationStartNs
+           : 0});
 }
 
 static void finalizePendingOfflineSplitsForKernel(
     detail::SyclKernelCg *KernelCg) {
   std::vector<PendingOfflineSplitMerge> &PendingSplits =
       pendingOfflineSplitMerges();
+
+  if (KernelCg != nullptr && KernelCg->kernel_cg) {
+    if (auto *ExecCG =
+            dynamic_cast<detail::CGExecKernel *>(KernelCg->kernel_cg.get())) {
+      for (detail::Requirement *Req : ExecCG->MRequirements) {
+        if (Req != nullptr && offlineSplitWriteAccess(Req->MAccessMode)) {
+          invalidateOfflineReadReplica(Req->MSYCLMemObj);
+        }
+      }
+    }
+  }
 
   // Split kernels share stable in-order queues.  A later pending kernel can
   // therefore already be queued behind an earlier one.  Waiting and merging
@@ -1023,20 +1156,99 @@ static void finalizeAllPendingOfflineSplits() {
   PendingSplits.clear();
 }
 
+static void finalizeCompletedOfflineSplit(int KernelCount) {
+  std::vector<PendingOfflineSplitMerge> &PendingSplits =
+      pendingOfflineSplitMerges();
+  for (size_t I = 0; I < PendingSplits.size(); ++I) {
+    if (PendingSplits[I].KernelCount != KernelCount) {
+      continue;
+    }
+    // Completion-driven gang scheduling guarantees no later command has been
+    // queued on these devices before this acknowledgement. It is therefore
+    // safe to materialize this one completed Split without the static path's
+    // all-pending pre-wait.
+    mergePendingOfflineSplit(PendingSplits[I]);
+    PendingSplits.erase(PendingSplits.begin() + I);
+    return;
+  }
+}
+
 static void applyOfflineSplitFinalizeTimes(
     std::vector<OfflineProfileEvent> &ProfileEvents) {
-  for (const std::pair<int, uint64_t> &FinalizeTime :
+  for (const OfflineSplitFinalizeTiming &FinalizeTime :
        offlineSplitFinalizeTimes()) {
     for (OfflineProfileEvent &ProfileEvent : ProfileEvents) {
-      if (ProfileEvent.KernelCount == FinalizeTime.first &&
-          FinalizeTime.second > ProfileEvent.HostEndNs) {
-        ProfileEvent.HostEndNs = FinalizeTime.second;
+      if (ProfileEvent.KernelCount == FinalizeTime.KernelCount) {
+        if (FinalizeTime.PartsCompleteNs > ProfileEvent.HostEndNs) {
+          ProfileEvent.HostEndNs = FinalizeTime.PartsCompleteNs;
+        }
+        ProfileEvent.MaterializationNs += FinalizeTime.MaterializationNs;
       }
     }
   }
   offlineSplitFinalizeTimes().clear();
 }
+
+static bool offlineSplitPartsComplete(int KernelCount) {
+  for (const PendingOfflineSplitMerge &Pending :
+       pendingOfflineSplitMerges()) {
+    if (Pending.KernelCount != KernelCount) {
+      continue;
+    }
+    if (!Pending.Events.empty()) {
+      for (const detail::EventImplPtr &Event : Pending.Events) {
+        if (Event) {
+          try {
+            const info::event_command_status Status =
+                Event->get_info<info::event::command_execution_status>();
+            // Backend execution failures are terminal negative statuses. Let
+            // the subsequent wait propagate the asynchronous exception rather
+            // than polling forever for a value equal to COMPLETE.
+            if (static_cast<pi_int32>(Status) > PI_EVENT_COMPLETE) {
+              return false;
+            }
+          } catch (...) {
+            // A failed status query is also terminal for this polling loop;
+            // waitPendingOfflineSplit() remains the source of the real error.
+          }
+        }
+      }
+      return true;
+    }
+    if (!Pending.Event) {
+      return true;
+    }
+    try {
+      const info::event_command_status Status =
+          Pending.Event->get_info<info::event::command_execution_status>();
+      return static_cast<pi_int32>(Status) <= PI_EVENT_COMPLETE;
+    } catch (...) {
+      return true;
+    }
+  }
+  return true;
+}
 #endif
+
+static bool offlineProfileEventComplete(
+    const OfflineProfileEvent &ProfileEvent) {
+  try {
+#ifdef SNMD_OFFLINE
+    if (ProfileEvent.NumParts > 1 &&
+        !offlineSplitPartsComplete(ProfileEvent.KernelCount)) {
+      return false;
+    }
+#endif
+    sycl::event EventCopy = ProfileEvent.Event;
+    const info::event_command_status Status =
+        EventCopy.get_info<info::event::command_execution_status>();
+    return static_cast<pi_int32>(Status) <= PI_EVENT_COMPLETE;
+  } catch (...) {
+    // Do not turn an event-query failure into an infinite scheduler stall.
+    // The mandatory wait immediately after polling propagates the real error.
+    return true;
+  }
+}
 
 static void fillOfflineProfileData(int WaitCount,
                                    const OfflineProfileEvent &ProfileEvent,
@@ -1075,13 +1287,22 @@ static bool collectOfflineProfilingInfo(
       ProfileEvent.HostEndNs > ProfileEvent.HostStartNs
           ? ProfileEvent.HostEndNs - ProfileEvent.HostStartNs
           : 0;
-  if (ProfileEvent.NumParts > 1 && HostDuration > 0) {
+  const uint64_t SplitDuration =
+      ProfileEvent.MaterializationNs >
+              std::numeric_limits<uint64_t>::max() - HostDuration
+          ? std::numeric_limits<uint64_t>::max()
+          : HostDuration + ProfileEvent.MaterializationNs;
+  if (ProfileEvent.NumParts > 1 && SplitDuration > 0) {
     HANDLER_TRACE_STREAM << "=== handler === Offline profiling split wall "
                          << "kernel_count: " << ProfileEvent.KernelCount
                          << " device_index: " << ProfileEvent.DeviceIndex
                          << " num_parts: " << ProfileEvent.NumParts
-                         << " duration_ns: " << HostDuration << std::endl;
-    fillOfflineProfileData(WaitCount, ProfileEvent, HostDuration, ProfileData);
+                         << " compute_wall_ns: " << HostDuration
+                         << " materialization_ns: "
+                         << ProfileEvent.MaterializationNs
+                         << " duration_ns: " << SplitDuration << std::endl;
+    fillOfflineProfileData(WaitCount, ProfileEvent, SplitDuration,
+                           ProfileData);
     return true;
   }
 
@@ -2796,6 +3017,16 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
         }
 
         for (const QueueImplPtr &SplitQueue : SplitQueues_Write) {
+          if (onlyRead && pendingOfflineSplitHasReadReplica(
+                              Req->MSYCLMemObj, SplitQueue)) {
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+            offlineSplitStats().ReusedReadReplicaBytes +=
+                offlineRequirementBytes(TransferReq);
+#endif
+            HANDLER_TRACE_STREAM
+                << "=== handler === Split step3 reuse read-only replica\n";
+            continue;
+          }
           if (ReqCurCtx != hostCtx && SplitQueue->getContextImplPtr() == ReqCurCtx) {
             HANDLER_TRACE_STREAM << "=== handler === Split step3 SplitQueue is SrcQueue, continue\n";
             continue;
@@ -2899,6 +3130,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     }
     PendingSplit.SplitReqsCopy = std::move(SplitReqs_Copy);
     PendingSplit.SplitReqOwners = std::move(SplitReqOwners);
+    cacheOfflineSplitReadReplicas(PendingSplit);
     pendingOfflineSplitMerges().push_back(std::move(PendingSplit));
     HANDLER_TRACE_STREAM << "=== handler === Split submitted async, merge deferred for kernel_count: "
               << sycl_kernel_cg.kernel_count << std::endl;
@@ -2966,9 +3198,14 @@ event handler::scheduleOffline() {
     uint64_t HostStart = offlineNowNs();
     last_event = resubmit(*sycl_kernel_cg);
     uint64_t HostEnd = offlineNowNs();
+    HANDLER_TRACE_STREAM << "=== handler === Offline submit kernel_count: "
+                         << sycl_kernel_cg->kernel_count
+                         << " host_duration_ns: "
+                         << (HostEnd >= HostStart ? HostEnd - HostStart : 0)
+                         << std::endl;
     profile_events.push_back(
         {sycl_kernel_cg->kernel_count, 1,
-         static_cast<int>(detail::ProgramManager::getInstance().NumParts),
+         offlineSubmittedNumParts(sycl_kernel_cg->kernel_count),
          HostStart, HostEnd, last_event,
          findOfflineKernelProfileKey(sycl_kernel_cg->kernel_count)});
   }
@@ -3189,10 +3426,15 @@ event handler::scheduleOffline() {
         uint64_t HostStart = offlineNowNs();
         last_event = resubmit(*sycl_kernel_cg);
         uint64_t HostEnd = offlineNowNs();
+        HANDLER_TRACE_STREAM << "=== handler === Offline submit kernel_count: "
+                             << kernel_count << " host_duration_ns: "
+                             << (HostEnd >= HostStart
+                                     ? HostEnd - HostStart
+                                     : 0)
+                             << std::endl;
         int ProfileNumParts = 1;
 #ifdef SNMD_OFFLINE
-        ProfileNumParts =
-            static_cast<int>(detail::ProgramManager::getInstance().NumParts);
+        ProfileNumParts = offlineSubmittedNumParts(kernel_count);
 #endif
         profile_events.push_back({kernel_count, ActualDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,
@@ -3238,13 +3480,21 @@ event handler::scheduleOffline() {
 
     // DONE ====【接收daemon对每个kernel的执行决策】
     std::vector<D2SKernelExecInfo> kernel_exec_infos;
+    bool completion_driven_dispatch = false;
+    bool completion_window_complete = false;
+    bool completion_window_failed = false;
     {
       std::string received_data = receiveOfflineMqPayload(
           mq_id_program, MAX_MSG_PROGRAM_SIZE, "kernel_exec_infos");
       HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === mq_receive kernel_exec_infos" << std::endl;
 
-      kernel_exec_infos = parseOfflineKernelExecInfos(received_data);
-      if (kernel_exec_infos.empty()) {
+      ParsedOfflineDispatchBatch parsed_dispatch =
+          parseOfflineDispatchBatch(received_data);
+      completion_driven_dispatch = parsed_dispatch.CompletionDriven;
+      completion_window_complete = parsed_dispatch.WindowComplete;
+      completion_window_failed = parsed_dispatch.WindowFailed;
+      kernel_exec_infos = std::move(parsed_dispatch.KernelExecInfos);
+      if (kernel_exec_infos.empty() && !completion_driven_dispatch) {
         std::cerr << "Error: Process " << getpid()
                   << " received empty kernel_exec_infos" << std::endl;
         exit(1);
@@ -3270,7 +3520,8 @@ event handler::scheduleOffline() {
 
       // 如果info中有scale_count 说明此daemon是scale起的
       // 全局视图 此时通用流程的daemon不会接收到scale_count
-      if (kernel_exec_infos.at(0).scale_count >= 1) {
+      if (!kernel_exec_infos.empty() &&
+          kernel_exec_infos.at(0).scale_count >= 1) {
         daemon_scale_count = kernel_exec_infos.at(0).scale_count;
         HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === kernel_exec_info scale_count: " << daemon_scale_count << std::endl;
       
@@ -3292,6 +3543,175 @@ event handler::scheduleOffline() {
         }
       }
     }
+
+#ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
+    if (completion_driven_dispatch) {
+      std::map<int, OfflineProfileEvent> in_flight;
+
+      try {
+        while (true) {
+          if (completion_window_failed) {
+            throw sycl::runtime_error(
+                "Internal Error. Completion queue daemon aborted the active "
+                "window.",
+                PI_ERROR_INVALID_OPERATION);
+          }
+          for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
+            if (!kernel_exec_info.exec ||
+                !kernel_exec_info.req_counts.empty()) {
+              throw sycl::runtime_error(
+                  "Internal Error. Completion queue received a non-local "
+                  "dispatch.",
+                  PI_ERROR_INVALID_OPERATION);
+            }
+
+            const int kernel_count = kernel_exec_info.kernel_count;
+            detail::SyclKernelCg *sycl_kernel_cg = findOfflineKernelCg(
+                detail::ProgramManager::getInstance().kernel_cgs,
+                kernel_count);
+            const int ActualDeviceIndex =
+                clampOfflineDeviceIndex(kernel_exec_info.device_index);
+
+#ifdef SNMD_OFFLINE
+            // Install the new decision before materializing an older Split. A
+            // future partition-resident path can use both decisions to retain
+            // compatible partitions; the current safe path still canonicalizes
+            // any conflicting producer before this submission.
+            applyOfflineSplitDecision(kernel_exec_info, ActualDeviceIndex);
+            finalizePendingOfflineSplitsForKernel(sycl_kernel_cg);
+#endif
+
+            std::shared_ptr<detail::queue_impl> &kernel_queue =
+                sycl_kernel_cg->kernel_queue;
+            device exec_device =
+                detail::ProgramManager::getInstance().globalDevices.at(
+                    ActualDeviceIndex);
+            detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
+            kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
+
+            const uint64_t HostStart = offlineNowNs();
+            last_event = resubmit(*sycl_kernel_cg);
+            const uint64_t HostEnd = offlineNowNs();
+            const int ProfileNumParts =
+                offlineSubmittedNumParts(kernel_count);
+            OfflineProfileEvent profile_event{
+                kernel_count, ActualDeviceIndex, ProfileNumParts,
+                HostStart,   HostEnd,          last_event,
+                findOfflineKernelProfileKey(kernel_count)};
+            if (!in_flight.emplace(kernel_count, std::move(profile_event))
+                     .second) {
+              throw sycl::runtime_error(
+                  "Internal Error. Completion queue dispatched a kernel "
+                  "twice.",
+                  PI_ERROR_INVALID_OPERATION);
+            }
+            HANDLER_TRACE_STREAM
+                << "=== handler === CompletionQueue dispatched kernel_count: "
+                << kernel_count << " device_index: " << ActualDeviceIndex
+                << " num_parts: " << ProfileNumParts
+                << " host_duration_ns: "
+                << (HostEnd >= HostStart ? HostEnd - HostStart : 0)
+                << std::endl;
+          }
+
+        if (completion_window_complete) {
+          if (!in_flight.empty()) {
+            throw sycl::runtime_error(
+                "Internal Error. Completion queue closed with kernels in "
+                "flight.",
+                PI_ERROR_INVALID_OPERATION);
+          }
+#ifdef SNMD_OFFLINE
+          finalizeAllPendingOfflineSplits();
+#endif
+          clearOfflineBatch();
+          return last_event;
+        }
+
+        std::vector<int> completed_kernel_counts;
+        while (completed_kernel_counts.empty()) {
+          for (const auto &entry : in_flight) {
+            if (offlineProfileEventComplete(entry.second)) {
+              completed_kernel_counts.push_back(entry.first);
+            }
+          }
+          if (completed_kernel_counts.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        }
+
+        S2DCompletionBatchData completion_batch;
+        completion_batch.wait_count = daemon_wait_count;
+        for (int kernel_count : completed_kernel_counts) {
+          auto profile_it = in_flight.find(kernel_count);
+          if (profile_it == in_flight.end()) {
+            continue;
+          }
+          OfflineProfileEvent completed_event = profile_it->second;
+          S2DKernelProfileData completion;
+          if (completed_event.NumParts > 1) {
+            completed_event.HostEndNs = offlineNowNs();
+            markOfflineSplitPartsComplete(kernel_count,
+                                          completed_event.HostEndNs);
+            finalizeCompletedOfflineSplit(kernel_count);
+            std::vector<OfflineProfileEvent> completed_split_profiles{
+                completed_event};
+            applyOfflineSplitFinalizeTimes(completed_split_profiles);
+            if (!collectOfflineProfilingInfo(
+                    daemon_wait_count, completed_split_profiles.front(),
+                    completion)) {
+              fillOfflineProfileData(daemon_wait_count,
+                                     completed_split_profiles.front(), 0,
+                                     completion);
+            }
+          } else {
+            sycl::event CompletedEventCopy = completed_event.Event;
+            CompletedEventCopy.wait();
+            if (!collectOfflineProfilingInfo(
+                    daemon_wait_count, completed_event, completion)) {
+              fillOfflineProfileData(daemon_wait_count, completed_event, 0,
+                                     completion);
+            }
+          }
+          completion_batch.completions.push_back(std::move(completion));
+          in_flight.erase(profile_it);
+        }
+
+        sendOfflineMqPayload(mq_id_daemon, completion_batch.serialize(),
+                             MAX_MSG_DAEMON_SIZE,
+                             "completion acknowledgement");
+
+        const std::string next_payload = receiveOfflineMqPayload(
+            mq_id_program, MAX_MSG_PROGRAM_SIZE,
+            "completion dispatch batch");
+        ParsedOfflineDispatchBatch next_dispatch =
+            parseOfflineDispatchBatch(next_payload);
+        if (!next_dispatch.CompletionDriven) {
+          throw sycl::runtime_error(
+              "Internal Error. Completion queue protocol downgraded inside "
+              "a window.",
+              PI_ERROR_INVALID_OPERATION);
+        }
+          completion_window_complete = next_dispatch.WindowComplete;
+          completion_window_failed = next_dispatch.WindowFailed;
+          kernel_exec_infos = std::move(next_dispatch.KernelExecInfos);
+        }
+      } catch (...) {
+        // Tell the daemon to abandon its reservation state before propagating
+        // the real SYCL exception to the user's wait(). If the daemon was the
+        // side that failed, it has already left the protocol and needs no echo.
+        if (!completion_window_failed) {
+          S2DCompletionBatchData failure_batch;
+          failure_batch.wait_count = daemon_wait_count;
+          failure_batch.window_failed = true;
+          sendOfflineMqPayload(mq_id_daemon, failure_batch.serialize(),
+                               MAX_MSG_DAEMON_SIZE,
+                               "completion failure acknowledgement");
+        }
+        throw;
+      }
+    }
+#endif
     
     // return commDepend(kernel_exec_infos);
     // DONE ====【按kernel执行顺序 为每个kernel处理满足依赖 -> rebind -> resubmit】
@@ -3415,10 +3835,15 @@ event handler::scheduleOffline() {
         uint64_t HostStart = offlineNowNs();
         last_event = resubmit(*sycl_kernel_cg);
         uint64_t HostEnd = offlineNowNs();
+        HANDLER_TRACE_STREAM << "=== handler === Offline submit kernel_count: "
+                             << kernel_count << " host_duration_ns: "
+                             << (HostEnd >= HostStart
+                                     ? HostEnd - HostStart
+                                     : 0)
+                             << std::endl;
         int ProfileNumParts = 1;
 #ifdef SNMD_OFFLINE
-        ProfileNumParts =
-            static_cast<int>(detail::ProgramManager::getInstance().NumParts);
+        ProfileNumParts = offlineSubmittedNumParts(kernel_count);
 #endif
         profile_events.push_back({kernel_count, ActualDeviceIndex,
                                   std::max(1, ProfileNumParts), HostStart,

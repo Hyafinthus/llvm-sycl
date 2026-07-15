@@ -39,7 +39,7 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #endif
 
 #ifndef SNMD_OFFLINE_SPLIT_DEFAULT_ENABLED
-#define SNMD_OFFLINE_SPLIT_DEFAULT_ENABLED 0
+#define SNMD_OFFLINE_SPLIT_DEFAULT_ENABLED 1
 #endif
 
 #ifdef PRINT_HANDLER_TRACE
@@ -69,8 +69,19 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 // device. The daemon and handler must use the same source-of-truth device.
 #define SNMD_OFFLINE_CANONICAL_MERGE 1
 
-// P2: Collect a real num_parts=1 profile before allowing a Split probe.
-#define SNMD_OFFLINE_SINGLE_FIRST 1
+// P2: Permit one bounded cold Split mode only for a long, narrow-DAG kernel
+// whose modeled end-to-end gain is substantial. Short/uncertain work remains
+// single-device; later windows use measured single/Split profiles.
+#define SNMD_OFFLINE_COLD_SPLIT_PROBE 1
+#define SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST 500000
+#define SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT 30
+#if SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST < 0
+#error "SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST must be nonnegative"
+#endif
+#if SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT < 0 ||                       \
+    SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT >= 100
+#error "SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT must be in [0, 100)"
+#endif
 
 // P2: Once both profiles exist, retain Split only when its end-to-end profile
 // beats the single-device profile by at least the configured percentage.
@@ -91,10 +102,30 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #error "SNMD_OFFLINE_SPLIT_THROUGHPUT_MARGIN_PERCENT must be in [0, 100)"
 #endif
 
-// Keep Split default-off until the current data path passes the application's
-// correctness suite, but allow an explicit runtime opt-in without rebuilding:
-//   SYCL_SNMD_ENABLE_SPLIT=1
-// SNMD_OFFLINE_TEST_DISABLE_SPLIT remains an optional compile-time hard stop.
+// Profile-risk admission: A cross-device placement must beat a data-local
+// single-device placement by more than the predictive uncertainty of the
+// available profile samples. Observed runtime jitter remains part of the
+// interval; only the cold-start prior decays with repeated samples.
+#define SNMD_OFFLINE_UNCERTAINTY_AWARE_MIGRATION 1
+#define SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT 5
+#define SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT 196
+#if SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT < 0 ||                       \
+    SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT >= 100
+#error "SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT must be in [0, 100)"
+#endif
+#if SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT < 0
+#error "SNMD_OFFLINE_MIGRATION_CONFIDENCE_PERCENT must be nonnegative"
+#endif
+
+// Completion-driven dispatch is currently enabled only for one daemon rank.
+// The handler reports actual completions and the daemon releases gang/device
+// reservations before selecting the next ready task. Multi-rank keeps the
+// batch-static fallback until remote completion acknowledgement is available.
+#define SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE 1
+
+// Split is enabled by default. Set SYCL_SNMD_ENABLE_SPLIT=0 for a runtime
+// fallback, or define SNMD_OFFLINE_TEST_DISABLE_SPLIT as a compile-time hard
+// stop for correctness isolation.
 // #define SNMD_OFFLINE_TEST_DISABLE_SPLIT 1
 
 // P5 diagnostics: uncomment for one daemon decision summary and one handler
