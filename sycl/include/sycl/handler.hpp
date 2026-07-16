@@ -1512,7 +1512,11 @@ public:
     detail::AccessorBaseHost *AccBase =
         reinterpret_cast<detail::AccessorBaseHost *>(&Acc);
     detail::AccessorImplPtr AccImpl = detail::getSyclObjImpl(*AccBase);
-    if (AccImpl && AccImpl->MSYCLMemObj != nullptr &&
+    // handler.hpp is a public header and only sees AccessorImplHost's forward
+    // declaration. Keep the accessor implementation opaque here; handler.cpp
+    // owns the complete type and validates the memory object and partition
+    // shape before the declaration is sent to the daemon or used for Split.
+    if (AccImpl &&
         std::find(MSNMDPartitionLocalReqs.begin(),
                   MSNMDPartitionLocalReqs.end(), AccImpl.get()) ==
             MSNMDPartitionLocalReqs.end()) {
