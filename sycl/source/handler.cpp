@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -731,6 +732,19 @@ static uint64_t offlineNowNs() {
 }
 
 #ifdef SNMD_OFFLINE
+static uint64_t offlineRequirementBytes(const detail::Requirement *Req) {
+  if (Req == nullptr) {
+    return 0;
+  }
+  const uint64_t Elements = static_cast<uint64_t>(Req->MAccessRange.size());
+  const uint64_t ElemSize = static_cast<uint64_t>(Req->MElemSize);
+  if (ElemSize != 0 &&
+      Elements > std::numeric_limits<uint64_t>::max() / ElemSize) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return Elements * ElemSize;
+}
+
 #ifdef SNMD_OFFLINE_SPLIT_STATS
 struct OfflineSplitStats {
   uint64_t SingleKernelCount = 0;
@@ -752,19 +766,6 @@ struct OfflineSplitStats {
 static OfflineSplitStats &offlineSplitStats() {
   static OfflineSplitStats Stats;
   return Stats;
-}
-
-static uint64_t offlineRequirementBytes(const detail::Requirement *Req) {
-  if (Req == nullptr) {
-    return 0;
-  }
-  const uint64_t Elements = static_cast<uint64_t>(Req->MAccessRange.size());
-  const uint64_t ElemSize = static_cast<uint64_t>(Req->MElemSize);
-  if (ElemSize != 0 &&
-      Elements > std::numeric_limits<uint64_t>::max() / ElemSize) {
-    return std::numeric_limits<uint64_t>::max();
-  }
-  return Elements * ElemSize;
 }
 
 static void printAndResetOfflineSplitStats() {
@@ -854,6 +855,11 @@ struct OfflineReadReplicaCacheEntry {
   std::vector<detail::QueueImplPtr> Queues;
 };
 
+struct OfflineBatchMemAccessSummary {
+  detail::Requirement *FullReadReq = nullptr;
+  bool ReadOnlyFullBuffer = true;
+};
+
 struct OfflinePartitionReadCacheEntry {
   detail::SYCLMemObjI *MemObj = nullptr;
   std::vector<int> SplitDeviceIndices;
@@ -868,6 +874,47 @@ static std::vector<PendingOfflineSplitMerge> &pendingOfflineSplitMerges() {
 static std::vector<OfflineReadReplicaCacheEntry> &offlineReadReplicaCache() {
   static std::vector<OfflineReadReplicaCacheEntry> Cache;
   return Cache;
+}
+
+static std::map<detail::SYCLMemObjI *, OfflineBatchMemAccessSummary> &
+offlineBatchMemAccessSummaries() {
+  static std::map<detail::SYCLMemObjI *, OfflineBatchMemAccessSummary>
+      Summaries;
+  return Summaries;
+}
+
+static bool &offlineBatchMemAccessSummariesInitialized() {
+  static bool Initialized = false;
+  return Initialized;
+}
+
+static void rememberOfflineReadReplica(
+    detail::SYCLMemObjI *MemObj, const detail::QueueImplPtr &Queue) {
+  if (MemObj == nullptr || Queue == nullptr) {
+    return;
+  }
+
+  auto CacheIt = std::find_if(
+      offlineReadReplicaCache().begin(), offlineReadReplicaCache().end(),
+      [MemObj](const OfflineReadReplicaCacheEntry &Entry) {
+        return Entry.MemObj == MemObj;
+      });
+  if (CacheIt == offlineReadReplicaCache().end()) {
+    offlineReadReplicaCache().push_back({MemObj, {Queue}});
+    return;
+  }
+
+  const bool AlreadyRemembered = std::any_of(
+      CacheIt->Queues.begin(), CacheIt->Queues.end(),
+      [&Queue](const detail::QueueImplPtr &ReplicaQueue) {
+        return ReplicaQueue != nullptr &&
+               detail::sameCtx(ReplicaQueue->getContextImplPtr(),
+                               Queue->getContextImplPtr()) &&
+               ReplicaQueue->getDeviceImplPtr() == Queue->getDeviceImplPtr();
+      });
+  if (!AlreadyRemembered) {
+    CacheIt->Queues.push_back(Queue);
+  }
 }
 
 static std::vector<OfflinePartitionReadCacheEntry> &
@@ -895,6 +942,8 @@ static void clearPendingOfflineSplitState() {
   pendingOfflineSplitMerges().clear();
   offlineSplitFinalizeTimes().clear();
   offlineReadReplicaCache().clear();
+  offlineBatchMemAccessSummaries().clear();
+  offlineBatchMemAccessSummariesInitialized() = false;
   offlinePartitionReadCache().clear();
 }
 
@@ -1061,20 +1110,8 @@ static bool offlineSubmittedPersistentSplit(int KernelCount) {
 static void cacheOfflineSplitReadReplicas(
     const PendingOfflineSplitMerge &Pending) {
   for (detail::SYCLMemObjI *MemObj : Pending.ReadMemObjs) {
-    auto cache_it = std::find_if(
-        offlineReadReplicaCache().begin(), offlineReadReplicaCache().end(),
-        [MemObj](const OfflineReadReplicaCacheEntry &Entry) {
-          return Entry.MemObj == MemObj;
-        });
-    if (cache_it == offlineReadReplicaCache().end()) {
-      offlineReadReplicaCache().push_back({MemObj, Pending.SplitQueues});
-      continue;
-    }
     for (const detail::QueueImplPtr &Queue : Pending.SplitQueues) {
-      if (std::find(cache_it->Queues.begin(), cache_it->Queues.end(), Queue) ==
-          cache_it->Queues.end()) {
-        cache_it->Queues.push_back(Queue);
-      }
+      rememberOfflineReadReplica(MemObj, Queue);
     }
   }
   for (detail::SYCLMemObjI *MemObj : Pending.PartitionLocalReadMemObjs) {
@@ -1127,7 +1164,7 @@ static bool pendingOfflineSplitHasPartitionReadReplica(
       });
 }
 
-static bool pendingOfflineSplitHasReadReplica(
+static bool offlineHasReadReplica(
     detail::SYCLMemObjI *MemObj, const detail::QueueImplPtr &TargetQueue) {
   if (MemObj == nullptr || TargetQueue == nullptr) {
     return false;
@@ -1150,6 +1187,254 @@ static bool pendingOfflineSplitHasReadReplica(
   }
 
   return false;
+}
+
+// The ordinary DPC++ scheduler tracks one current context per buffer. If
+// independent kernels on different devices share a read-only coefficient
+// table, submitting the second kernel migrates that table away from the first
+// context. The migration is represented as read_write and therefore waits for
+// the first reader, accidentally serializing the whole ready wave.
+//
+// Replicate only conservative constant-like inputs: every accessor in this
+// wait batch must be a full-buffer read, the current daemon dispatch must use
+// the object on at least two devices, and the object must fit the configured
+// size cap. Copies finish before any reader in the dispatch is submitted. A
+// later write is consequently impossible in this batch; the existing write
+// invalidation remains a second line of defense.
+struct OfflineDispatchReadReplicaCandidate {
+  detail::Requirement *Req = nullptr;
+  detail::QueueImplPtr QueueTemplate;
+  std::vector<int> DeviceIndices;
+};
+
+static size_t offlineDispatchReadReplicaMaxBytes() {
+  static const size_t MaxBytes = []() {
+    constexpr size_t DefaultMaxBytes = 64 * 1024;
+    const char *Env = std::getenv("SYCL_SNMD_READ_REPLICA_MAX_BYTES");
+    if (Env == nullptr || *Env == '\0') {
+      return DefaultMaxBytes;
+    }
+
+    errno = 0;
+    char *End = nullptr;
+    const unsigned long long Parsed = std::strtoull(Env, &End, 10);
+    bool Invalid = errno != 0 || End == Env || *End != '\0';
+    if constexpr (std::numeric_limits<size_t>::digits <
+                  std::numeric_limits<unsigned long long>::digits) {
+      Invalid |= Parsed > std::numeric_limits<size_t>::max();
+    }
+    if (Invalid) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === invalid SYCL_SNMD_READ_REPLICA_MAX_BYTES='"
+          << Env << "', using default: " << DefaultMaxBytes << std::endl;
+      return DefaultMaxBytes;
+    }
+    return static_cast<size_t>(Parsed);
+  }();
+  return MaxBytes;
+}
+
+static bool offlineReqCoversWholeBuffer(const detail::Requirement *Req) {
+  if (Req == nullptr || Req->MSYCLMemObj == nullptr || Req->MIsSubBuffer ||
+      Req->MOffsetInBytes != 0) {
+    return false;
+  }
+  return offlineRequirementBytes(Req) ==
+         Req->MSYCLMemObj->getSizeInBytes();
+}
+
+static detail::QueueImplPtr offlineReadReplicaSourceQueue(
+    detail::Requirement *Req, const detail::QueueImplPtr &HostQueue) {
+  detail::MemObjRecord *Record =
+      detail::Scheduler::getInstance().getMemObjRecord(Req);
+  if (Record == nullptr || Record->MCurContext == nullptr ||
+      detail::sameCtx(Record->MCurContext,
+                      HostQueue->getContextImplPtr())) {
+    return HostQueue;
+  }
+
+  for (detail::AllocaCommandBase *AllocaCmd : Record->MAllocaCommands) {
+    if (AllocaCmd != nullptr && AllocaCmd->getQueue() != nullptr &&
+        detail::sameCtx(AllocaCmd->getQueue()->getContextImplPtr(),
+                        Record->MCurContext)) {
+      return AllocaCmd->getQueue();
+    }
+  }
+  return nullptr;
+}
+
+static void prepareOfflineReadReplicasForDispatch(
+    const std::vector<D2SKernelExecInfo> &KernelExecInfos) {
+  const size_t MaxBytes = offlineDispatchReadReplicaMaxBytes();
+  if (MaxBytes == 0 || KernelExecInfos.empty()) {
+    return;
+  }
+
+  auto &PM = detail::ProgramManager::getInstance();
+  auto &Summaries = offlineBatchMemAccessSummaries();
+  if (!offlineBatchMemAccessSummariesInitialized()) {
+    for (detail::SyclKernelCg *KernelCg : PM.kernel_cgs) {
+      if (KernelCg == nullptr || !KernelCg->kernel_cg) {
+        continue;
+      }
+      auto *ExecCG =
+          dynamic_cast<detail::CGExecKernel *>(KernelCg->kernel_cg.get());
+      if (ExecCG == nullptr) {
+        continue;
+      }
+      for (detail::Requirement *Req : ExecCG->MRequirements) {
+        if (Req == nullptr || Req->MSYCLMemObj == nullptr) {
+          continue;
+        }
+        OfflineBatchMemAccessSummary &Summary = Summaries[Req->MSYCLMemObj];
+        if (Req->MAccessMode != access::mode::read ||
+            !offlineReqCoversWholeBuffer(Req)) {
+          Summary.ReadOnlyFullBuffer = false;
+          Summary.FullReadReq = nullptr;
+        } else if (Summary.ReadOnlyFullBuffer &&
+                   Summary.FullReadReq == nullptr) {
+          Summary.FullReadReq = Req;
+        }
+      }
+    }
+    offlineBatchMemAccessSummariesInitialized() = true;
+  }
+
+  std::map<detail::SYCLMemObjI *, OfflineDispatchReadReplicaCandidate>
+      Candidates;
+  for (const D2SKernelExecInfo &ExecInfo : KernelExecInfos) {
+    if (!ExecInfo.exec || ExecInfo.num_parts > 1) {
+      continue;
+    }
+    detail::SyclKernelCg *KernelCg =
+        findOfflineKernelCg(PM.kernel_cgs, ExecInfo.kernel_count);
+    auto *ExecCG = KernelCg != nullptr && KernelCg->kernel_cg
+                       ? dynamic_cast<detail::CGExecKernel *>(
+                             KernelCg->kernel_cg.get())
+                       : nullptr;
+    if (ExecCG == nullptr) {
+      continue;
+    }
+
+    const int DeviceIndex = clampOfflineDeviceIndex(ExecInfo.device_index);
+    for (detail::Requirement *Req : ExecCG->MRequirements) {
+      if (Req == nullptr || Req->MSYCLMemObj == nullptr ||
+          Req->MAccessMode != access::mode::read) {
+        continue;
+      }
+      auto SummaryIt = Summaries.find(Req->MSYCLMemObj);
+      if (SummaryIt == Summaries.end() ||
+          !SummaryIt->second.ReadOnlyFullBuffer ||
+          SummaryIt->second.FullReadReq == nullptr ||
+          Req->MSYCLMemObj->getSizeInBytes() > MaxBytes) {
+        continue;
+      }
+
+      OfflineDispatchReadReplicaCandidate &Candidate =
+          Candidates[Req->MSYCLMemObj];
+      Candidate.Req = SummaryIt->second.FullReadReq;
+      if (Candidate.QueueTemplate == nullptr) {
+        Candidate.QueueTemplate = KernelCg->kernel_queue;
+      }
+      if (std::find(Candidate.DeviceIndices.begin(),
+                    Candidate.DeviceIndices.end(), DeviceIndex) ==
+          Candidate.DeviceIndices.end()) {
+        Candidate.DeviceIndices.push_back(DeviceIndex);
+      }
+    }
+  }
+
+  const detail::QueueImplPtr HostQueue =
+      detail::Scheduler::getInstance().getDefaultHostQueue();
+  for (auto &CandidateEntry : Candidates) {
+    detail::SYCLMemObjI *MemObj = CandidateEntry.first;
+    OfflineDispatchReadReplicaCandidate &Candidate = CandidateEntry.second;
+    if (Candidate.Req == nullptr || Candidate.QueueTemplate == nullptr ||
+        Candidate.DeviceIndices.size() < 2) {
+      continue;
+    }
+
+    detail::QueueImplPtr SourceQueue =
+        offlineReadReplicaSourceQueue(Candidate.Req, HostQueue);
+    if (SourceQueue == nullptr) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === dispatch read replica skipped: current source "
+             "allocation not found, memobj: "
+          << MemObj << std::endl;
+      continue;
+    }
+    bool HostStagingReady = SourceQueue->is_host();
+
+    for (int DeviceIndex : Candidate.DeviceIndices) {
+      if (DeviceIndex <= 0 ||
+          DeviceIndex >= static_cast<int>(PM.globalDevices.size())) {
+        continue;
+      }
+      const device ReplicaDevice = PM.globalDevices.at(DeviceIndex);
+      const detail::DeviceImplPtr ReplicaDeviceImpl =
+          detail::getSyclObjImpl(ReplicaDevice);
+      const detail::QueueImplPtr ReplicaQueue =
+          makeOfflineProfilingQueue(ReplicaDeviceImpl,
+                                    Candidate.QueueTemplate);
+      if (offlineHasReadReplica(MemObj, ReplicaQueue)) {
+        continue;
+      }
+
+      if (detail::sameCtx(SourceQueue->getContextImplPtr(),
+                          ReplicaQueue->getContextImplPtr()) &&
+          SourceQueue->getDeviceImplPtr() ==
+              ReplicaQueue->getDeviceImplPtr()) {
+        rememberOfflineReadReplica(MemObj, ReplicaQueue);
+        continue;
+      }
+
+      bool Prepared = false;
+      if (!SourceQueue->is_host()) {
+        try {
+          detail::EventImplPtr DirectEvent =
+              detail::Scheduler::getInstance().addMemoryMove(
+                  Candidate.Req, ReplicaQueue, SourceQueue);
+          waitOfflineSplitEvent(DirectEvent, OfflineSplitWaitKind::Prepare);
+          Prepared = true;
+          HANDLER_TRACE_STREAM
+              << "=== handler === prepared dispatch read replica direct D2D, "
+                 "memobj: "
+              << MemObj << " bytes: " << MemObj->getSizeInBytes()
+              << " device_index: " << DeviceIndex << std::endl;
+        } catch (const std::exception &Error) {
+          HANDLER_TRACE_STREAM
+              << "=== handler === dispatch read replica direct D2D failed, "
+                 "using host staging, reason: "
+              << Error.what() << std::endl;
+        } catch (...) {
+          HANDLER_TRACE_STREAM
+              << "=== handler === dispatch read replica direct D2D failed, "
+                 "using host staging"
+              << std::endl;
+        }
+      }
+
+      if (!Prepared) {
+        if (!HostStagingReady) {
+          detail::EventImplPtr HostEvent =
+              detail::Scheduler::getInstance().addMemoryMove(
+                  Candidate.Req, HostQueue, SourceQueue);
+          waitOfflineSplitEvent(HostEvent, OfflineSplitWaitKind::Prepare);
+          HostStagingReady = true;
+        }
+        detail::EventImplPtr ReplicaEvent =
+            detail::Scheduler::getInstance().addMemoryMove(
+                Candidate.Req, ReplicaQueue, HostQueue);
+        waitOfflineSplitEvent(ReplicaEvent, OfflineSplitWaitKind::Prepare);
+        HANDLER_TRACE_STREAM
+            << "=== handler === prepared dispatch read replica via host, "
+               "memobj: "
+            << MemObj << " bytes: " << MemObj->getSizeInBytes()
+            << " device_index: " << DeviceIndex << std::endl;
+      }
+      rememberOfflineReadReplica(MemObj, ReplicaQueue);
+    }
+  }
 }
 
 static bool kernelTouchesPendingOfflineSplit(
@@ -3379,8 +3664,7 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
             }
 
             if (onlyRead && !PartitionLocal &&
-                pendingOfflineSplitHasReadReplica(Req->MSYCLMemObj,
-                                                  SplitQueue)) {
+                offlineHasReadReplica(Req->MSYCLMemObj, SplitQueue)) {
 #ifdef SNMD_OFFLINE_SPLIT_STATS
               offlineSplitStats().ReusedReadReplicaBytes +=
                   offlineRequirementBytes(PartTransferReq);
@@ -3531,13 +3815,13 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
 #endif
     HANDLER_TRACE_STREAM << getpid() << " === handler === resubmit kernel: " << sycl_kernel_cg.kernel_count << std::endl;
 
-    // A non-split read can consume the already prepared replica in its target
-    // context. This does not skip split-to-split version preparation below;
-    // it only prevents the ordinary scheduler from attempting an unsupported
-    // cross-context D2D move for an unchanged read-only object.
+    // A non-split read can consume a replica prepared either by Split or by a
+    // multi-device dispatch of ordinary kernels. This does not skip
+    // split-to-split version preparation; it only prevents the ordinary
+    // scheduler from migrating an unchanged read-only object between readers.
     for (Requirement *Req : KernelReqs) {
       if (Req == nullptr || Req->MAccessMode != access::mode::read ||
-          !pendingOfflineSplitHasReadReplica(Req->MSYCLMemObj, KernelQueue)) {
+          !offlineHasReadReplica(Req->MSYCLMemObj, KernelQueue)) {
         continue;
       }
       if (MemObjRecord *Record =
@@ -3705,6 +3989,9 @@ event handler::scheduleOffline() {
     // DONE ====【按kernel执行顺序 为每个kernel处理满足依赖 -> rebind -> resubmit】
     // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
     std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
+#ifdef SNMD_OFFLINE
+    prepareOfflineReadReplicasForDispatch(kernel_exec_infos);
+#endif
     for (int exec_num = 0; exec_num < kernel_exec_infos.size(); exec_num++) {
       HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === scale commDepend exec_num: " << exec_num << std::endl;
       D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
@@ -3955,6 +4242,9 @@ event handler::scheduleOffline() {
                 "window.",
                 PI_ERROR_INVALID_OPERATION);
           }
+#ifdef SNMD_OFFLINE
+          prepareOfflineReadReplicasForDispatch(kernel_exec_infos);
+#endif
           for (D2SKernelExecInfo &kernel_exec_info : kernel_exec_infos) {
             if (!kernel_exec_info.exec ||
                 !kernel_exec_info.req_counts.empty()) {
@@ -4118,6 +4408,9 @@ event handler::scheduleOffline() {
     // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
     std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
     HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === kernel_exec_infos.size(): " << kernel_exec_infos.size() << std::endl;
+#ifdef SNMD_OFFLINE
+    prepareOfflineReadReplicasForDispatch(kernel_exec_infos);
+#endif
     for (int exec_num = 0; exec_num < kernel_exec_infos.size(); exec_num++) {
       D2SKernelExecInfo &kernel_exec_info = kernel_exec_infos.at(exec_num);
       int kernel_count = kernel_exec_info.kernel_count;
