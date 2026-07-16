@@ -177,7 +177,7 @@ CGExecKernel::cloneForSplit(const NDRDescT &NewNDR) const {
       MAuxiliaryResources, // vector<shared_ptr<const void>> 共享资源
       MType,
       MKernelCacheConfig,
-      {},
+      code_location{},
       std::move(PartitionLocalReqsCopy));
 }
 
