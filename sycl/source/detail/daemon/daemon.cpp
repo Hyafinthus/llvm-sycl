@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 #include <signal.h>
 #include <unistd.h>
 #include <mqueue.h>
@@ -12,12 +13,16 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <list>
 #include <map>
+#include <deque>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <cuda_runtime_api.h>
@@ -163,12 +168,55 @@ struct ProfileCostEntry {
   double mean_cost = 0.0;
   double m2_cost = 0.0;
   double min_cost = std::numeric_limits<double>::infinity();
+  double source_fp32_capability = 0.0;
+  double source_fp64_capability = 0.0;
+  uint64_t last_observed_unix_sec = 0;
   int samples = 0;
+  int live_samples = 0;
+};
+
+struct KernelFeatureSignature {
+  uint64_t kernel_identity = 0;
+  int work_dim = 0;
+  double global_items = 1.0;
+  double total_access_elems = 1.0;
+  double read_bytes = 0.0;
+  double write_bytes = 0.0;
+  double analytical_work = 1.0;
+  int req_count = 0;
+  int read_req_count = 0;
+  int write_req_count = 0;
+  int dominant_elem_size = 0;
+  uint32_t access_mode_mask = 0;
+  bool partition_local_read = false;
+  bool partition_local_write = false;
+};
+
+struct PersistedProfileObservation {
+  std::string profile_namespace;
+  ProfileCostKey key;
+  double sample_cost = 0.0;
+  double source_fp32_capability = 0.0;
+  double source_fp64_capability = 0.0;
+  uint64_t observed_unix_sec = 0;
+  bool feature_valid = false;
+  KernelFeatureSignature feature;
 };
 
 std::map<ProfileCostKey, ProfileCostEntry> profile_cost_table;
+std::map<std::string, KernelFeatureSignature> kernel_feature_table;
 std::map<std::tuple<pid_t, int, int>, uint64_t> profile_device_update_ns;
 std::mutex profile_cost_mutex;
+
+std::mutex profile_store_mutex;
+std::condition_variable profile_store_cv;
+std::deque<PersistedProfileObservation> profile_store_queue;
+std::thread profile_store_thread;
+std::string profile_store_path;
+std::string profile_store_namespace = "default";
+bool profile_store_enabled = false;
+bool profile_store_stop = false;
+uint64_t profile_store_dropped_records = 0;
 
 // ====【MPI】
 int mpi_rank, mpi_size; // main
@@ -846,7 +894,9 @@ static constexpr double SPLIT_MIN_ELEMS = 65536.0;
 enum class CostEstimateSource {
   cold_model,
   exact_profile,
+  persisted_profile,
   scaled_profile,
+  learned_profile,
   derived_split
 };
 
@@ -863,8 +913,12 @@ static const char *costEstimateSourceName(CostEstimateSource source) {
     return "cold";
   case CostEstimateSource::exact_profile:
     return "exact-profile";
+  case CostEstimateSource::persisted_profile:
+    return "persisted-profile";
   case CostEstimateSource::scaled_profile:
     return "scaled-profile";
+  case CostEstimateSource::learned_profile:
+    return "learned-profile";
   case CostEstimateSource::derived_split:
     return "derived-split";
   }
@@ -1168,7 +1222,329 @@ static uint64_t daemonSteadyNowNs() {
   return static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch())
+      .count());
+}
+
+static uint64_t daemonUnixNowSec() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
           .count());
+}
+
+static ComputeCapability fallbackCapabilityForProc(int proc);
+
+static KernelFeatureSignature buildKernelFeature(const DAGNode *node) {
+  KernelFeatureSignature feature;
+  if (node == nullptr) {
+    return feature;
+  }
+
+  feature.kernel_identity = node->kernel_identity;
+  feature.work_dim = node->work_dim;
+  feature.global_items =
+      static_cast<double>(node->global_size0) *
+      static_cast<double>(node->global_size1) *
+      static_cast<double>(node->global_size2);
+  feature.total_access_elems = 0.0;
+  feature.req_count = static_cast<int>(node->req_data.size());
+
+  std::map<int, double> elems_by_size;
+  for (const SyclReqData &req : node->req_data) {
+    const bool reads = isReadAccess(req.req_accmode);
+    const bool writes = isWriteAccess(req.req_accmode);
+    const double access_elems = reqAccessElems(req);
+    const double access_bytes = reqAccessBytes(req);
+    feature.total_access_elems += access_elems;
+    if (reads) {
+      feature.read_req_count++;
+      feature.read_bytes += access_bytes;
+      feature.partition_local_read =
+          feature.partition_local_read || req.partition_local;
+    }
+    if (writes) {
+      feature.write_req_count++;
+      feature.write_bytes += access_bytes;
+      feature.partition_local_write =
+          feature.partition_local_write || req.partition_local;
+    }
+    const unsigned mode = static_cast<unsigned>(req.req_accmode);
+    if (mode < 32) {
+      feature.access_mode_mask |= (1U << mode);
+    }
+    if (req.elem_size > 0) {
+      elems_by_size[req.elem_size] += access_elems;
+    }
+  }
+
+  double dominant_elems = -1.0;
+  for (const auto &entry : elems_by_size) {
+    if (entry.second > dominant_elems) {
+      dominant_elems = entry.second;
+      feature.dominant_elem_size = entry.first;
+    }
+  }
+
+  // Keep the transfer feature independent of the current DAG. The cold model
+  // deliberately changes its arithmetic-intensity guard for a wide root set,
+  // but a persisted sample must retain the same feature when the same kernel
+  // appears in a narrow window. Identity transfer learns the kernel-specific
+  // intensity from the measured service time; this proxy only scales shape.
+  feature.analytical_work =
+      std::max(feature.global_items, feature.total_access_elems);
+  feature.global_items = std::max(1.0, feature.global_items);
+  feature.total_access_elems = std::max(1.0, feature.total_access_elems);
+  feature.analytical_work = std::max(1.0, feature.analytical_work);
+  return feature;
+}
+
+static void registerKernelFeature(const DAGNode *node) {
+  if (node == nullptr) {
+    return;
+  }
+  const std::string key = profileKeyForNode(node);
+  const KernelFeatureSignature feature = buildKernelFeature(node);
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
+  kernel_feature_table[key] = feature;
+}
+
+static std::pair<double, double> profileSourceCapabilities(int rank,
+                                                           int device) {
+  if (rank >= 0 && rank < static_cast<int>(gpu_capability.size()) &&
+      device >= 0 &&
+      device < static_cast<int>(gpu_capability[rank].size())) {
+    return {gpu_capability[rank][device].fp32,
+            gpu_capability[rank][device].fp64};
+  }
+  const ComputeCapability fallback = fallbackCapabilityForProc(device);
+  return {fallback.fp32, fallback.fp64};
+}
+
+static void applyProfileObservationLocked(
+    const PersistedProfileObservation &observation, bool live_sample) {
+  ProfileCostEntry &entry = profile_cost_table[observation.key];
+  if (entry.samples == 0) {
+    entry.ewma_cost = observation.sample_cost;
+  } else {
+    entry.ewma_cost = entry.ewma_cost * 0.7 + observation.sample_cost * 0.3;
+  }
+  entry.samples++;
+  entry.live_samples += live_sample ? 1 : 0;
+  const double delta = observation.sample_cost - entry.mean_cost;
+  entry.mean_cost += delta / static_cast<double>(entry.samples);
+  const double delta_after_mean = observation.sample_cost - entry.mean_cost;
+  entry.m2_cost += delta * delta_after_mean;
+  entry.min_cost = std::min(entry.min_cost, observation.sample_cost);
+  if (observation.source_fp32_capability > 0.0) {
+    entry.source_fp32_capability = observation.source_fp32_capability;
+  }
+  if (observation.source_fp64_capability > 0.0) {
+    entry.source_fp64_capability = observation.source_fp64_capability;
+  }
+  entry.last_observed_unix_sec =
+      std::max(entry.last_observed_unix_sec, observation.observed_unix_sec);
+  if (observation.feature_valid) {
+    kernel_feature_table[observation.key.kernel_key] = observation.feature;
+  }
+}
+
+static std::string serializePersistedProfileObservation(
+    const PersistedProfileObservation &observation) {
+  const KernelFeatureSignature &feature = observation.feature;
+  std::ostringstream oss;
+  oss << std::setprecision(17) << "SNMD_PROFILE_OBS_V2\t"
+      << observation.profile_namespace << '\t' << observation.key.rank << '\t'
+      << observation.key.device << '\t'
+      << observation.key.num_parts << '\t'
+      << (observation.key.persistent_split ? 1 : 0) << '\t'
+      << observation.sample_cost << '\t'
+      << observation.source_fp32_capability << '\t'
+      << observation.source_fp64_capability << '\t'
+      << observation.observed_unix_sec << '\t'
+      << (observation.feature_valid ? 1 : 0) << '\t'
+      << feature.kernel_identity << '\t' << feature.work_dim << '\t'
+      << feature.global_items << '\t' << feature.total_access_elems << '\t'
+      << feature.read_bytes << '\t' << feature.write_bytes << '\t'
+      << feature.analytical_work << '\t' << feature.req_count << '\t'
+      << feature.read_req_count << '\t' << feature.write_req_count << '\t'
+      << feature.dominant_elem_size << '\t' << feature.access_mode_mask << '\t'
+      << (feature.partition_local_read ? 1 : 0) << '\t'
+      << (feature.partition_local_write ? 1 : 0) << '\t'
+      << observation.key.kernel_key << '\n';
+  return oss.str();
+}
+
+static bool deserializePersistedProfileObservation(
+    const std::string &line, PersistedProfileObservation &observation) {
+  std::istringstream iss(line);
+  std::string tag;
+  int persistent_split = 0;
+  int feature_valid = 0;
+  int partition_local_read = 0;
+  int partition_local_write = 0;
+  if (!(iss >> tag)) {
+    return false;
+  }
+  if (tag == "SNMD_PROFILE_OBS_V2") {
+    if (!(iss >> observation.profile_namespace)) {
+      return false;
+    }
+  } else if (tag == "SNMD_PROFILE_OBS_V1") {
+    // V1 predates build/application isolation. Only the default namespace
+    // accepts it; a caller selecting a namespace gets strict isolation.
+    observation.profile_namespace = "default";
+  } else {
+    return false;
+  }
+  if (!(iss >> observation.key.rank >> observation.key.device >>
+        observation.key.num_parts >> persistent_split >>
+        observation.sample_cost >> observation.source_fp32_capability >>
+        observation.source_fp64_capability >> observation.observed_unix_sec >>
+        feature_valid >> observation.feature.kernel_identity >>
+        observation.feature.work_dim >> observation.feature.global_items >>
+        observation.feature.total_access_elems >>
+        observation.feature.read_bytes >> observation.feature.write_bytes >>
+        observation.feature.analytical_work >> observation.feature.req_count >>
+        observation.feature.read_req_count >>
+        observation.feature.write_req_count >>
+        observation.feature.dominant_elem_size >>
+        observation.feature.access_mode_mask >> partition_local_read >>
+        partition_local_write >> observation.key.kernel_key)) {
+    return false;
+  }
+  observation.key.num_parts = std::max(1, observation.key.num_parts);
+  observation.key.persistent_split = persistent_split != 0;
+  observation.feature_valid = feature_valid != 0;
+  observation.feature.partition_local_read = partition_local_read != 0;
+  observation.feature.partition_local_write = partition_local_write != 0;
+  return observation.sample_cost > 0.0 &&
+         std::isfinite(observation.sample_cost) &&
+         !observation.key.kernel_key.empty();
+}
+
+static void persistentProfileStoreWriter() {
+  std::ofstream store(profile_store_path, std::ios::out | std::ios::app);
+  if (!store.is_open()) {
+    std::lock_guard<std::mutex> lock(profile_store_mutex);
+    profile_store_enabled = false;
+    profile_store_queue.clear();
+    DAEMON_TRACE_STREAM << "ProfileStore: cannot open " << profile_store_path
+                        << std::endl;
+    return;
+  }
+
+  while (true) {
+    PersistedProfileObservation observation;
+    {
+      std::unique_lock<std::mutex> lock(profile_store_mutex);
+      profile_store_cv.wait(lock, [] {
+        return profile_store_stop || !profile_store_queue.empty();
+      });
+      if (profile_store_stop && profile_store_queue.empty()) {
+        break;
+      }
+      observation = std::move(profile_store_queue.front());
+      profile_store_queue.pop_front();
+    }
+    store << serializePersistedProfileObservation(observation);
+    store.flush();
+  }
+}
+
+static void enqueuePersistentProfileObservation(
+    PersistedProfileObservation observation) {
+  std::lock_guard<std::mutex> lock(profile_store_mutex);
+  if (!profile_store_enabled || profile_store_stop) {
+    return;
+  }
+  if (profile_store_queue.size() >=
+      static_cast<size_t>(SNMD_OFFLINE_PROFILE_STORE_QUEUE_LIMIT)) {
+    profile_store_queue.pop_front();
+    ++profile_store_dropped_records;
+  }
+  profile_store_queue.push_back(std::move(observation));
+  profile_store_cv.notify_one();
+}
+
+static void initializePersistentProfileStore() {
+  if (mpi_rank != 0) {
+    return;
+  }
+  const char *enabled_env = std::getenv("SYCL_SNMD_PROFILE_PERSIST");
+  bool enabled = SNMD_OFFLINE_PROFILE_STORE_DEFAULT_ENABLED != 0;
+  if (enabled_env != nullptr) {
+    enabled = std::strcmp(enabled_env, "0") != 0 &&
+              std::strcmp(enabled_env, "false") != 0 &&
+              std::strcmp(enabled_env, "FALSE") != 0;
+  }
+  if (!enabled) {
+    return;
+  }
+
+  const char *namespace_env = std::getenv("SYCL_SNMD_PROFILE_NAMESPACE");
+  if (namespace_env != nullptr && namespace_env[0] != '\0') {
+    profile_store_namespace = namespace_env;
+    for (char &ch : profile_store_namespace) {
+      if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-' &&
+          ch != '_' && ch != '.') {
+        ch = '_';
+      }
+    }
+  }
+
+  const char *path_env = std::getenv("SYCL_SNMD_PROFILE_STORE");
+  profile_store_path =
+      path_env != nullptr && path_env[0] != '\0'
+          ? path_env
+          : "/tmp/sycl-snmd-profile-observations-v1-rank0.tsv";
+
+  size_t loaded = 0;
+  std::ifstream store(profile_store_path);
+  std::string line;
+  const uint64_t now_sec = daemonUnixNowSec();
+  const uint64_t max_age_sec =
+      static_cast<uint64_t>(SNMD_OFFLINE_PROFILE_STORE_MAX_AGE_DAYS) * 86400ULL;
+  while (std::getline(store, line)) {
+    PersistedProfileObservation observation;
+    if (!deserializePersistedProfileObservation(line, observation)) {
+      continue;
+    }
+    if (observation.profile_namespace != profile_store_namespace) {
+      continue;
+    }
+    if (observation.observed_unix_sec != 0 &&
+        now_sec > observation.observed_unix_sec &&
+        now_sec - observation.observed_unix_sec > max_age_sec) {
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(profile_cost_mutex);
+    applyProfileObservationLocked(observation, /*live_sample=*/false);
+    ++loaded;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(profile_store_mutex);
+    profile_store_stop = false;
+    profile_store_enabled = true;
+  }
+  profile_store_thread = std::thread(persistentProfileStoreWriter);
+  DAEMON_TRACE_STREAM << "ProfileStore: loaded " << loaded << " records from "
+                      << profile_store_path << " namespace "
+                      << profile_store_namespace << std::endl;
+}
+
+static void shutdownPersistentProfileStore() {
+  {
+    std::lock_guard<std::mutex> lock(profile_store_mutex);
+    if (!profile_store_thread.joinable()) {
+      return;
+    }
+    profile_store_stop = true;
+    profile_store_cv.notify_all();
+  }
+  profile_store_thread.join();
+  DAEMON_TRACE_STREAM << "ProfileStore: stopped dropped_records "
+                      << profile_store_dropped_records << std::endl;
 }
 
 static void updateProfileCostTable(const S2DKernelProfileData &profile,
@@ -1183,26 +1559,39 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
   const double sample_cost =
       static_cast<double>(profile.duration_ns) / PROFILE_NS_TO_COST;
 
-  std::lock_guard<std::mutex> lock(profile_cost_mutex);
-  ProfileCostEntry &entry = profile_cost_table[key];
-  if (entry.samples == 0) {
-    entry.ewma_cost = sample_cost;
-  } else {
-    entry.ewma_cost = entry.ewma_cost * 0.7 + sample_cost * 0.3;
+  PersistedProfileObservation observation;
+  observation.profile_namespace = profile_store_namespace;
+  observation.key = key;
+  observation.sample_cost = sample_cost;
+  const auto source_capability =
+      profileSourceCapabilities(sample_rank, profile.device_index);
+  observation.source_fp32_capability = source_capability.first;
+  observation.source_fp64_capability = source_capability.second;
+  observation.observed_unix_sec = daemonUnixNowSec();
+
+  ProfileCostEntry entry_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(profile_cost_mutex);
+    auto feature_it = kernel_feature_table.find(profile.kernel_key);
+    if (feature_it != kernel_feature_table.end()) {
+      observation.feature_valid = true;
+      observation.feature = feature_it->second;
+    }
+    applyProfileObservationLocked(observation, /*live_sample=*/true);
+    profile_device_update_ns[
+        {profile.pid, sample_rank, profile.device_index}] =
+        daemonSteadyNowNs();
+    entry_snapshot = profile_cost_table[key];
   }
-  entry.samples++;
-  const double delta = sample_cost - entry.mean_cost;
-  entry.mean_cost += delta / static_cast<double>(entry.samples);
-  const double delta_after_mean = sample_cost - entry.mean_cost;
-  entry.m2_cost += delta * delta_after_mean;
-  entry.min_cost = std::min(entry.min_cost, sample_cost);
-  profile_device_update_ns[
-      {profile.pid, sample_rank, profile.device_index}] =
-      daemonSteadyNowNs();
+  // Persistence is deliberately outside profile_cost_mutex and only enqueues
+  // a bounded record. The writer thread may block on storage without delaying
+  // completion acknowledgement or the next ready-queue admission.
+  enqueuePersistentProfileObservation(std::move(observation));
 
   const double stddev =
-      entry.samples > 1
-          ? std::sqrt(entry.m2_cost / static_cast<double>(entry.samples - 1))
+      entry_snapshot.samples > 1
+          ? std::sqrt(entry_snapshot.m2_cost /
+                      static_cast<double>(entry_snapshot.samples - 1))
           : 0.0;
 
   DAEMON_TRACE_STREAM << "ProfileCostTable: key " << profile.kernel_key
@@ -1210,11 +1599,12 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
             << " parts " << std::max(1, profile.num_parts)
             << " persistent " << profile.persistent_split
             << " sample_cost " << sample_cost
-            << " ewma_cost " << entry.ewma_cost
-            << " mean_cost " << entry.mean_cost
+            << " ewma_cost " << entry_snapshot.ewma_cost
+            << " mean_cost " << entry_snapshot.mean_cost
             << " stddev_cost " << stddev
-            << " min_cost " << entry.min_cost
-            << " samples " << entry.samples << std::endl;
+            << " min_cost " << entry_snapshot.min_cost
+            << " samples " << entry_snapshot.samples
+            << " live_samples " << entry_snapshot.live_samples << std::endl;
 }
 
 static double profileEntryUncertainty(const ProfileCostEntry &entry) {
@@ -1234,7 +1624,23 @@ static double profileEntryUncertainty(const ProfileCostEntry &entry) {
       std::max(0.001, entry.ewma_cost) *
       (static_cast<double>(SNMD_OFFLINE_PROFILE_PRIOR_ERROR_PERCENT) / 100.0) /
       std::sqrt(static_cast<double>(entry.samples));
-  return std::hypot(observed_prediction_uncertainty, prior_uncertainty);
+  double uncertainty =
+      std::hypot(observed_prediction_uncertainty, prior_uncertainty);
+  if (entry.live_samples == 0) {
+    const uint64_t now_sec = daemonUnixNowSec();
+    const double age_days =
+        entry.last_observed_unix_sec != 0 && now_sec > entry.last_observed_unix_sec
+            ? static_cast<double>(now_sec - entry.last_observed_unix_sec) /
+                  86400.0
+            : 0.0;
+    const double persisted_floor =
+        std::max(0.001, entry.ewma_cost) *
+        (static_cast<double>(SNMD_OFFLINE_PERSISTED_PROFILE_ERROR_PERCENT) /
+             100.0 +
+         std::min(0.5, age_days * 0.01));
+    uncertainty = std::hypot(uncertainty, persisted_floor);
+  }
+  return uncertainty;
 }
 
 static bool lookupExactProfileEstimate(const std::string &kernel_key,
@@ -1252,16 +1658,20 @@ static bool lookupExactProfileEstimate(const std::string &kernel_key,
   estimate.mean = exact_it->second.ewma_cost;
   estimate.uncertainty = profileEntryUncertainty(exact_it->second);
   estimate.samples = exact_it->second.samples;
-  estimate.source = CostEstimateSource::exact_profile;
+  estimate.source = exact_it->second.live_samples > 0
+                        ? CostEstimateSource::exact_profile
+                        : CostEstimateSource::persisted_profile;
   return true;
 }
 
-static bool hasExactProfileCost(const std::string &kernel_key, int rank,
-                                int device, int num_parts,
-                                bool persistent_split = false) {
-  CostEstimate ignored_estimate;
-  return lookupExactProfileEstimate(kernel_key, rank, device, num_parts,
-                                    persistent_split, ignored_estimate);
+static bool hasLiveExactProfileCost(const std::string &kernel_key, int rank,
+                                    int device, int num_parts,
+                                    bool persistent_split = false) {
+  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts),
+                       persistent_split};
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
+  auto it = profile_cost_table.find(exact);
+  return it != profile_cost_table.end() && it->second.live_samples > 0;
 }
 
 #if defined(SNMD_OFFLINE_COLD_SPLIT_PROBE) ||                              \
@@ -1810,6 +2220,10 @@ static bool isKernelPlacementProc(int rank, int proc) {
   return proc == 0;
 }
 
+static double profileEntrySourceCapability(const ProfileCostKey &key,
+                                           const ProfileCostEntry &entry,
+                                           KernelPrecision precision);
+
 static bool lookupScaledProfileEstimate(const std::string &kernel_key,
                                         int rank, int device, int num_parts,
                                         bool persistent_split,
@@ -1837,9 +2251,8 @@ static bool lookupScaledProfileEstimate(const std::string &kernel_key,
       continue;
     }
 
-    const double source_capability =
-        std::max(0.1, deviceCapability(sample_key.rank, sample_key.device,
-                                       precision));
+    const double source_capability = profileEntrySourceCapability(
+        sample_key, entry.second, precision);
     const double scaled_cost =
         entry.second.ewma_cost * source_capability / target_capability;
     const double scaled_uncertainty =
@@ -1868,6 +2281,169 @@ static bool lookupScaledProfileEstimate(const std::string &kernel_key,
   return true;
 }
 
+static bool kernelFeaturesShareStructuralCohort(
+    const KernelFeatureSignature &lhs, const KernelFeatureSignature &rhs) {
+  return lhs.work_dim == rhs.work_dim && lhs.req_count == rhs.req_count &&
+         lhs.read_req_count == rhs.read_req_count &&
+         lhs.write_req_count == rhs.write_req_count &&
+         lhs.dominant_elem_size == rhs.dominant_elem_size &&
+         lhs.access_mode_mask == rhs.access_mode_mask &&
+         lhs.partition_local_read == rhs.partition_local_read &&
+         lhs.partition_local_write == rhs.partition_local_write;
+}
+
+static double logFeatureRatioDistance(double lhs, double rhs) {
+  lhs = std::max(1.0, lhs);
+  rhs = std::max(1.0, rhs);
+  return std::abs(std::log(lhs / rhs));
+}
+
+static double kernelFeatureDistance(const KernelFeatureSignature &target,
+                                    const KernelFeatureSignature &sample) {
+  const double global_distance =
+      logFeatureRatioDistance(target.global_items, sample.global_items);
+  const double access_distance = logFeatureRatioDistance(
+      target.total_access_elems, sample.total_access_elems);
+  const double read_distance =
+      logFeatureRatioDistance(target.read_bytes + 1.0,
+                              sample.read_bytes + 1.0);
+  const double write_distance =
+      logFeatureRatioDistance(target.write_bytes + 1.0,
+                              sample.write_bytes + 1.0);
+  return std::sqrt(global_distance * global_distance +
+                   access_distance * access_distance +
+                   0.5 * read_distance * read_distance +
+                   0.5 * write_distance * write_distance);
+}
+
+static double profileEntrySourceCapability(const ProfileCostKey &key,
+                                           const ProfileCostEntry &entry,
+                                           KernelPrecision precision) {
+  const double stored = precision == KernelPrecision::fp64
+                            ? entry.source_fp64_capability
+                            : entry.source_fp32_capability;
+  return stored > 0.0
+             ? stored
+             : std::max(0.1,
+                        deviceCapability(key.rank, key.device, precision));
+}
+
+static bool lookupLearnedProfileEstimate(
+    DAGNode *node, int rank, int device, int num_parts,
+    bool persistent_split, KernelPrecision precision, CostEstimate &estimate) {
+  if (node == nullptr) {
+    return false;
+  }
+  const KernelFeatureSignature target = buildKernelFeature(node);
+  const int parts = std::max(1, num_parts);
+  const double target_capability =
+      std::max(0.1, deviceCapability(rank, device, precision));
+
+  struct Neighbor {
+    const ProfileCostKey *key = nullptr;
+    const ProfileCostEntry *entry = nullptr;
+    const KernelFeatureSignature *feature = nullptr;
+    double distance = 0.0;
+    bool same_identity = false;
+  };
+  std::vector<Neighbor> neighbors;
+  bool has_identity_neighbor = false;
+
+  std::lock_guard<std::mutex> lock(profile_cost_mutex);
+  for (const auto &profile_entry : profile_cost_table) {
+    const ProfileCostKey &sample_key = profile_entry.first;
+    const ProfileCostEntry &sample_entry = profile_entry.second;
+    if (sample_entry.samples <= 0 || sample_key.num_parts != parts ||
+        sample_key.persistent_split != persistent_split) {
+      continue;
+    }
+    auto feature_it = kernel_feature_table.find(sample_key.kernel_key);
+    if (feature_it == kernel_feature_table.end()) {
+      continue;
+    }
+    const KernelFeatureSignature &sample_feature = feature_it->second;
+    const bool same_identity = target.kernel_identity != 0 &&
+                               target.kernel_identity ==
+                                   sample_feature.kernel_identity;
+    if (!same_identity &&
+        !kernelFeaturesShareStructuralCohort(target, sample_feature)) {
+      continue;
+    }
+    const double distance = kernelFeatureDistance(target, sample_feature);
+    // Same-kernel strong scaling may span a wide range of input sizes.
+    // Cross-kernel transfer is intentionally local because equal access modes
+    // alone do not prove equal arithmetic intensity.
+    if ((!same_identity && distance > 1.5) ||
+        (same_identity && distance > 6.0)) {
+      continue;
+    }
+    neighbors.push_back(
+        {&sample_key, &sample_entry, &sample_feature, distance, same_identity});
+    has_identity_neighbor = has_identity_neighbor || same_identity;
+  }
+
+  double total_weight = 0.0;
+  double weighted_mean = 0.0;
+  double weighted_second_moment = 0.0;
+  int total_samples = 0;
+  int used_neighbors = 0;
+  for (const Neighbor &neighbor : neighbors) {
+    if (has_identity_neighbor && !neighbor.same_identity) {
+      continue;
+    }
+    const double source_capability = profileEntrySourceCapability(
+        *neighbor.key, *neighbor.entry, precision);
+    const double work_scale = std::max(
+        0.05, std::min(20.0, target.analytical_work /
+                                  std::max(1.0,
+                                           neighbor.feature->analytical_work)));
+    const double predicted_cost =
+        neighbor.entry->ewma_cost * source_capability / target_capability *
+        work_scale;
+    const double scaled_profile_uncertainty =
+        profileEntryUncertainty(*neighbor.entry) * source_capability /
+        target_capability * work_scale;
+    const double base_model_error =
+        static_cast<double>(neighbor.same_identity
+                                ? SNMD_OFFLINE_LEARNED_IDENTITY_ERROR_PERCENT
+                                : SNMD_OFFLINE_LEARNED_STRUCTURAL_ERROR_PERCENT) /
+        100.0;
+    const double model_uncertainty =
+        predicted_cost *
+        std::min(1.5, base_model_error + 0.10 * neighbor.distance);
+    const double neighbor_uncertainty =
+        std::hypot(scaled_profile_uncertainty, model_uncertainty);
+    const double weight =
+        std::sqrt(static_cast<double>(neighbor.entry->samples)) *
+        (neighbor.same_identity ? 4.0 : 1.0) /
+        (1.0 + neighbor.distance * neighbor.distance);
+    total_weight += weight;
+    weighted_mean += weight * predicted_cost;
+    weighted_second_moment +=
+        weight * (predicted_cost * predicted_cost +
+                  neighbor_uncertainty * neighbor_uncertainty);
+    total_samples += neighbor.entry->samples;
+    ++used_neighbors;
+  }
+
+  if (total_weight <= 0.0 || used_neighbors == 0) {
+    return false;
+  }
+  estimate.mean = weighted_mean / total_weight;
+  const double second_moment = weighted_second_moment / total_weight;
+  estimate.uncertainty =
+      std::sqrt(std::max(0.0, second_moment - estimate.mean * estimate.mean));
+  estimate.samples = total_samples;
+  estimate.source = CostEstimateSource::learned_profile;
+  DAEMON_TRACE_STREAM
+      << "LearnedProfile: kernel " << node->kernel_count << " parts " << parts
+      << " persistent " << persistent_split << " identity_neighbors "
+      << (has_identity_neighbor ? 1 : 0) << " neighbors " << used_neighbors
+      << " samples " << total_samples << " mean " << estimate.mean
+      << " uncertainty " << estimate.uncertainty << std::endl;
+  return true;
+}
+
 static double deviceServiceTimeScale(int rank, int proc) {
   if (rank < 0 || rank >= static_cast<int>(gpu_service_time_scale.size()) ||
       proc < 0 ||
@@ -1883,10 +2459,10 @@ static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
   // on the device. Until residency-aware allocation deltas are tracked, do not
   // double-count its existing buffers against current free memory.
   if (proc > 0 &&
-      (hasExactProfileCost(profileKeyForNode(node), rank, proc, num_parts,
-                           false) ||
-       hasExactProfileCost(profileKeyForNode(node), rank, proc, num_parts,
-                           true))) {
+      (hasLiveExactProfileCost(profileKeyForNode(node), rank, proc, num_parts,
+                               false) ||
+       hasLiveExactProfileCost(profileKeyForNode(node), rank, proc, num_parts,
+                               true))) {
     return true;
   }
 
@@ -1913,6 +2489,13 @@ static CostEstimate estimateSingleExecCost(DAGNode *node, int rank, int proc) {
   const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
   if (lookupScaledProfileEstimate(key, rank, proc, 1, false, precision,
                                   estimate)) {
+    const double scale = deviceServiceTimeScale(rank, proc);
+    estimate.mean = std::max(0.001, estimate.mean) * scale;
+    estimate.uncertainty *= scale;
+    return estimate;
+  }
+  if (lookupLearnedProfileEstimate(node, rank, proc, 1, false, precision,
+                                   estimate)) {
     const double scale = deviceServiceTimeScale(rank, proc);
     estimate.mean = std::max(0.001, estimate.mean) * scale;
     estimate.uncertainty *= scale;
@@ -2460,6 +3043,17 @@ estimateSplitExecCost(DAGNode *node, int rank,
   const KernelPrecision precision = inferKernelPrecisionFromReqs(node->req_data);
   if (lookupScaledProfileEstimate(key, rank, split_devices.front(), num_parts,
                                   persistent_split, precision, estimate)) {
+    double penalty = 1.0;
+    for (int proc : split_devices) {
+      penalty = std::max(penalty, deviceServiceTimeScale(rank, proc));
+    }
+    estimate.mean = std::max(0.001, estimate.mean) * penalty;
+    estimate.uncertainty *= penalty;
+    return estimate;
+  }
+  if (lookupLearnedProfileEstimate(node, rank, split_devices.front(),
+                                   num_parts, persistent_split, precision,
+                                   estimate)) {
     double penalty = 1.0;
     for (int proc : split_devices) {
       penalty = std::max(penalty, deviceServiceTimeScale(rank, proc));
@@ -3065,6 +3659,7 @@ void algorithmHEFT(
       total_elem += reqAccessElems(req);
     }
     node->total_elem = total_elem / 1000; // TODO 归一化
+    registerKernelFeature(node);
     DAEMON_TRACE_STREAM << "algorithmHEFT: Kernel " << node->kernel_count
               << " identity " << std::hex << node->kernel_identity << std::dec
               << " total_elem: " << total_elem
@@ -5367,6 +5962,7 @@ int main(int argc, char *argv[]) {
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
   MPI_Get_processor_name(proc_name, &name_len);
   DAEMON_TRACE_STREAM << "MPI_Rank " << mpi_rank << ": " << proc_name << " of " << mpi_size << " started" << std::endl;
+  initializePersistentProfileStore();
   // split_key==mpi_rank 所以local_rank和mpi_rank相同 在线程中仍可以使用mpi_rank和mpi_size
   MPI_Comm_split(MPI_COMM_WORLD, 0, mpi_rank, &comm_submit);
   MPI_Comm_split(MPI_COMM_WORLD, 0, mpi_rank, &comm_monitor);
@@ -5411,6 +6007,7 @@ int main(int argc, char *argv[]) {
 
   // ====【MPI】
   MPI_Comm_free(&comm_submit);
+  shutdownPersistentProfileStore();
   MPI_Finalize();
 
   return 0;
