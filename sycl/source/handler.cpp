@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -852,6 +853,8 @@ struct OfflineSplitFinalizeTiming {
 
 struct OfflineReadReplicaCacheEntry {
   detail::SYCLMemObjI *MemObj = nullptr;
+  std::weak_ptr<detail::MemObjRecord> Record;
+  uint64_t WriteVersion = 0;
   std::vector<detail::QueueImplPtr> Queues;
 };
 
@@ -876,6 +879,25 @@ static std::vector<OfflineReadReplicaCacheEntry> &offlineReadReplicaCache() {
   return Cache;
 }
 
+static bool offlinePersistReadReplicasAcrossWaits() {
+  static const bool Persist = []() {
+    const char *Env = std::getenv("SYCL_SNMD_READ_REPLICA_PERSIST");
+    if (Env == nullptr || *Env == '\0' || std::strcmp(Env, "1") == 0 ||
+        std::strcmp(Env, "true") == 0 || std::strcmp(Env, "TRUE") == 0) {
+      return true;
+    }
+    if (std::strcmp(Env, "0") == 0 || std::strcmp(Env, "false") == 0 ||
+        std::strcmp(Env, "FALSE") == 0) {
+      return false;
+    }
+    HANDLER_TRACE_STREAM
+        << "=== handler === invalid SYCL_SNMD_READ_REPLICA_PERSIST='"
+        << Env << "', using default: 1" << std::endl;
+    return true;
+  }();
+  return Persist;
+}
+
 static std::map<detail::SYCLMemObjI *, OfflineBatchMemAccessSummary> &
 offlineBatchMemAccessSummaries() {
   static std::map<detail::SYCLMemObjI *, OfflineBatchMemAccessSummary>
@@ -894,14 +916,30 @@ static void rememberOfflineReadReplica(
     return;
   }
 
+  std::shared_ptr<detail::MemObjRecord> CurrentRecord =
+      detail::Scheduler::getMemObjRecordWeak(MemObj).lock();
+  if (CurrentRecord == nullptr) {
+    return;
+  }
+  const uint64_t CurrentWriteVersion =
+      CurrentRecord->MWriteVersion.load(std::memory_order_acquire);
+
   auto CacheIt = std::find_if(
       offlineReadReplicaCache().begin(), offlineReadReplicaCache().end(),
       [MemObj](const OfflineReadReplicaCacheEntry &Entry) {
         return Entry.MemObj == MemObj;
       });
   if (CacheIt == offlineReadReplicaCache().end()) {
-    offlineReadReplicaCache().push_back({MemObj, {Queue}});
+    offlineReadReplicaCache().push_back(
+        {MemObj, CurrentRecord, CurrentWriteVersion, {Queue}});
     return;
+  }
+
+  if (CacheIt->Record.lock() != CurrentRecord ||
+      CacheIt->WriteVersion != CurrentWriteVersion) {
+    CacheIt->Record = CurrentRecord;
+    CacheIt->WriteVersion = CurrentWriteVersion;
+    CacheIt->Queues.clear();
   }
 
   const bool AlreadyRemembered = std::any_of(
@@ -941,7 +979,30 @@ static std::vector<OfflineSplitFinalizeTiming> &offlineSplitFinalizeTimes() {
 static void clearPendingOfflineSplitState() {
   pendingOfflineSplitMerges().clear();
   offlineSplitFinalizeTimes().clear();
-  offlineReadReplicaCache().clear();
+  // Full-buffer read replicas are physical allocations, not batch-local
+  // Requirement objects. Keep them across wait windows while their record is
+  // alive and no write has advanced the version. This avoids synchronously
+  // rebuilding the same constant tables at every time step.
+  std::vector<OfflineReadReplicaCacheEntry> &ReplicaCache =
+      offlineReadReplicaCache();
+  if (!offlinePersistReadReplicasAcrossWaits()) {
+    ReplicaCache.clear();
+  } else {
+    ReplicaCache.erase(
+        std::remove_if(
+            ReplicaCache.begin(), ReplicaCache.end(),
+            [](const OfflineReadReplicaCacheEntry &Entry) {
+              std::shared_ptr<detail::MemObjRecord> Record =
+                  Entry.Record.lock();
+              return Record == nullptr ||
+                     Record->MWriteVersion.load(std::memory_order_acquire) !=
+                         Entry.WriteVersion;
+            }),
+        ReplicaCache.end());
+  }
+  HANDLER_TRACE_STREAM
+      << "=== handler === retained cross-wait read replica objects: "
+      << ReplicaCache.size() << std::endl;
   offlineBatchMemAccessSummaries().clear();
   offlineBatchMemAccessSummariesInitialized() = false;
   offlinePartitionReadCache().clear();
@@ -1170,19 +1231,38 @@ static bool offlineHasReadReplica(
     return false;
   }
 
-  for (const OfflineReadReplicaCacheEntry &Entry :
-       offlineReadReplicaCache()) {
-    if (Entry.MemObj != MemObj) {
-      continue;
-    }
-    for (const detail::QueueImplPtr &ReplicaQueue : Entry.Queues) {
-      if (ReplicaQueue != nullptr &&
-          detail::sameCtx(ReplicaQueue->getContextImplPtr(),
-                          TargetQueue->getContextImplPtr()) &&
-          ReplicaQueue->getDeviceImplPtr() ==
-              TargetQueue->getDeviceImplPtr()) {
-        return true;
-      }
+  std::shared_ptr<detail::MemObjRecord> CurrentRecord =
+      detail::Scheduler::getMemObjRecordWeak(MemObj).lock();
+  if (CurrentRecord == nullptr) {
+    return false;
+  }
+
+  std::vector<OfflineReadReplicaCacheEntry> &Cache =
+      offlineReadReplicaCache();
+  auto CacheIt = std::find_if(
+      Cache.begin(), Cache.end(),
+      [MemObj](const OfflineReadReplicaCacheEntry &Entry) {
+        return Entry.MemObj == MemObj;
+      });
+  if (CacheIt == Cache.end()) {
+    return false;
+  }
+
+  const uint64_t CurrentWriteVersion =
+      CurrentRecord->MWriteVersion.load(std::memory_order_acquire);
+  if (CacheIt->Record.lock() != CurrentRecord ||
+      CacheIt->WriteVersion != CurrentWriteVersion) {
+    Cache.erase(CacheIt);
+    return false;
+  }
+
+  for (const detail::QueueImplPtr &ReplicaQueue : CacheIt->Queues) {
+    if (ReplicaQueue != nullptr &&
+        detail::sameCtx(ReplicaQueue->getContextImplPtr(),
+                        TargetQueue->getContextImplPtr()) &&
+        ReplicaQueue->getDeviceImplPtr() ==
+            TargetQueue->getDeviceImplPtr()) {
+      return true;
     }
   }
 

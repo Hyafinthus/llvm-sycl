@@ -1152,6 +1152,9 @@ void Scheduler::GraphBuilder::markModifiedIfWrite(MemObjRecord *Record,
   case access::mode::discard_read_write:
   case access::mode::atomic:
     Record->MMemModified = true;
+#ifdef SNMD_OFFLINE
+    Record->MWriteVersion.fetch_add(1, std::memory_order_release);
+#endif
     break;
   case access::mode::read:
     break;

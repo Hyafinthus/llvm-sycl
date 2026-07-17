@@ -562,6 +562,15 @@ MemObjRecord *Scheduler::getMemObjRecord(const Requirement *const Req) {
   return Req->MSYCLMemObj->MRecord.get();
 }
 
+#ifdef SNMD_OFFLINE
+std::weak_ptr<MemObjRecord>
+Scheduler::getMemObjRecordWeak(SYCLMemObjI *MemObject) {
+  if (MemObject == nullptr)
+    return {};
+  return MemObject->MRecord;
+}
+#endif
+
 void Scheduler::cleanupCommands(const std::vector<Command *> &Cmds) {
   cleanupAuxiliaryResources(BlockingT::NON_BLOCKING);
   cleanupDeferredMemObjects(BlockingT::NON_BLOCKING);

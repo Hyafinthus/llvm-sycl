@@ -3324,14 +3324,14 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
   TaskCandidate candidate;
   candidate.rank = rank;
   candidate.num_parts = num_parts;
-  const bool persistent_split =
-      gpu_available_time.size() == 1 &&
-      supportsPersistentSplit(node, num_parts) &&
-      hasPartitionLocalSuccessor(node, num_parts);
 
   if (!worthConsideringSplit(node, num_parts)) {
     return candidate;
   }
+  const bool persistent_split =
+      gpu_available_time.size() == 1 &&
+      supportsPersistentSplit(node, num_parts) &&
+      hasPartitionLocalSuccessor(node, num_parts);
   if (rank < 0 || rank >= static_cast<int>(gpu_available_time.size()) ||
       static_cast<int>(gpu_available_time[rank].size()) <= num_parts) {
     return candidate;
@@ -3349,6 +3349,28 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
       gpu_procs.size() >= 63) {
     return candidate;
   }
+
+#if defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
+    defined(SNMD_OFFLINE_COLD_SPLIT_PROBE)
+  const bool has_split_profile =
+      hasProfileCostForParts(profileKeyForNode(node), num_parts,
+                             persistent_split);
+  std::map<int, CostEstimate> single_estimates;
+  for (int proc : gpu_procs) {
+    single_estimates.emplace(proc, estimateSingleExecCost(node, rank, proc));
+  }
+#endif
+#ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
+  if (!has_split_profile &&
+      std::all_of(single_estimates.begin(), single_estimates.end(),
+                  [](const auto &Entry) {
+                    return std::isfinite(Entry.second.mean) &&
+                           Entry.second.mean <
+                               SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST;
+                  })) {
+    return candidate;
+  }
+#endif
 
   const uint64_t mask_limit = 1ULL << gpu_procs.size();
   for (uint64_t mask = 0; mask < mask_limit; ++mask) {
@@ -3368,6 +3390,29 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
       device_ready = std::max(device_ready, gpu_available_time[rank][proc]);
     }
 
+#if defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
+    defined(SNMD_OFFLINE_COLD_SPLIT_PROBE)
+    CostEstimate best_single_estimate;
+    for (int proc : split_devices) {
+      const CostEstimate &single_estimate = single_estimates.at(proc);
+      if (riskAdjustedCost(single_estimate) <
+          riskAdjustedCost(best_single_estimate)) {
+        best_single_estimate = single_estimate;
+      }
+    }
+#endif
+#ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
+    // The minimum single-task cost is a hard gate. Apply it before building a
+    // transfer plan or estimating Split execution: completion-driven
+    // scheduling revisits every ready task, so doing the expensive work first
+    // creates dispatch bubbles even though the candidate cannot be selected.
+    if (!has_split_profile && std::isfinite(best_single_estimate.mean) &&
+        best_single_estimate.mean <
+            SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST) {
+      continue;
+    }
+#endif
+
     const DependencyTransferPlan transfer_plan =
         buildDependencyTransferPlan(node, rank, split_devices);
     const double start_time =
@@ -3375,30 +3420,12 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     const CostEstimate exec_estimate =
         estimateSplitExecCost(node, rank, split_devices, persistent_split);
 
-#if defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
-    defined(SNMD_OFFLINE_COLD_SPLIT_PROBE)
-    CostEstimate best_single_estimate;
-    for (int proc : split_devices) {
-      const CostEstimate single_estimate =
-          estimateSingleExecCost(node, rank, proc);
-      if (riskAdjustedCost(single_estimate) <
-          riskAdjustedCost(best_single_estimate)) {
-        best_single_estimate = single_estimate;
-      }
-    }
-
-    const bool has_split_profile =
-        hasProfileCostForParts(profileKeyForNode(node), num_parts,
-                               persistent_split);
-#endif
 #ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
     if (!has_split_profile && std::isfinite(best_single_estimate.mean)) {
       const double max_cold_split_cost =
           best_single_estimate.mean *
           (100.0 - SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT) / 100.0;
-      if (best_single_estimate.mean <
-              SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST ||
-          exec_estimate.mean > max_cold_split_cost) {
+      if (exec_estimate.mean > max_cold_split_cost) {
         DAEMON_TRACE_STREAM
             << "algorithmHEFT: Kernel " << node->kernel_count
             << " cold split probe rejected: split " << exec_estimate.mean

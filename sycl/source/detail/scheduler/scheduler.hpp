@@ -13,7 +13,9 @@
 #include <detail/sycl_mem_obj_i.hpp>
 #include <sycl/detail/cg.hpp>
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <queue>
 #include <set>
@@ -224,6 +226,13 @@ struct MemObjRecord {
   // The flag indicates that the content of the memory object was/will be
   // modified. Used while deciding if copy back needed.
   bool MMemModified = false;
+
+#ifdef SNMD_OFFLINE
+  // Monotonically identifies writes submitted for this memory object.  The
+  // offline multi-device path uses this to keep read-only replicas across
+  // wait-delimited scheduling windows without ever reusing a stale replica.
+  std::atomic<std::uint64_t> MWriteVersion{0};
+#endif
 };
 
 /// DPC++ graph scheduler class.
@@ -450,6 +459,13 @@ public:
   const QueueImplPtr &getDefaultHostQueue() const { return DefaultHostQueue; }
 
   static MemObjRecord *getMemObjRecord(const Requirement *const Req);
+
+#ifdef SNMD_OFFLINE
+  // A weak handle lets the offline replica cache validate object lifetime
+  // without extending the lifetime of the scheduler record.
+  static std::weak_ptr<MemObjRecord>
+  getMemObjRecordWeak(SYCLMemObjI *MemObject);
+#endif
 
   void deferMemObjRelease(const std::shared_ptr<detail::SYCLMemObjI> &MemObj);
 
