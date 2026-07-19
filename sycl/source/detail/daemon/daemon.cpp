@@ -890,6 +890,28 @@ static constexpr double FALLBACK_D2D_BW_GIB = 12.0;
 static constexpr double FALLBACK_CROSS_RANK_BW_GIB = 0.106;
 static constexpr double SPLIT_EFFICIENCY = 0.85;
 static constexpr double SPLIT_MIN_ELEMS = 65536.0;
+// One latency-bound CUDA kernel can require several resident warps per SM to
+// reach its profiled throughput.  Treat this many aggregate work-items as one
+// GPU's concurrent-residency budget when comparing a co-located out-of-order
+// queue with the ordinary exclusive-device HEFT plan.  The runtime override
+// is useful for architecture-specific calibration; zero disables the model.
+static constexpr double DEFAULT_CONCURRENT_GPU_TARGET_ITEMS = 16384.0;
+
+static double concurrentGpuTargetItems() {
+  static const double target_items = [] {
+    const char *env = std::getenv("SYCL_SNMD_CONCURRENT_TARGET_ITEMS");
+    if (env == nullptr || *env == '\0') {
+      return DEFAULT_CONCURRENT_GPU_TARGET_ITEMS;
+    }
+    char *end = nullptr;
+    const double parsed = std::strtod(env, &end);
+    if (end == env || *end != '\0' || !std::isfinite(parsed) || parsed < 0.0) {
+      return DEFAULT_CONCURRENT_GPU_TARGET_ITEMS;
+    }
+    return parsed;
+  }();
+  return target_items;
+}
 
 enum class CostEstimateSource {
   cold_model,
@@ -2483,6 +2505,36 @@ static bool monitorMemoryFits(const DAGNode *node, int rank, int proc,
   return required_bytes < available_bytes * 0.85;
 }
 
+static bool monitorCoLocatedBatchMemoryFits(
+    const std::vector<DAGNode *> &nodes, int rank, int proc) {
+  if (rank < 0 || rank >= static_cast<int>(gpu_memory_available_kib.size()) ||
+      proc < 0 ||
+      proc >= static_cast<int>(gpu_memory_available_kib[rank].size()) ||
+      gpu_memory_available_kib[rank][proc] <= 0.0) {
+    return true;
+  }
+
+  // Co-location keeps every distinct buffer used by the batch in one private
+  // device context. Per-kernel fit is insufficient when independent chains
+  // own disjoint allocations, so conservatively count each buffer once.
+  std::map<uintptr_t, double> unique_buffer_bytes;
+  for (const DAGNode *node : nodes) {
+    for (const SyclReqData &req : node->req_data) {
+      const uintptr_t key = reinterpret_cast<uintptr_t>(req.mem_pointer);
+      unique_buffer_bytes[key] =
+          std::max(unique_buffer_bytes[key], reqBytes(req));
+    }
+  }
+
+  double required_bytes = 0.0;
+  for (const auto &entry : unique_buffer_bytes) {
+    required_bytes += entry.second;
+  }
+  const double available_bytes =
+      gpu_memory_available_kib[rank][proc] * 1024.0;
+  return required_bytes < available_bytes * 0.85;
+}
+
 static CostEstimate estimateSingleExecCost(DAGNode *node, int rank, int proc) {
   CostEstimate estimate;
   const std::string key = profileKeyForNode(node);
@@ -3143,6 +3195,36 @@ static TaskCandidate makeSingleCandidateNoMemoryFilter(DAGNode *node, int rank,
   return candidate;
 }
 
+// A co-located batch is submitted to one out-of-order device queue.  Its
+// independent kernels must therefore not inherit the exclusive device
+// calendar used by ordinary HEFT.  Data predecessors and transfer endpoints
+// are still modeled exactly as for a regular Single candidate.
+static TaskCandidate makeConcurrentSingleCandidate(DAGNode *node, int rank,
+                                                   int proc) {
+  TaskCandidate candidate;
+  candidate.rank = rank;
+  candidate.proc = proc;
+  candidate.num_parts = 1;
+  candidate.occupied_procs.push_back(proc);
+
+  if (!isKernelPlacementProc(rank, proc)) {
+    return candidate;
+  }
+  if (!monitorMemoryFits(node, rank, proc, 1)) {
+    return candidate;
+  }
+
+  const DependencyTransferPlan transfer_plan =
+      buildDependencyTransferPlan(node, rank, std::vector<int>{proc});
+  candidate.start_time = transfer_plan.ready_time;
+  candidate.exec_estimate = estimateSingleExecCost(node, rank, proc);
+  candidate.transfer_uncertainty = transfer_plan.uncertainty;
+  candidate.movement_bytes = transfer_plan.movement_bytes;
+  candidate.transfer_reservations = transfer_plan.reservations;
+  candidate.finish_time = candidate.start_time + candidate.exec_estimate.mean;
+  return candidate;
+}
+
 static void commitCandidateReservations(const TaskCandidate &candidate) {
   for (const TaskCandidate::DeviceReservation &reservation :
        candidate.transfer_reservations) {
@@ -3225,7 +3307,8 @@ static bool applyCoLocatedGpuScheduleIfBetter(
     const std::vector<std::vector<double>> &initial_available_time,
     double heft_finish_time, double heft_risk_finish_time,
     std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
-  if (nodes.size() < 2) {
+  const double target_items = concurrentGpuTargetItems();
+  if (nodes.size() < 2 || target_items <= 0.0) {
     return false;
   }
 
@@ -3233,7 +3316,33 @@ static bool applyCoLocatedGpuScheduleIfBetter(
       saveNodePlacementStates(nodes);
   const std::vector<std::vector<double>> heft_available_time =
       gpu_available_time;
-  const std::vector<DAGNode *> topo_order = topologicalOrderForCurrentBatch(nodes);
+  const std::vector<DAGNode *> topo_order =
+      topologicalOrderForCurrentBatch(nodes);
+  const std::unordered_set<DAGNode *> current_nodes(nodes.begin(), nodes.end());
+  std::map<DAGNode *, int> batch_depth;
+  std::map<int, std::vector<DAGNode *>> depth_nodes;
+  for (DAGNode *node : topo_order) {
+    int depth = 0;
+    for (DAGNode *predecessor : node->depend_on) {
+      if (current_nodes.count(predecessor)) {
+        depth = std::max(depth, batch_depth[predecessor] + 1);
+      }
+    }
+    batch_depth[node] = depth;
+    depth_nodes[depth].push_back(node);
+  }
+
+  bool has_concurrent_level = false;
+  for (const auto &entry : depth_nodes) {
+    if (entry.second.size() > 1) {
+      has_concurrent_level = true;
+      break;
+    }
+  }
+  if (!has_concurrent_level) {
+    return false;
+  }
+
   std::vector<NodePlacementState> best_states;
   std::vector<std::vector<double>> best_available_time;
   double best_finish_time = std::numeric_limits<double>::infinity();
@@ -3247,37 +3356,95 @@ static bool applyCoLocatedGpuScheduleIfBetter(
       if (!isKernelPlacementProc(rank, proc)) {
         continue;
       }
+      if (!monitorCoLocatedBatchMemoryFits(nodes, rank, proc)) {
+        continue;
+      }
 
       restoreNodePlacementStates(nodes, initial_node_states);
       gpu_available_time = initial_available_time;
 
       bool valid = true;
+      double finish_time = 0.0;
       double risk_finish_time = 0.0;
-      for (DAGNode *node : topo_order) {
-        TaskCandidate candidate =
-            makeSingleCandidateNoMemoryFilter(node, rank, proc);
-        if (!std::isfinite(candidate.finish_time)) {
-          valid = false;
+      for (const auto &entry : depth_nodes) {
+        struct ConcurrentNodePlan {
+          DAGNode *node = nullptr;
+          TaskCandidate candidate;
+        };
+        std::vector<ConcurrentNodePlan> level_plans;
+        level_plans.reserve(entry.second.size());
+        double level_ready = finish_time;
+        double level_risk_ready = risk_finish_time;
+        double occupancy_weighted_cost = 0.0;
+        double occupancy_weighted_risk_cost = 0.0;
+        double span_cost = 0.0;
+        double span_risk_cost = 0.0;
+
+        for (DAGNode *node : entry.second) {
+          TaskCandidate candidate =
+              makeConcurrentSingleCandidate(node, rank, proc);
+          if (!std::isfinite(candidate.finish_time)) {
+            valid = false;
+            break;
+          }
+
+          level_ready = std::max(level_ready, candidate.start_time);
+          level_risk_ready = std::max(
+              level_risk_ready,
+              candidate.start_time +
+                  riskConfidenceMultiplier() * candidate.transfer_uncertainty);
+
+          const double global_items =
+              std::max(1.0, static_cast<double>(node->global_size0) *
+                                static_cast<double>(node->global_size1) *
+                                static_cast<double>(node->global_size2));
+          const double occupancy_demand =
+              std::min(1.0, global_items / target_items);
+          const double exec_risk = riskAdjustedCost(candidate.exec_estimate);
+          occupancy_weighted_cost +=
+              candidate.exec_estimate.mean * occupancy_demand;
+          occupancy_weighted_risk_cost += exec_risk * occupancy_demand;
+          span_cost = std::max(span_cost, candidate.exec_estimate.mean);
+          span_risk_cost = std::max(span_risk_cost, exec_risk);
+          level_plans.push_back({node, std::move(candidate)});
+        }
+        if (!valid) {
           break;
         }
 
-        node->exec_rank = candidate.rank;
-        node->exec_proc = candidate.proc;
-        node->num_parts = candidate.num_parts;
-        node->persistent_split = candidate.persistent_split;
-        node->split_devices = candidate.occupied_procs;
-        node->finish_time = candidate.finish_time;
-        commitCandidateReservations(candidate);
-        gpu_available_time[rank][proc] = candidate.finish_time;
-        risk_finish_time =
-            std::max(risk_finish_time, candidateRiskScore(candidate));
+        // Below the residency target, additional independent kernels mainly
+        // hide instruction/memory latency, so the layer cannot be faster than
+        // its longest kernel.  Once aggregate demand exceeds one GPU, the
+        // occupancy-weighted work term creates the required extra waves.
+        const double level_cost =
+            std::max(span_cost, occupancy_weighted_cost);
+        const double level_risk_cost =
+            std::max(span_risk_cost, occupancy_weighted_risk_cost);
+        finish_time = level_ready + level_cost;
+        risk_finish_time = level_risk_ready + level_risk_cost;
+
+        for (ConcurrentNodePlan &plan : level_plans) {
+          DAGNode *node = plan.node;
+          const TaskCandidate &candidate = plan.candidate;
+          node->exec_rank = candidate.rank;
+          node->exec_proc = candidate.proc;
+          node->num_parts = candidate.num_parts;
+          node->persistent_split = candidate.persistent_split;
+          node->split_devices = candidate.occupied_procs;
+          // A depth barrier is conservative for irregular DAGs and ensures a
+          // successor never assumes that its co-resident producer completed
+          // before the layer's shared occupancy budget became available.
+          node->finish_time = finish_time;
+          commitCandidateReservations(candidate);
+        }
       }
 
       if (!valid) {
         continue;
       }
 
-      const double finish_time = batchFinishTime(nodes);
+      gpu_available_time[rank][proc] =
+          std::max(gpu_available_time[rank][proc], finish_time);
       if (risk_finish_time < best_risk_finish_time ||
           (risk_finish_time == best_risk_finish_time &&
            finish_time < best_finish_time)) {
@@ -3308,6 +3475,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
             << " risk_finish_time " << best_risk_finish_time
             << " previous_heft_finish_time " << heft_finish_time
             << " previous_heft_risk_finish_time " << heft_risk_finish_time
+            << " concurrent_target_items " << target_items
             << std::endl;
   for (DAGNode *node : topo_order) {
     DAEMON_TRACE_STREAM << "algorithmHEFT: Kernel " << node->kernel_count
@@ -3630,7 +3798,7 @@ static double estimateAverageCommCost(DAGNode *node, DAGNode *pre_node) {
 }
 
 // nodes: 这批要调度的所有kernel
-void algorithmHEFT(
+bool algorithmHEFT(
     std::vector<DAGNode *> &nodes,
     std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
   // Build one scheduling context for this wait-delimited batch. A confirmed
@@ -3802,10 +3970,9 @@ void algorithmHEFT(
   }
 
   const double heft_finish_time = batchFinishTime(nodes);
-  applyCoLocatedGpuScheduleIfBetter(nodes, initial_node_states,
-                                    initial_available_time, heft_finish_time,
-                                    heft_risk_finish_time,
-                                    kernel_sched_order_infos);
+  const bool co_located_batch = applyCoLocatedGpuScheduleIfBetter(
+      nodes, initial_node_states, initial_available_time, heft_finish_time,
+      heft_risk_finish_time, kernel_sched_order_infos);
 
 #ifdef SNMD_OFFLINE_SPLIT_STATS
   uint64_t selected_single_kernels = 0;
@@ -3877,6 +4044,7 @@ void algorithmHEFT(
   // TODO 最合适用几个节点去跑
   // 通信代价和贪心避免了扩张代价大于运行代价
 
+  return co_located_batch;
 }
 
 #ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
@@ -5602,12 +5770,13 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         generateDAGs(kernel_dag_nodes, nodes);
 
         // 2. 调度算法 更新node和sched_info
-        algorithmHEFT(nodes, kernel_sched_order_infos);
+        const bool co_located_batch =
+            algorithmHEFT(nodes, kernel_sched_order_infos);
         DAEMON_TRACE_STREAM << "Rank " << daemon_rank << " TEST kernel_sched_order_infos size: " << kernel_sched_order_infos.size() << std::endl;
 
 #ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
         if (daemon_size == 1 && onrun_size == 1 &&
-            completionDrivenQueueRuntimeEnabled()) {
+            completionDrivenQueueRuntimeEnabled() && !co_located_batch) {
           const CompletionWindowResult result = runCompletionDrivenWindow(
               nodes, daemon_wait_count, local_pid, mq_id_daemon);
           completion_window_handled =

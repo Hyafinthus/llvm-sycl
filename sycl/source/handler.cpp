@@ -269,8 +269,12 @@ parseOfflineDispatchBatch(const std::string &ReceivedData) {
 }
 
 static property_list
-getOfflineProfilingPropertyList(const detail::QueueImplPtr &Queue) {
+getOfflineProfilingPropertyList(const detail::QueueImplPtr &Queue,
+                                bool InOrder) {
   (void)Queue;
+  if (!InOrder) {
+    return property_list(property::queue::enable_profiling{});
+  }
   return property_list(property::queue::in_order{},
                        property::queue::enable_profiling{});
 }
@@ -307,33 +311,37 @@ getOfflineDeviceContext(const detail::DeviceImplPtr &Device) {
 
 static detail::QueueImplPtr
 makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
-                          const detail::QueueImplPtr &OldQueue) {
-  // The daemon models every device as one HEFT processor timeline. Creating a
-  // new out-of-order queue for every rebind violates that model: kernels
-  // assigned sequentially to one GPU are launched on unrelated CUDA streams
-  // and can overlap pending split kernels and their transfers. Keep one
-  // in-order profiling queue per offline device. Different devices still run
-  // concurrently, including the different devices used by one split kernel.
+                          const detail::QueueImplPtr &OldQueue,
+                          bool InOrder = true) {
+  // Ordinary HEFT models every device as one processor timeline, so it uses
+  // one stable in-order queue per device. A daemon-selected co-located batch
+  // instead uses a separate stable out-of-order queue on that device, allowing
+  // independent low-occupancy kernels to share the backend stream pool.
   static std::mutex QueueMutex;
-  static std::vector<std::pair<detail::DeviceImplPtr, detail::QueueImplPtr>>
-      DeviceQueues;
+  struct DeviceQueueEntry {
+    detail::DeviceImplPtr Device;
+    bool InOrder = true;
+    detail::QueueImplPtr Queue;
+  };
+  static std::vector<DeviceQueueEntry> DeviceQueues;
 
   std::lock_guard<std::mutex> Lock(QueueMutex);
   for (const auto &Entry : DeviceQueues) {
-    if (Entry.first == Device) {
+    if (Entry.Device == Device && Entry.InOrder == InOrder) {
       HANDLER_TRACE_STREAM
           << "=== handler === Offline profiling queue reused, profiling: "
-          << Entry.second
+          << Entry.Queue
                  ->has_property<property::queue::enable_profiling>()
           << " in_order: "
-          << Entry.second->has_property<property::queue::in_order>()
+          << Entry.Queue->has_property<property::queue::in_order>()
           << std::endl;
-      return Entry.second;
+      return Entry.Queue;
     }
   }
 
   try {
-    property_list ProfilingProps = getOfflineProfilingPropertyList(OldQueue);
+    property_list ProfilingProps =
+        getOfflineProfilingPropertyList(OldQueue, InOrder);
     detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(
         Device, getOfflineDeviceContext(Device),
         OldQueue->getAsyncHandler(), ProfilingProps);
@@ -342,7 +350,7 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
               << " in_order: "
               << NewQueue->has_property<property::queue::in_order>()
               << std::endl;
-    DeviceQueues.push_back({Device, NewQueue});
+    DeviceQueues.push_back({Device, InOrder, NewQueue});
     return NewQueue;
   } catch (const std::exception &e) {
     HANDLER_TRACE_STREAM << "=== handler === Offline profiling queue creation failed: "
@@ -353,12 +361,15 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
               << "Fallback to original queue properties." << std::endl;
   }
 
-  // Profiling may be unsupported by a backend, but ordering is part of the
-  // offline scheduler contract and must not be dropped in the fallback.
+  // Profiling may be unsupported by a backend. Preserve the selected queue
+  // ordering mode: ordinary HEFT needs in-order execution, while a co-located
+  // batch intentionally needs the backend's out-of-order stream pool.
+  property_list FallbackProps =
+      InOrder ? property_list(property::queue::in_order{}) : property_list{};
   detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(
       Device, getOfflineDeviceContext(Device), OldQueue->getAsyncHandler(),
-      property_list(property::queue::in_order{}));
-  DeviceQueues.push_back({Device, NewQueue});
+      FallbackProps);
+  DeviceQueues.push_back({Device, InOrder, NewQueue});
   return NewQueue;
 }
 
@@ -376,6 +387,30 @@ findOfflineKernelCg(std::vector<detail::SyclKernelCg *> &KernelCgs,
         PI_ERROR_INVALID_OPERATION);
   }
   return *It;
+}
+
+static bool offlineBatchCanUseConcurrentQueue(
+    const std::vector<D2SKernelExecInfo> &KernelExecInfos) {
+  int DeviceIndex = -1;
+  size_t LocalKernelCount = 0;
+  for (const D2SKernelExecInfo &Info : KernelExecInfos) {
+    if (!Info.exec) {
+      continue;
+    }
+    // Single candidates also carry their occupied processor in
+    // split_devices as placement metadata. Only num_parts changes execution
+    // semantics and makes an out-of-order co-located queue unsafe.
+    if (Info.num_parts > 1) {
+      return false;
+    }
+    if (DeviceIndex == -1) {
+      DeviceIndex = Info.device_index;
+    } else if (DeviceIndex != Info.device_index) {
+      return false;
+    }
+    ++LocalKernelCount;
+  }
+  return LocalKernelCount > 1;
 }
 
 static int clampOfflineDeviceIndex(int RequestedDeviceIndex) {
@@ -4069,6 +4104,11 @@ event handler::scheduleOffline() {
     // DONE ====【按kernel执行顺序 为每个kernel处理满足依赖 -> rebind -> resubmit】
     // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
     std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
+    const bool ConcurrentBatch =
+        offlineBatchCanUseConcurrentQueue(kernel_exec_infos);
+    HANDLER_TRACE_STREAM
+        << "=== handler === Offline static concurrent batch: "
+        << ConcurrentBatch << std::endl;
 #ifdef SNMD_OFFLINE
     prepareOfflineReadReplicasForDispatch(kernel_exec_infos);
 #endif
@@ -4182,7 +4222,8 @@ event handler::scheduleOffline() {
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
         HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
-        kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
+        kernel_queue =
+            makeOfflineProfilingQueue(dp, kernel_queue, !ConcurrentBatch);
 
         // resubmit
         uint64_t HostStart = offlineNowNs();
@@ -4488,6 +4529,11 @@ event handler::scheduleOffline() {
     // 即使scale这一组kernel需要前一组kernel的数据 不需要单独的流程满足
     std::vector<detail::SyclKernelCg *> &kernel_cgs = detail::ProgramManager::getInstance().kernel_cgs;
     HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === kernel_exec_infos.size(): " << kernel_exec_infos.size() << std::endl;
+    const bool ConcurrentBatch =
+        offlineBatchCanUseConcurrentQueue(kernel_exec_infos);
+    HANDLER_TRACE_STREAM
+        << "=== handler === Offline static concurrent batch: "
+        << ConcurrentBatch << std::endl;
 #ifdef SNMD_OFFLINE
     prepareOfflineReadReplicasForDispatch(kernel_exec_infos);
 #endif
@@ -4610,7 +4656,8 @@ event handler::scheduleOffline() {
         device exec_device = detail::ProgramManager::getInstance().globalDevices.at(ActualDeviceIndex);
         detail::DeviceImplPtr dp = detail::getSyclObjImpl(exec_device);
         HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind_device is_gpu: " << exec_device.is_gpu() << std::endl;
-        kernel_queue = makeOfflineProfilingQueue(dp, kernel_queue);
+        kernel_queue =
+            makeOfflineProfilingQueue(dp, kernel_queue, !ConcurrentBatch);
         HANDLER_TRACE_STREAM << "=== handler === Process " << getpid() << " === rebind MQueue" << std::endl;
 
         // resubmit
