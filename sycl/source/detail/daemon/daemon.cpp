@@ -30,6 +30,7 @@
 
 #include "daemon.hpp"
 #include "define.hpp"
+#include <sycl/backend.hpp>
 #include <sycl/device.hpp>
 // #include <sycl/access/access.hpp>
 
@@ -60,6 +61,7 @@ struct ComputeCapability {
 };
 std::map<int, int> index_sycl_nvml; // 根据busid确定sycl::device到gpu映射
 std::map<int, int> index_nvml_sycl;
+std::map<int, std::string> index_sycl_device_identity;
 std::vector<MonitorInfo> device_monitor_info(1); // 每个设备的监控信息, 0号设备固定是CPU
 std::vector<ComputeCapability> device_capability(1); // 本rank设备原始能力, 编号与handler的globalDevices一致
 std::vector<std::vector<MonitorInfo>> cluster_monitor_info;
@@ -153,12 +155,14 @@ struct ProfileCostKey {
   std::string kernel_key;
   int rank = 0;
   int device = 0;
+  std::string device_identity;
   int num_parts = 1;
   bool persistent_split = false;
 
   bool operator<(const ProfileCostKey &other) const {
-    return std::tie(kernel_key, rank, device, num_parts, persistent_split) <
-           std::tie(other.kernel_key, other.rank, other.device,
+    return std::tie(kernel_key, rank, device_identity, num_parts,
+                    persistent_split) <
+           std::tie(other.kernel_key, other.rank, other.device_identity,
                     other.num_parts, other.persistent_split);
   }
 };
@@ -1342,6 +1346,38 @@ static std::pair<double, double> profileSourceCapabilities(int rank,
   return {fallback.fp32, fallback.fp64};
 }
 
+static bool profileLegacyOrdinalStoreEnabled() {
+  static const bool enabled = [] {
+    const char *env =
+        std::getenv("SYCL_SNMD_PROFILE_ALLOW_LEGACY_ORDINALS");
+    return env != nullptr && std::strcmp(env, "0") != 0 &&
+           std::strcmp(env, "false") != 0 &&
+           std::strcmp(env, "FALSE") != 0;
+  }();
+  return enabled;
+}
+
+static std::string ordinalProfileDeviceIdentity(int rank, int device) {
+  return "rank-" + std::to_string(rank) + "-device-" +
+         std::to_string(device);
+}
+
+static std::string profileDeviceIdentity(int rank, int device) {
+  if (profileLegacyOrdinalStoreEnabled() || rank != 0 || device <= 0) {
+    return ordinalProfileDeviceIdentity(rank, device);
+  }
+
+  std::lock_guard<std::mutex> lock(monitor_state_mutex);
+  auto identity_it = index_sycl_device_identity.find(device);
+  if (identity_it != index_sycl_device_identity.end() &&
+      !identity_it->second.empty()) {
+    return identity_it->second;
+  }
+  // Monitor initialization is synchronous before profile loading and program
+  // submission. Keep a deterministic fallback for non-CUDA devices.
+  return ordinalProfileDeviceIdentity(rank, device);
+}
+
 static void applyProfileObservationLocked(
     const PersistedProfileObservation &observation, bool live_sample) {
   ProfileCostEntry &entry = profile_cost_table[observation.key];
@@ -1374,9 +1410,10 @@ static std::string serializePersistedProfileObservation(
     const PersistedProfileObservation &observation) {
   const KernelFeatureSignature &feature = observation.feature;
   std::ostringstream oss;
-  oss << std::setprecision(17) << "SNMD_PROFILE_OBS_V2\t"
+  oss << std::setprecision(17) << "SNMD_PROFILE_OBS_V3\t"
       << observation.profile_namespace << '\t' << observation.key.rank << '\t'
       << observation.key.device << '\t'
+      << observation.key.device_identity << '\t'
       << observation.key.num_parts << '\t'
       << (observation.key.persistent_split ? 1 : 0) << '\t'
       << observation.sample_cost << '\t'
@@ -1407,19 +1444,38 @@ static bool deserializePersistedProfileObservation(
   if (!(iss >> tag)) {
     return false;
   }
-  if (tag == "SNMD_PROFILE_OBS_V2") {
+  const bool has_stable_device_identity = tag == "SNMD_PROFILE_OBS_V3";
+  if (has_stable_device_identity) {
     if (!(iss >> observation.profile_namespace)) {
       return false;
     }
+  } else if (tag == "SNMD_PROFILE_OBS_V2") {
+    if (!profileLegacyOrdinalStoreEnabled() ||
+        !(iss >> observation.profile_namespace)) {
+      return false;
+    }
   } else if (tag == "SNMD_PROFILE_OBS_V1") {
+    if (!profileLegacyOrdinalStoreEnabled()) {
+      return false;
+    }
     // V1 predates build/application isolation. Only the default namespace
     // accepts it; a caller selecting a namespace gets strict isolation.
     observation.profile_namespace = "default";
   } else {
     return false;
   }
-  if (!(iss >> observation.key.rank >> observation.key.device >>
-        observation.key.num_parts >> persistent_split >>
+  if (!(iss >> observation.key.rank >> observation.key.device)) {
+    return false;
+  }
+  if (has_stable_device_identity) {
+    if (!(iss >> observation.key.device_identity)) {
+      return false;
+    }
+  } else {
+    observation.key.device_identity = ordinalProfileDeviceIdentity(
+        observation.key.rank, observation.key.device);
+  }
+  if (!(iss >> observation.key.num_parts >> persistent_split >>
         observation.sample_cost >> observation.source_fp32_capability >>
         observation.source_fp64_capability >> observation.observed_unix_sec >>
         feature_valid >> observation.feature.kernel_identity >>
@@ -1441,7 +1497,8 @@ static bool deserializePersistedProfileObservation(
   observation.feature.partition_local_write = partition_local_write != 0;
   return observation.sample_cost > 0.0 &&
          std::isfinite(observation.sample_cost) &&
-         !observation.key.kernel_key.empty();
+         !observation.key.kernel_key.empty() &&
+         !observation.key.device_identity.empty();
 }
 
 static void persistentProfileStoreWriter() {
@@ -1518,7 +1575,7 @@ static void initializePersistentProfileStore() {
   profile_store_path =
       path_env != nullptr && path_env[0] != '\0'
           ? path_env
-          : "/tmp/sycl-snmd-profile-observations-v1-rank0.tsv";
+          : "/tmp/sycl-snmd-profile-observations-v3-rank0.tsv";
 
   size_t loaded = 0;
   std::ifstream store(profile_store_path);
@@ -1576,6 +1633,7 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
   }
 
   ProfileCostKey key{profile.kernel_key, sample_rank, profile.device_index,
+                     profileDeviceIdentity(sample_rank, profile.device_index),
                      std::max(1, profile.num_parts),
                      profile.persistent_split};
   const double sample_cost =
@@ -1618,6 +1676,7 @@ static void updateProfileCostTable(const S2DKernelProfileData &profile,
 
   DAEMON_TRACE_STREAM << "ProfileCostTable: key " << profile.kernel_key
             << " rank " << sample_rank << " device " << profile.device_index
+            << " identity " << key.device_identity
             << " parts " << std::max(1, profile.num_parts)
             << " persistent " << profile.persistent_split
             << " sample_cost " << sample_cost
@@ -1669,8 +1728,9 @@ static bool lookupExactProfileEstimate(const std::string &kernel_key,
                                        int rank, int device, int num_parts,
                                        bool persistent_split,
                                        CostEstimate &estimate) {
-  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts),
-                       persistent_split};
+  ProfileCostKey exact{kernel_key, rank, device,
+                       profileDeviceIdentity(rank, device),
+                       std::max(1, num_parts), persistent_split};
   std::lock_guard<std::mutex> lock(profile_cost_mutex);
   auto exact_it = profile_cost_table.find(exact);
   if (exact_it == profile_cost_table.end() || exact_it->second.samples <= 0) {
@@ -1689,8 +1749,9 @@ static bool lookupExactProfileEstimate(const std::string &kernel_key,
 static bool hasLiveExactProfileCost(const std::string &kernel_key, int rank,
                                     int device, int num_parts,
                                     bool persistent_split = false) {
-  ProfileCostKey exact{kernel_key, rank, device, std::max(1, num_parts),
-                       persistent_split};
+  ProfileCostKey exact{kernel_key, rank, device,
+                       profileDeviceIdentity(rank, device),
+                       std::max(1, num_parts), persistent_split};
   std::lock_guard<std::mutex> lock(profile_cost_mutex);
   auto it = profile_cost_table.find(exact);
   return it != profile_cost_table.end() && it->second.live_samples > 0;
@@ -2818,9 +2879,9 @@ static DependencyTransferPlan buildDependencyTransferPlan(
         addTransferEstimate(plan, best_transfer_cost);
         plan.movement_bytes += comm_bytes;
       } else {
-        // In completion-driven mode infinity denotes a genuinely busy
-        // endpoint. Do not silently drop this transfer and dispatch against a
-        // different idle target; wait until a completion releases the source.
+        // No reachable source/target endpoint pair exists for this placement.
+        // Do not silently drop the transfer and dispatch against a different
+        // target; keep the candidate infeasible for this admission pass.
         plan.ready_time = std::numeric_limits<double>::infinity();
       }
       continue;
@@ -4053,6 +4114,11 @@ enum class CompletionNodePhase { Pending, Dispatched, Complete };
 struct CompletionNodeRuntimeState {
   CompletionNodePhase phase = CompletionNodePhase::Pending;
   std::vector<std::pair<int, int>> reserved_devices;
+  // Used to compare immediate execution on an idle slow device with waiting
+  // for a faster in-flight device. Real completion acknowledgements remain
+  // the only mechanism that releases the reservation.
+  uint64_t dispatch_started_ns = 0;
+  uint64_t predicted_release_ns = 0;
 };
 
 enum class CompletionWindowResult {
@@ -4117,18 +4183,53 @@ completionCandidateReservations(const TaskCandidate &candidate) {
 static void clearCompletionEphemeralTransferCalendar() {
   for (std::vector<double> &rank_calendar : gpu_available_time) {
     for (double &ready_time : rank_calendar) {
-      // Infinity is an in-flight compute/gang reservation and survives until
-      // completion. Finite transfer times only serialize admission within the
-      // dispatch wave; stable in-order queues preserve the actual copy order.
-      if (std::isfinite(ready_time)) {
-        ready_time = 0.0;
-      }
+      // Completion compute predictions are reconstructed from runtime state
+      // before every admission pass. Everything left here after a dispatch
+      // wave is ephemeral transfer-planning state.
+      ready_time = 0.0;
     }
   }
 }
 
-static void setCompletionDevicesBusy(
-    const std::vector<std::pair<int, int>> &devices, bool busy) {
+static double completionRemainingCost(
+    const CompletionNodeRuntimeState &state, uint64_t now_ns) {
+  if (state.predicted_release_ns > now_ns) {
+    return static_cast<double>(state.predicted_release_ns - now_ns) /
+           PROFILE_NS_TO_COST;
+  }
+
+  // A task that outlives its upper-confidence prediction is evidence that the
+  // old prediction was too optimistic, not that the device will become free
+  // "immediately". Use elapsed service time as a conservative residual until
+  // the real completion updates the profile.
+  if (state.dispatch_started_ns < now_ns) {
+    return std::max(
+        0.001, static_cast<double>(now_ns - state.dispatch_started_ns) /
+                   PROFILE_NS_TO_COST);
+  }
+  return 0.001;
+}
+
+static uint64_t completionPredictedReleaseNs(
+    const TaskCandidate &candidate) {
+  const double release_cost = candidateRiskScore(candidate);
+  if (!std::isfinite(release_cost) || release_cost <= 0.0) {
+    return daemonSteadyNowNs();
+  }
+
+  const long double release_ns =
+      static_cast<long double>(release_cost) * PROFILE_NS_TO_COST;
+  const uint64_t now_ns = daemonSteadyNowNs();
+  if (release_ns >=
+      static_cast<long double>(std::numeric_limits<uint64_t>::max() -
+                               now_ns)) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return now_ns + static_cast<uint64_t>(std::ceil(release_ns));
+}
+
+static void setCompletionDeviceCalendar(
+    const std::vector<std::pair<int, int>> &devices, double ready_time) {
   for (const std::pair<int, int> &device : devices) {
     const int rank = device.first;
     const int proc = device.second;
@@ -4138,8 +4239,61 @@ static void setCompletionDevicesBusy(
       continue;
     }
     gpu_available_time[rank][proc] =
-        busy ? std::numeric_limits<double>::infinity() : 0.0;
+        std::max(gpu_available_time[rank][proc], ready_time);
   }
+}
+
+static void refreshCompletionDeviceCalendar(
+    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states) {
+  for (std::vector<double> &rank_calendar : gpu_available_time) {
+    std::fill(rank_calendar.begin(), rank_calendar.end(), 0.0);
+  }
+
+  const uint64_t now_ns = daemonSteadyNowNs();
+  for (const auto &entry : states) {
+    const CompletionNodeRuntimeState &state = entry.second;
+    if (state.phase != CompletionNodePhase::Dispatched) {
+      continue;
+    }
+    setCompletionDeviceCalendar(
+        state.reserved_devices, completionRemainingCost(state, now_ns));
+  }
+}
+
+static bool completionDeviceInFlight(
+    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states,
+    int rank, int proc) {
+  for (const auto &entry : states) {
+    const CompletionNodeRuntimeState &state = entry.second;
+    if (state.phase != CompletionNodePhase::Dispatched) {
+      continue;
+    }
+    if (std::find(state.reserved_devices.begin(),
+                  state.reserved_devices.end(),
+                  std::make_pair(rank, proc)) !=
+        state.reserved_devices.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool completionCandidateTouchesInFlightDevice(
+    const TaskCandidate &candidate,
+    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states) {
+  for (int proc : candidate.occupied_procs) {
+    if (completionDeviceInFlight(states, candidate.rank, proc)) {
+      return true;
+    }
+  }
+  for (const TaskCandidate::DeviceReservation &reservation :
+       candidate.transfer_reservations) {
+    if (completionDeviceInFlight(states, reservation.rank,
+                                 reservation.proc)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
@@ -4153,9 +4307,12 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     size_t compute_reservations = 0;
   };
   std::vector<PlannedDispatch> planned_dispatches;
+  refreshCompletionDeviceCalendar(states);
   while (true) {
     DAGNode *selected_node = nullptr;
     TaskCandidate selected_candidate;
+    DAGNode *deferred_node = nullptr;
+    TaskCandidate deferred_candidate;
 
     for (DAGNode *node : priority_order) {
       CompletionNodeRuntimeState &state = states[node];
@@ -4173,12 +4330,37 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
       if (candidate.rank != 0) {
         continue;
       }
+      // Waiting for an in-flight fast device can be cheaper than immediate
+      // execution on an idle slow device. Do not enqueue that future choice:
+      // it would discard completion feedback and a cross-context migration
+      // can synchronously wait behind the source device's compute queue,
+      // preventing the handler from reporting unrelated completions. Keep
+      // scanning so another READY node can still use an idle device when that
+      // is genuinely its best candidate.
+      if (completionCandidateTouchesInFlightDevice(candidate, states)) {
+        if (deferred_node == nullptr) {
+          deferred_node = node;
+          deferred_candidate = candidate;
+        }
+        continue;
+      }
       selected_node = node;
       selected_candidate = std::move(candidate);
       break;
     }
 
     if (selected_node == nullptr) {
+      if (deferred_node != nullptr) {
+        DAEMON_TRACE_STREAM
+            << "CompletionQueue: defer kernel "
+            << deferred_node->kernel_count
+            << " for predicted-better in-flight candidate rank "
+            << deferred_candidate.rank << " proc "
+            << deferred_candidate.proc << " start_time "
+            << deferred_candidate.start_time << " finish_time "
+            << deferred_candidate.finish_time << " risk "
+            << candidateRiskScore(deferred_candidate) << std::endl;
+      }
       break;
     }
 
@@ -4193,12 +4375,17 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     selected_state.phase = CompletionNodePhase::Dispatched;
     selected_state.reserved_devices =
         completionCandidateReservations(selected_candidate);
+    selected_state.dispatch_started_ns = daemonSteadyNowNs();
+    selected_state.predicted_release_ns =
+        completionPredictedReleaseNs(selected_candidate);
     // Reserve copy endpoints while selecting the remainder of this dispatch
     // wave, but do not hold a source GPU for the target kernel's full compute
     // duration. That old lifetime turns a millisecond migration into a
     // multi-second false occupancy and recreates the skipped-GPU symptom.
     commitCandidateReservations(selected_candidate);
-    setCompletionDevicesBusy(selected_state.reserved_devices, true);
+    setCompletionDeviceCalendar(
+        selected_state.reserved_devices,
+        completionRemainingCost(selected_state, daemonSteadyNowNs()));
 
     D2SKernelExecInfo exec_info;
     exec_info.kernel_count = selected_node->kernel_count;
@@ -4213,16 +4400,12 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
   }
   clearCompletionEphemeralTransferCalendar();
 
-  // resubmit() may synchronously prepare cross-context data. Submit all
-  // zero-movement work first so one legitimate migration cannot delay host
-  // submission to otherwise idle GPUs in the same ready wave. Candidates and
-  // resource ownership are unchanged; this is an execution order of the
-  // daemon-approved set, not a second placement policy in the handler.
-  std::stable_partition(
-      planned_dispatches.begin(), planned_dispatches.end(),
-      [](const PlannedDispatch &dispatch) {
-        return dispatch.movement_bytes <= 0.0;
-      });
+  // Preserve admission order. Transfer reservations are committed while this
+  // list is built; moving zero-copy work ahead of an earlier migration can
+  // put a long in-order compute on the migration's source device and recreate
+  // the handler-wide synchronous wait that endpoint-safe admission prevents.
+  // Independent zero-copy work is still admitted before a blocked migration
+  // because the READY scan skips candidates that touch in-flight endpoints.
 
   std::vector<D2SKernelExecInfo> dispatches;
   dispatches.reserve(planned_dispatches.size());
@@ -4407,8 +4590,9 @@ static CompletionWindowResult runCompletionDrivenWindow(
             return candidate->kernel_count == completion.kernel_count;
           });
       CompletionNodeRuntimeState &state = states[node];
-      setCompletionDevicesBusy(state.reserved_devices, false);
       state.reserved_devices.clear();
+      state.dispatch_started_ns = 0;
+      state.predicted_release_ns = 0;
       state.phase = CompletionNodePhase::Complete;
       const int actual_parts = std::max(1, completion.num_parts);
       if (node->exec_proc != completion.device_index ||
@@ -4510,13 +4694,14 @@ int getCudaPciBusId(const sycl::device &device) {
   if (device.get_backend() != sycl::backend::ext_oneapi_cuda) {
       return -1;
   }
-  int cudaDevice;
-  cudaError_t err = cudaGetDevice(&cudaDevice);
-  if (err != cudaSuccess) {
-      throw std::runtime_error("Failed to get current CUDA device.");
-  }
+  // cudaGetDevice() reports the calling thread's current context rather than
+  // the device being iterated. Query the SYCL device's native CUDA handle so
+  // monitor load and capability data are attached to the correct processor.
+  const int cudaDevice =
+      sycl::get_native<sycl::backend::ext_oneapi_cuda>(device);
   int busId;
-  err = cudaDeviceGetAttribute(&busId, cudaDevAttrPciBusId, cudaDevice);
+  const cudaError_t err =
+      cudaDeviceGetAttribute(&busId, cudaDevAttrPciBusId, cudaDevice);
   if (err != cudaSuccess) {
       throw std::runtime_error("Failed to get PCI Bus ID for the CUDA device.");
   }
@@ -4525,6 +4710,9 @@ int getCudaPciBusId(const sycl::device &device) {
 
 int MonitorInit() {
   std::lock_guard<std::mutex> lock(monitor_state_mutex);
+  index_sycl_nvml.clear();
+  index_nvml_sycl.clear();
+  index_sycl_device_identity.clear();
   device_capability.resize(1);
   device_capability[0] = inferCpuCapabilityFromName(readCpuModelName());
 
@@ -4547,6 +4735,7 @@ int MonitorInit() {
   DAEMON_TRACE_STREAM << "Number of GPUs: " << device_count << std::endl;
   
   std::vector<int> nvmlBusIds;
+  std::vector<std::string> nvmlDeviceIdentities;
   for (int i = 0; i < device_count; ++i) {
     nvmlDevice_t device;
     result = nvmlDeviceGetHandleByIndex(i, &device);
@@ -4564,9 +4753,12 @@ int MonitorInit() {
       continue;
     }
 
-    int nvmlBusId = std::stoi(std::string(pciInfo.busId).substr(9, 2), nullptr, 16);
+    const std::string pci_bus_id = pciInfo.busId;
+    int nvmlBusId =
+        std::stoi(pci_bus_id.substr(9, 2), nullptr, 16);
     DAEMON_TRACE_STREAM << "GPU " << i << ": PCI Bus ID: " << pciInfo.busId << " int: " << nvmlBusId << std::endl;
     nvmlBusIds.push_back(nvmlBusId);
+    nvmlDeviceIdentities.push_back("pci-" + pci_bus_id);
   }
 
   std::vector<sycl::device> globalDevices = sycl::device::get_devices();
@@ -4600,6 +4792,8 @@ int MonitorInit() {
       if (it != nvmlBusIds.end()) {
         index_sycl_nvml[i] = std::distance(nvmlBusIds.begin(), it) + 1;
         index_nvml_sycl[index_sycl_nvml[i]] = i;
+        index_sycl_device_identity[i] =
+            nvmlDeviceIdentities[std::distance(nvmlBusIds.begin(), it)];
         device_capability[i] =
             inferDeviceCapabilityFromName(sycl_device_name, false);
       }
@@ -4610,7 +4804,8 @@ int MonitorInit() {
               << pair.second << " fp32 capability "
               << device_capability[pair.first].fp32
               << " fp64 capability "
-              << device_capability[pair.first].fp64 << std::endl;
+              << device_capability[pair.first].fp64 << " identity "
+              << index_sycl_device_identity[pair.first] << std::endl;
   }
 
   return device_count;
@@ -4690,7 +4885,8 @@ void CudaMonitor(int device_count) {
 }
 
 void *SystemMonitor(void *arg) {
-  int device_count = MonitorInit();
+  const int device_count =
+      arg != nullptr ? *static_cast<const int *>(arg) : MonitorInit();
   
   while(1) {
     CPUMonitor();
@@ -4715,7 +4911,7 @@ void *SystemSchedulerMonitor(void *arg) {
   DAEMON_TRACE_STREAM << "SystemSchedulerMonitor: MONITOR_Rank " << monitor_rank << " started." << std::endl;
 
   pthread_t monitor_tid;
-  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemMonitor, NULL);
+  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemMonitor, arg);
   pthread_detach(monitor_tid);
 
   {
@@ -6158,6 +6354,10 @@ int main(int argc, char *argv[]) {
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
   MPI_Get_processor_name(proc_name, &name_len);
   DAEMON_TRACE_STREAM << "MPI_Rank " << mpi_rank << ": " << proc_name << " of " << mpi_size << " started" << std::endl;
+  // Device identity must be stable before persisted profiles are loaded.
+  // Otherwise CUDA visibility masks can remap multiple physical GPUs to the
+  // same logical ordinal and merge incompatible service-time histories.
+  int monitor_device_count = MonitorInit();
   initializePersistentProfileStore();
   // split_key==mpi_rank 所以local_rank和mpi_rank相同 在线程中仍可以使用mpi_rank和mpi_size
   MPI_Comm_split(MPI_COMM_WORLD, 0, mpi_rank, &comm_submit);
@@ -6169,7 +6369,8 @@ int main(int argc, char *argv[]) {
 
   // ====【pthread】
   pthread_t monitor_tid, submit_tid;
-  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemSchedulerMonitor, NULL);
+  pthread_create(&monitor_tid, NULL, (void *(*)(void *))SystemSchedulerMonitor,
+                 &monitor_device_count);
   pthread_create(&submit_tid, NULL, (void *(*)(void *))SystemSchedulerSubmit, NULL);
   DAEMON_TRACE_STREAM << "MPI_Rank " << mpi_rank << ": SystemSchedulerSubmit started" << std::endl;
 
