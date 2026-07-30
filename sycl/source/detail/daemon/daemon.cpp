@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <cuda_runtime_api.h>
 #include <nvml.h>
@@ -3344,6 +3345,92 @@ topologicalOrderForCurrentBatch(const std::vector<DAGNode *> &nodes) {
   return order;
 }
 
+// Whole-batch co-location is not a safe replacement when HEFT has already
+// placed independent components (for example, observation tiles) one-to-one
+// on different GPUs. Collapsing those components to one GPU discards physical
+// device parallelism based only on the approximate stream-concurrency model.
+static bool heftAlreadyParallelizesIndependentComponents(
+    const std::vector<DAGNode *> &topo_order,
+    const std::unordered_set<DAGNode *> &current_nodes,
+    size_t &component_count, size_t &device_count) {
+  std::unordered_map<DAGNode *, size_t> component_ids;
+  component_count = 0;
+
+  for (DAGNode *seed : topo_order) {
+    if (component_ids.count(seed)) {
+      continue;
+    }
+
+    const size_t component_id = component_count++;
+    std::vector<DAGNode *> pending{seed};
+    component_ids.emplace(seed, component_id);
+    while (!pending.empty()) {
+      DAGNode *node = pending.back();
+      pending.pop_back();
+
+      auto add_neighbor = [&](DAGNode *neighbor) {
+        if (neighbor != nullptr && current_nodes.count(neighbor) &&
+            component_ids.emplace(neighbor, component_id).second) {
+          pending.push_back(neighbor);
+        }
+      };
+      for (DAGNode *predecessor : node->depend_on) {
+        add_neighbor(predecessor);
+      }
+      for (DAGNode *successor : node->depend_by) {
+        add_neighbor(successor);
+      }
+    }
+  }
+
+  if (component_count < 2) {
+    device_count = 0;
+    return false;
+  }
+
+  std::vector<std::pair<int, int>> component_devices(
+      component_count, std::make_pair(-1, -1));
+
+  for (DAGNode *node : topo_order) {
+    const size_t component_id = component_ids.at(node);
+    // A split or a component that HEFT moves between devices is not already a
+    // one-device component and may still benefit from another placement shape.
+    if (node->num_parts != 1 || node->exec_rank < 0 || node->exec_proc <= 0) {
+      device_count = 0;
+      return false;
+    }
+    const std::pair<int, int> placement{node->exec_rank, node->exec_proc};
+    if (component_devices[component_id].first < 0) {
+      component_devices[component_id] = placement;
+    } else if (component_devices[component_id] != placement) {
+      device_count = 0;
+      return false;
+    }
+  }
+
+  const std::set<std::pair<int, int>> distinct_devices(
+      component_devices.begin(), component_devices.end());
+  device_count = distinct_devices.size();
+  return device_count == component_count;
+}
+
+static double coLocatedOccupancyDemand(const DAGNode *node,
+                                       double target_items) {
+  const double global_items =
+      std::max(1.0, static_cast<double>(node->global_size0) *
+                        static_cast<double>(node->global_size1) *
+                        static_cast<double>(node->global_size2));
+
+  // global_items alone underestimates kernels whose few work-items loop over a
+  // large accessor range (row correlation and classic MGS are representative
+  // examples). node->total_elem is the scheduler's /1000-normalized logical
+  // access footprint. It is intentionally only a conservative saturation
+  // signal here, not a claim that access elements equal resident threads.
+  const double occupancy_proxy =
+      std::max(global_items, std::max(1.0, node->total_elem));
+  return std::min(1.0, occupancy_proxy / target_items);
+}
+
 static void rebuildKernelSchedInfos(
     const std::vector<DAGNode *> &order,
     std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
@@ -3404,6 +3491,19 @@ static bool applyCoLocatedGpuScheduleIfBetter(
     return false;
   }
 
+  size_t independent_component_count = 0;
+  size_t independent_component_device_count = 0;
+  if (heftAlreadyParallelizesIndependentComponents(
+          topo_order, current_nodes, independent_component_count,
+          independent_component_device_count)) {
+    DAEMON_TRACE_STREAM
+        << "algorithmHEFT: whole-batch co-location skipped; ordinary HEFT "
+           "already maps "
+        << independent_component_count << " independent components to "
+        << independent_component_device_count << " distinct GPUs" << std::endl;
+    return false;
+  }
+
   std::vector<NodePlacementState> best_states;
   std::vector<std::vector<double>> best_available_time;
   double best_finish_time = std::numeric_limits<double>::infinity();
@@ -3455,12 +3555,8 @@ static bool applyCoLocatedGpuScheduleIfBetter(
               candidate.start_time +
                   riskConfidenceMultiplier() * candidate.transfer_uncertainty);
 
-          const double global_items =
-              std::max(1.0, static_cast<double>(node->global_size0) *
-                                static_cast<double>(node->global_size1) *
-                                static_cast<double>(node->global_size2));
           const double occupancy_demand =
-              std::min(1.0, global_items / target_items);
+              coLocatedOccupancyDemand(node, target_items);
           const double exec_risk = riskAdjustedCost(candidate.exec_estimate);
           occupancy_weighted_cost +=
               candidate.exec_estimate.mean * occupancy_demand;
@@ -3520,8 +3616,19 @@ static bool applyCoLocatedGpuScheduleIfBetter(
   restoreNodePlacementStates(nodes, initial_node_states);
   gpu_available_time = initial_available_time;
 
-  if (!std::isfinite(best_risk_finish_time) ||
-      best_risk_finish_time >= heft_risk_finish_time) {
+  const bool mean_improves =
+      std::isfinite(best_finish_time) && best_finish_time < heft_finish_time;
+  const bool risk_improves = std::isfinite(best_risk_finish_time) &&
+                             best_risk_finish_time < heft_risk_finish_time;
+  if (!mean_improves || !risk_improves) {
+    DAEMON_TRACE_STREAM
+        << "algorithmHEFT: whole-batch co-location rejected"
+        << " mean_improves " << (mean_improves ? 1 : 0)
+        << " risk_improves " << (risk_improves ? 1 : 0)
+        << " candidate_finish_time " << best_finish_time
+        << " candidate_risk_finish_time " << best_risk_finish_time
+        << " heft_finish_time " << heft_finish_time
+        << " heft_risk_finish_time " << heft_risk_finish_time << std::endl;
     restoreNodePlacementStates(nodes, heft_states);
     gpu_available_time = heft_available_time;
     return false;
