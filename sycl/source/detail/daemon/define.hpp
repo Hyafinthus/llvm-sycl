@@ -75,15 +75,22 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 // whose modeled end-to-end gain is substantial. Short/uncertain work remains
 // single-device; later windows use measured single/Split profiles.
 #define SNMD_OFFLINE_COLD_SPLIT_PROBE 1
+// Runtime override (same HEFT cost units):
+//   SYCL_SNMD_COLD_SPLIT_MIN_SINGLE_COST=<nonnegative real>
+// The compile-time value remains the conservative production default.
 #define SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST 500000
 #define SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT 30
 #if SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST < 0
 #error "SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST must be nonnegative"
 #endif
+
 #if SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT < 0 ||                       \
     SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT >= 100
 #error "SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT must be in [0, 100)"
 #endif
+
+// Opt-in, synchronization-free per-window aggregate scheduler telemetry:
+//   SYCL_SNMD_DECISION_SUMMARY=1
 
 // P3: When a complete DAG depth already has enough independent tasks to fill
 // the GPUs, prefer task parallelism. A measured superlinear-throughput Split

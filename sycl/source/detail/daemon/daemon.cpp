@@ -920,6 +920,49 @@ static double concurrentGpuTargetItems() {
   return target_items;
 }
 
+#ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
+static double coldSplitMinSingleCost() {
+  static const double min_cost = [] {
+    constexpr double default_min_cost =
+        SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST;
+    const char *env = std::getenv("SYCL_SNMD_COLD_SPLIT_MIN_SINGLE_COST");
+    if (env == nullptr || *env == '\0') {
+      return default_min_cost;
+    }
+    char *end = nullptr;
+    const double parsed = std::strtod(env, &end);
+    if (end == env || *end != '\0' || !std::isfinite(parsed) ||
+        parsed < 0.0) {
+      return default_min_cost;
+    }
+    return parsed;
+  }();
+  return min_cost;
+}
+#endif
+
+static bool decisionSummaryRuntimeEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("SYCL_SNMD_DECISION_SUMMARY");
+    return env != nullptr && std::strcmp(env, "0") != 0 &&
+           std::strcmp(env, "false") != 0 &&
+           std::strcmp(env, "FALSE") != 0;
+  }();
+  return enabled;
+}
+
+static bool completionQueueRuntimeRequested() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("SYCL_SNMD_COMPLETION_QUEUE");
+    if (env == nullptr) {
+      return true;
+    }
+    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+           std::strcmp(env, "FALSE") != 0;
+  }();
+  return enabled;
+}
+
 static bool componentAffineStaticFastPathEnabled() {
   static const bool enabled = [] {
     const char *env = std::getenv("SYCL_SNMD_COMPONENT_AFFINE_STATIC");
@@ -3743,7 +3786,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
                   [](const auto &Entry) {
                     return std::isfinite(Entry.second.mean) &&
                            Entry.second.mean <
-                               SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST;
+                               coldSplitMinSingleCost();
                   })) {
     return candidate;
   }
@@ -3785,7 +3828,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     // creates dispatch bubbles even though the candidate cannot be selected.
     if (!has_split_profile && std::isfinite(best_single_estimate.mean) &&
         best_single_estimate.mean <
-            SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST) {
+            coldSplitMinSingleCost()) {
       continue;
     }
 #endif
@@ -3807,7 +3850,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
             << "algorithmHEFT: Kernel " << node->kernel_count
             << " cold split probe rejected: split " << exec_estimate.mean
             << " single " << best_single_estimate.mean << " min_single "
-            << SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST << std::endl;
+            << coldSplitMinSingleCost() << std::endl;
         continue;
       }
     }
@@ -4192,6 +4235,8 @@ bool algorithmHEFT(
       heft_parallelizes_independent_components, independent_component_count,
       independent_component_device_count, kernel_sched_order_infos);
   bool use_static_batch = co_located_batch;
+  bool component_affine_static_batch = false;
+  bool single_gpu_static_batch = false;
   const size_t component_static_min_nodes =
       componentAffineStaticMinNodesPerComponent();
   const bool component_graph_is_deep =
@@ -4204,6 +4249,7 @@ bool algorithmHEFT(
     // full DAG once: per-kernel completion feedback cannot improve affinity
     // here, but it creates a host round trip between dependent microkernels.
     use_static_batch = true;
+    component_affine_static_batch = true;
     DAEMON_TRACE_STREAM
         << "algorithmHEFT: multi-GPU component-affine batch uses static "
            "execution for "
@@ -4229,6 +4275,7 @@ bool algorithmHEFT(
       // batch. The handler independently verifies one device and num_parts=1
       // before selecting its concurrent queue.
       use_static_batch = true;
+      single_gpu_static_batch = true;
       DAEMON_TRACE_STREAM
           << "algorithmHEFT: single-GPU non-split batch uses static "
              "out-of-order execution for "
@@ -4302,6 +4349,78 @@ bool algorithmHEFT(
             << static_cast<double>(estimated_split_merge_bytes) << std::endl;
 #endif
 
+  if (decisionSummaryRuntimeEnabled()) {
+    uint64_t selected_single_kernels = 0;
+    uint64_t selected_split_kernels = 0;
+    std::array<uint64_t, 6> source_counts{};
+    uint64_t profile_sampled_kernels = 0;
+    uint64_t profile_samples_total = 0;
+    for (DAGNode *node : nodes) {
+      CostEstimate estimate;
+      if (node->num_parts > 1) {
+        ++selected_split_kernels;
+        estimate = estimateSplitExecCost(
+            node, node->exec_rank, node->split_devices,
+            node->persistent_split);
+      } else {
+        ++selected_single_kernels;
+        estimate =
+            estimateSingleExecCost(node, node->exec_rank, node->exec_proc);
+      }
+      const size_t source_index = static_cast<size_t>(estimate.source);
+      if (source_index < source_counts.size()) {
+        ++source_counts[source_index];
+      }
+      if (estimate.samples > 0) {
+        ++profile_sampled_kernels;
+        profile_samples_total += static_cast<uint64_t>(estimate.samples);
+      }
+    }
+    const char *path =
+        co_located_batch
+            ? "co_located_static"
+            : (component_affine_static_batch
+                   ? "component_affine_static"
+                   : (single_gpu_static_batch ? "single_gpu_ooo_static"
+                                              : (completionQueueRuntimeRequested()
+                                                     ? "completion_candidate"
+                                                     : "heft_static_fallback")));
+    std::cout
+        << "SNMD_WINDOW_DECISION pid=" << program_pid
+        << " kernels=" << nodes.size()
+        << " roots=" << batch_root_count
+        << " components=" << independent_component_count
+        << " component_devices=" << independent_component_device_count
+        << " path=" << path
+        << " completion_queue="
+        << (completionQueueRuntimeRequested() ? 1 : 0)
+        << " single_kernels=" << selected_single_kernels
+        << " split_kernels=" << selected_split_kernels
+        << " source_cold="
+        << source_counts[static_cast<size_t>(CostEstimateSource::cold_model)]
+        << " source_exact="
+        << source_counts[
+               static_cast<size_t>(CostEstimateSource::exact_profile)]
+        << " source_persisted="
+        << source_counts[
+               static_cast<size_t>(CostEstimateSource::persisted_profile)]
+        << " source_scaled="
+        << source_counts[
+               static_cast<size_t>(CostEstimateSource::scaled_profile)]
+        << " source_learned="
+        << source_counts[
+               static_cast<size_t>(CostEstimateSource::learned_profile)]
+        << " source_derived_split="
+        << source_counts[
+               static_cast<size_t>(CostEstimateSource::derived_split)]
+        << " profile_sampled_kernels=" << profile_sampled_kernels
+        << " profile_samples_total=" << profile_samples_total
+#ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
+        << " cold_split_min_single_cost=" << coldSplitMinSingleCost()
+#endif
+        << std::endl;
+  }
+
   regenerateReqRanksAfterHEFT(nodes, kernel_sched_order_infos);
 
   // TODO 最合适用几个节点去跑
@@ -4331,15 +4450,7 @@ enum class CompletionWindowResult {
 };
 
 static bool completionDrivenQueueRuntimeEnabled() {
-  static const bool enabled = [] {
-    const char *env = std::getenv("SYCL_SNMD_COMPLETION_QUEUE");
-    if (env == nullptr) {
-      return true;
-    }
-    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
-           std::strcmp(env, "FALSE") != 0;
-  }();
-  return enabled;
+  return completionQueueRuntimeRequested();
 }
 
 static void resetCompletionWindowCalendar(const std::vector<DAGNode *> &nodes) {
