@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <list>
 #include <map>
+#include <set>
 #include <deque>
 #include <stdexcept>
 #include <thread>
@@ -916,6 +918,38 @@ static double concurrentGpuTargetItems() {
     return parsed;
   }();
   return target_items;
+}
+
+static bool componentAffineStaticFastPathEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("SYCL_SNMD_COMPONENT_AFFINE_STATIC");
+    if (env == nullptr) {
+      return true;
+    }
+    return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+           std::strcmp(env, "FALSE") != 0;
+  }();
+  return enabled;
+}
+
+static size_t componentAffineStaticMinNodesPerComponent() {
+  static const size_t min_nodes = [] {
+    constexpr size_t default_min_nodes = 64;
+    const char *env =
+        std::getenv("SYCL_SNMD_COMPONENT_AFFINE_STATIC_MIN_NODES");
+    if (env == nullptr || *env == '\0') {
+      return default_min_nodes;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' ||
+        parsed > std::numeric_limits<size_t>::max()) {
+      return default_min_nodes;
+    }
+    return static_cast<size_t>(parsed);
+  }();
+  return min_nodes;
 }
 
 enum class CostEstimateSource {
@@ -3463,6 +3497,11 @@ static bool applyCoLocatedGpuScheduleIfBetter(
     const std::vector<NodePlacementState> &initial_node_states,
     const std::vector<std::vector<double>> &initial_available_time,
     double heft_finish_time, double heft_risk_finish_time,
+    const std::vector<DAGNode *> &topo_order,
+    const std::unordered_set<DAGNode *> &current_nodes,
+    bool heft_parallelizes_independent_components,
+    size_t independent_component_count,
+    size_t independent_component_device_count,
     std::vector<D2DKernelSchedInfo> &kernel_sched_order_infos) {
   const double target_items = concurrentGpuTargetItems();
   if (nodes.size() < 2 || target_items <= 0.0) {
@@ -3473,9 +3512,6 @@ static bool applyCoLocatedGpuScheduleIfBetter(
       saveNodePlacementStates(nodes);
   const std::vector<std::vector<double>> heft_available_time =
       gpu_available_time;
-  const std::vector<DAGNode *> topo_order =
-      topologicalOrderForCurrentBatch(nodes);
-  const std::unordered_set<DAGNode *> current_nodes(nodes.begin(), nodes.end());
   std::map<DAGNode *, int> batch_depth;
   std::map<int, std::vector<DAGNode *>> depth_nodes;
   for (DAGNode *node : topo_order) {
@@ -3500,11 +3536,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
     return false;
   }
 
-  size_t independent_component_count = 0;
-  size_t independent_component_device_count = 0;
-  if (heftAlreadyParallelizesIndependentComponents(
-          topo_order, current_nodes, independent_component_count,
-          independent_component_device_count)) {
+  if (heft_parallelizes_independent_components) {
     DAEMON_TRACE_STREAM
         << "algorithmHEFT: whole-batch co-location skipped; ordinary HEFT "
            "already maps "
@@ -4061,6 +4093,7 @@ bool algorithmHEFT(
   // 必须使用逆拓扑序，保证计算一个节点时同批次所有后继已经计算过rank_u。
   std::unordered_set<DAGNode *> current_nodes(nodes.begin(), nodes.end());
   std::vector<DAGNode *> visited = reverseTopologicalOrder(nodes);
+  const std::vector<DAGNode *> topo_order(visited.rbegin(), visited.rend());
   for (DAGNode *node : visited) {
     double max_succ = 0;
     for (DAGNode *succ_node : node->depend_by) {
@@ -4147,11 +4180,46 @@ bool algorithmHEFT(
   }
 
   const double heft_finish_time = batchFinishTime(nodes);
+  size_t independent_component_count = 0;
+  size_t independent_component_device_count = 0;
+  const bool heft_parallelizes_independent_components =
+      heftAlreadyParallelizesIndependentComponents(
+          topo_order, current_nodes, independent_component_count,
+          independent_component_device_count);
   const bool co_located_batch = applyCoLocatedGpuScheduleIfBetter(
       nodes, initial_node_states, initial_available_time, heft_finish_time,
-      heft_risk_finish_time, kernel_sched_order_infos);
-  bool use_static_concurrent_batch = co_located_batch;
-  if (!use_static_concurrent_batch && concurrentGpuTargetItems() > 0.0) {
+      heft_risk_finish_time, topo_order, current_nodes,
+      heft_parallelizes_independent_components, independent_component_count,
+      independent_component_device_count, kernel_sched_order_infos);
+  bool use_static_batch = co_located_batch;
+  const size_t component_static_min_nodes =
+      componentAffineStaticMinNodesPerComponent();
+  const bool component_graph_is_deep =
+      component_static_min_nodes == 0 ||
+      independent_component_count <= nodes.size() / component_static_min_nodes;
+  if (!use_static_batch && componentAffineStaticFastPathEnabled() &&
+      heft_parallelizes_independent_components && component_graph_is_deep) {
+    // HEFT has already produced a complete, migration-free placement for
+    // every independent component. Preserve that placement and submit the
+    // full DAG once: per-kernel completion feedback cannot improve affinity
+    // here, but it creates a host round trip between dependent microkernels.
+    use_static_batch = true;
+    DAEMON_TRACE_STREAM
+        << "algorithmHEFT: multi-GPU component-affine batch uses static "
+           "execution for "
+        << independent_component_count << " independent components across "
+        << independent_component_device_count << " distinct GPUs"
+        << std::endl;
+  } else if (!use_static_batch && componentAffineStaticFastPathEnabled() &&
+             heft_parallelizes_independent_components &&
+             !component_graph_is_deep) {
+    DAEMON_TRACE_STREAM
+        << "algorithmHEFT: component-affine static execution skipped; "
+           "average component size "
+        << nodes.size() / independent_component_count
+        << " is below threshold " << component_static_min_nodes << std::endl;
+  }
+  if (!use_static_batch && concurrentGpuTargetItems() > 0.0) {
     size_t independent_component_count = 0;
     if (independentComponentsShareOneGpu(nodes,
                                          independent_component_count)) {
@@ -4160,7 +4228,7 @@ bool algorithmHEFT(
       // ordering can help, so submit the HEFT placement as one static OOO
       // batch. The handler independently verifies one device and num_parts=1
       // before selecting its concurrent queue.
-      use_static_concurrent_batch = true;
+      use_static_batch = true;
       DAEMON_TRACE_STREAM
           << "algorithmHEFT: single-GPU non-split batch uses static "
              "out-of-order execution for "
@@ -4239,7 +4307,7 @@ bool algorithmHEFT(
   // TODO 最合适用几个节点去跑
   // 通信代价和贪心避免了扩张代价大于运行代价
 
-  return use_static_concurrent_batch;
+  return use_static_batch;
 }
 
 #ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
@@ -4272,22 +4340,6 @@ static bool completionDrivenQueueRuntimeEnabled() {
            std::strcmp(env, "FALSE") != 0;
   }();
   return enabled;
-}
-
-static bool completionNodeReady(
-    DAGNode *node, const std::unordered_set<DAGNode *> &window_nodes,
-    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states) {
-  for (DAGNode *predecessor : node->depend_on) {
-    if (!window_nodes.count(predecessor)) {
-      continue;
-    }
-    auto state_it = states.find(predecessor);
-    if (state_it == states.end() ||
-        state_it->second.phase != CompletionNodePhase::Complete) {
-      return false;
-    }
-  }
-  return true;
 }
 
 static void resetCompletionWindowCalendar(const std::vector<DAGNode *> &nodes) {
@@ -4377,53 +4429,42 @@ static void setCompletionDeviceCalendar(
   }
 }
 
-static void refreshCompletionDeviceCalendar(
-    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states) {
+using CompletionDeviceSet = std::set<std::pair<int, int>>;
+
+static CompletionDeviceSet refreshCompletionDeviceCalendar(
+    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states,
+    const std::unordered_set<DAGNode *> &in_flight_nodes) {
   for (std::vector<double> &rank_calendar : gpu_available_time) {
     std::fill(rank_calendar.begin(), rank_calendar.end(), 0.0);
   }
 
+  CompletionDeviceSet in_flight_devices;
   const uint64_t now_ns = daemonSteadyNowNs();
-  for (const auto &entry : states) {
-    const CompletionNodeRuntimeState &state = entry.second;
+  for (DAGNode *node : in_flight_nodes) {
+    const CompletionNodeRuntimeState &state = states.at(node);
     if (state.phase != CompletionNodePhase::Dispatched) {
       continue;
     }
     setCompletionDeviceCalendar(
         state.reserved_devices, completionRemainingCost(state, now_ns));
-  }
-}
-
-static bool completionDeviceInFlight(
-    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states,
-    int rank, int proc) {
-  for (const auto &entry : states) {
-    const CompletionNodeRuntimeState &state = entry.second;
-    if (state.phase != CompletionNodePhase::Dispatched) {
-      continue;
-    }
-    if (std::find(state.reserved_devices.begin(),
-                  state.reserved_devices.end(),
-                  std::make_pair(rank, proc)) !=
-        state.reserved_devices.end()) {
-      return true;
+    for (const std::pair<int, int> &device : state.reserved_devices) {
+      in_flight_devices.insert(device);
     }
   }
-  return false;
+  return in_flight_devices;
 }
 
 static bool completionCandidateTouchesInFlightDevice(
     const TaskCandidate &candidate,
-    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states) {
+    const CompletionDeviceSet &in_flight_devices) {
   for (int proc : candidate.occupied_procs) {
-    if (completionDeviceInFlight(states, candidate.rank, proc)) {
+    if (in_flight_devices.count({candidate.rank, proc}) != 0) {
       return true;
     }
   }
   for (const TaskCandidate::DeviceReservation &reservation :
        candidate.transfer_reservations) {
-    if (completionDeviceInFlight(states, reservation.rank,
-                                 reservation.proc)) {
+    if (in_flight_devices.count({reservation.rank, reservation.proc}) != 0) {
       return true;
     }
   }
@@ -4432,8 +4473,9 @@ static bool completionCandidateTouchesInFlightDevice(
 
 static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     const std::vector<DAGNode *> &priority_order,
-    const std::unordered_set<DAGNode *> &window_nodes,
+    std::set<size_t> &ready_indices,
     std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states,
+    std::unordered_set<DAGNode *> &in_flight_nodes,
     int &dispatch_order) {
   struct PlannedDispatch {
     D2SKernelExecInfo exec_info;
@@ -4441,17 +4483,20 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     size_t compute_reservations = 0;
   };
   std::vector<PlannedDispatch> planned_dispatches;
-  refreshCompletionDeviceCalendar(states);
+  CompletionDeviceSet in_flight_devices =
+      refreshCompletionDeviceCalendar(states, in_flight_nodes);
   while (true) {
     DAGNode *selected_node = nullptr;
+    auto selected_ready_it = ready_indices.end();
     TaskCandidate selected_candidate;
     DAGNode *deferred_node = nullptr;
     TaskCandidate deferred_candidate;
 
-    for (DAGNode *node : priority_order) {
-      CompletionNodeRuntimeState &state = states[node];
-      if (state.phase != CompletionNodePhase::Pending ||
-          !completionNodeReady(node, window_nodes, states)) {
+    for (auto ready_it = ready_indices.begin();
+         ready_it != ready_indices.end(); ++ready_it) {
+      DAGNode *node = priority_order[*ready_it];
+      CompletionNodeRuntimeState &state = states.at(node);
+      if (state.phase != CompletionNodePhase::Pending) {
         continue;
       }
 
@@ -4471,7 +4516,8 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
       // preventing the handler from reporting unrelated completions. Keep
       // scanning so another READY node can still use an idle device when that
       // is genuinely its best candidate.
-      if (completionCandidateTouchesInFlightDevice(candidate, states)) {
+      if (completionCandidateTouchesInFlightDevice(
+              candidate, in_flight_devices)) {
         if (deferred_node == nullptr) {
           deferred_node = node;
           deferred_candidate = candidate;
@@ -4479,6 +4525,7 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
         continue;
       }
       selected_node = node;
+      selected_ready_it = ready_it;
       selected_candidate = std::move(candidate);
       break;
     }
@@ -4505,7 +4552,7 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     selected_node->split_devices = selected_candidate.occupied_procs;
     selected_node->finish_time = selected_candidate.finish_time;
 
-    CompletionNodeRuntimeState &selected_state = states[selected_node];
+    CompletionNodeRuntimeState &selected_state = states.at(selected_node);
     selected_state.phase = CompletionNodePhase::Dispatched;
     selected_state.reserved_devices =
         completionCandidateReservations(selected_candidate);
@@ -4520,6 +4567,10 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     setCompletionDeviceCalendar(
         selected_state.reserved_devices,
         completionRemainingCost(selected_state, daemonSteadyNowNs()));
+    ready_indices.erase(selected_ready_it);
+    in_flight_nodes.insert(selected_node);
+    in_flight_devices.insert(selected_state.reserved_devices.begin(),
+                             selected_state.reserved_devices.end());
 
     D2SKernelExecInfo exec_info;
     exec_info.kernel_count = selected_node->kernel_count;
@@ -4555,16 +4606,6 @@ static std::vector<D2SKernelExecInfo> dispatchCompletionReadyNodes(
     dispatches.push_back(std::move(dispatch.exec_info));
   }
   return dispatches;
-}
-
-static size_t countCompletionPhase(
-    const std::unordered_map<DAGNode *, CompletionNodeRuntimeState> &states,
-    CompletionNodePhase phase) {
-  size_t count = 0;
-  for (const auto &entry : states) {
-    count += entry.second.phase == phase ? 1 : 0;
-  }
-  return count;
 }
 
 static bool sendCompletionDispatchBatch(
@@ -4604,8 +4645,36 @@ static CompletionWindowResult runCompletionDrivenWindow(
                    });
   std::unordered_set<DAGNode *> window_nodes(nodes.begin(), nodes.end());
   std::unordered_map<DAGNode *, CompletionNodeRuntimeState> states;
+  std::unordered_map<DAGNode *, size_t> remaining_predecessors;
+  std::unordered_map<DAGNode *, size_t> priority_indices;
+  std::unordered_map<int, DAGNode *> nodes_by_kernel_count;
+  std::unordered_set<DAGNode *> in_flight_nodes;
+  states.reserve(nodes.size());
+  remaining_predecessors.reserve(nodes.size());
+  priority_indices.reserve(nodes.size());
+  nodes_by_kernel_count.reserve(nodes.size());
+  in_flight_nodes.reserve(nodes.size());
+  for (size_t index = 0; index < priority_order.size(); ++index) {
+    priority_indices.emplace(priority_order[index], index);
+  }
+  std::set<size_t> ready_indices;
   for (DAGNode *node : nodes) {
     states.emplace(node, CompletionNodeRuntimeState{});
+    if (!nodes_by_kernel_count.emplace(node->kernel_count, node).second) {
+      std::cerr << "CompletionQueue: duplicate kernel_count "
+                << node->kernel_count << " in wait " << daemon_wait_count
+                << std::endl;
+      mq_close(mq_id_program);
+      return CompletionWindowResult::FailedBeforeStart;
+    }
+    size_t predecessor_count = 0;
+    for (DAGNode *predecessor : node->depend_on) {
+      predecessor_count += window_nodes.count(predecessor) != 0 ? 1 : 0;
+    }
+    remaining_predecessors.emplace(node, predecessor_count);
+    if (predecessor_count == 0) {
+      ready_indices.insert(priority_indices.at(node));
+    }
   }
   // algorithmHEFT has already produced the batch-static fallback before this
   // function is entered. Preserve its DAG placement as well as its serialized
@@ -4618,17 +4687,14 @@ static CompletionWindowResult runCompletionDrivenWindow(
 
   int dispatch_order = 0;
   bool protocol_started = false;
+  size_t complete_count = 0;
   while (true) {
     std::vector<D2SKernelExecInfo> dispatches =
-        dispatchCompletionReadyNodes(priority_order, window_nodes, states,
-                                     dispatch_order);
-    const size_t complete_count =
-        countCompletionPhase(states, CompletionNodePhase::Complete);
-    const size_t dispatched_count =
-        countCompletionPhase(states, CompletionNodePhase::Dispatched);
+        dispatchCompletionReadyNodes(priority_order, ready_indices, states,
+                                     in_flight_nodes, dispatch_order);
     const bool window_complete = complete_count == nodes.size();
 
-    if (!window_complete && dispatches.empty() && dispatched_count == 0) {
+    if (!window_complete && dispatches.empty() && in_flight_nodes.empty()) {
       std::cerr << "CompletionQueue: no ready or in-flight kernel in wait "
                 << daemon_wait_count << std::endl;
       if (protocol_started) {
@@ -4692,21 +4758,20 @@ static CompletionWindowResult runCompletionDrivenWindow(
     }
 
     std::unordered_set<int> completion_kernel_counts;
+    std::vector<DAGNode *> completed_nodes;
+    completed_nodes.reserve(completion_batch.completions.size());
     for (const S2DKernelProfileData &completion :
          completion_batch.completions) {
-      auto node_it = std::find_if(
-          nodes.begin(), nodes.end(), [&](const DAGNode *node) {
-            return node->kernel_count == completion.kernel_count;
-          });
-      if (node_it == nodes.end()) {
+      auto node_it = nodes_by_kernel_count.find(completion.kernel_count);
+      if (node_it == nodes_by_kernel_count.end()) {
         std::cerr << "CompletionQueue: unknown completed kernel "
                   << completion.kernel_count << std::endl;
         sendCompletionDispatchBatch(mq_id_program, {}, false, true);
         mq_close(mq_id_program);
         return CompletionWindowResult::FailedAfterStart;
       }
-      DAGNode *node = *node_it;
-      CompletionNodeRuntimeState &state = states[node];
+      DAGNode *node = node_it->second;
+      CompletionNodeRuntimeState &state = states.at(node);
       if (state.phase != CompletionNodePhase::Dispatched ||
           !completion_kernel_counts.insert(completion.kernel_count).second) {
         std::cerr << "CompletionQueue: duplicate or non-dispatched completion "
@@ -4715,19 +4780,40 @@ static CompletionWindowResult runCompletionDrivenWindow(
         mq_close(mq_id_program);
         return CompletionWindowResult::FailedAfterStart;
       }
+      completed_nodes.push_back(node);
     }
 
-    for (const S2DKernelProfileData &completion :
-         completion_batch.completions) {
-      DAGNode *node = *std::find_if(
-          nodes.begin(), nodes.end(), [&](const DAGNode *candidate) {
-            return candidate->kernel_count == completion.kernel_count;
-          });
-      CompletionNodeRuntimeState &state = states[node];
+    for (size_t completion_index = 0;
+         completion_index < completion_batch.completions.size();
+         ++completion_index) {
+      const S2DKernelProfileData &completion =
+          completion_batch.completions[completion_index];
+      DAGNode *node = completed_nodes[completion_index];
+      CompletionNodeRuntimeState &state = states.at(node);
       state.reserved_devices.clear();
       state.dispatch_started_ns = 0;
       state.predicted_release_ns = 0;
       state.phase = CompletionNodePhase::Complete;
+      in_flight_nodes.erase(node);
+      ++complete_count;
+      for (DAGNode *successor : node->depend_by) {
+        if (window_nodes.count(successor) == 0) {
+          continue;
+        }
+        size_t &remaining = remaining_predecessors.at(successor);
+        if (remaining == 0) {
+          std::cerr << "CompletionQueue: predecessor underflow for kernel "
+                    << successor->kernel_count << " in wait "
+                    << daemon_wait_count << std::endl;
+          sendCompletionDispatchBatch(mq_id_program, {}, false, true);
+          mq_close(mq_id_program);
+          return CompletionWindowResult::FailedAfterStart;
+        }
+        --remaining;
+        if (remaining == 0) {
+          ready_indices.insert(priority_indices.at(successor));
+        }
+      }
       const int actual_parts = std::max(1, completion.num_parts);
       if (node->exec_proc != completion.device_index ||
           node->num_parts != actual_parts ||
@@ -6100,14 +6186,14 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         generateDAGs(kernel_dag_nodes, nodes);
 
         // 2. 调度算法 更新node和sched_info
-        const bool use_static_concurrent_batch =
+        const bool use_static_batch =
             algorithmHEFT(nodes, kernel_sched_order_infos);
         DAEMON_TRACE_STREAM << "Rank " << daemon_rank << " TEST kernel_sched_order_infos size: " << kernel_sched_order_infos.size() << std::endl;
 
 #ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
         if (daemon_size == 1 && onrun_size == 1 &&
             completionDrivenQueueRuntimeEnabled() &&
-            !use_static_concurrent_batch) {
+            !use_static_batch) {
           const CompletionWindowResult result = runCompletionDrivenWindow(
               nodes, daemon_wait_count, local_pid, mq_id_daemon);
           completion_window_handled =
