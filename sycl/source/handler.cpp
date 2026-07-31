@@ -314,9 +314,9 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
                           const detail::QueueImplPtr &OldQueue,
                           bool InOrder = true) {
   // Ordinary HEFT models every device as one processor timeline, so it uses
-  // one stable in-order queue per device. A daemon-selected co-located batch
-  // instead uses a separate stable out-of-order queue on that device, allowing
-  // independent low-occupancy kernels to share the backend stream pool.
+  // one stable in-order queue per device. A daemon-selected concurrent static
+  // batch instead uses a separate stable out-of-order queue on that device,
+  // allowing independent kernels to share the backend stream pool.
   static std::mutex QueueMutex;
   struct DeviceQueueEntry {
     detail::DeviceImplPtr Device;
@@ -362,8 +362,8 @@ makeOfflineProfilingQueue(const detail::DeviceImplPtr &Device,
   }
 
   // Profiling may be unsupported by a backend. Preserve the selected queue
-  // ordering mode: ordinary HEFT needs in-order execution, while a co-located
-  // batch intentionally needs the backend's out-of-order stream pool.
+  // ordering mode: ordinary HEFT needs in-order execution, while a concurrent
+  // static batch intentionally needs the backend's out-of-order stream pool.
   property_list FallbackProps =
       InOrder ? property_list(property::queue::in_order{}) : property_list{};
   detail::QueueImplPtr NewQueue = std::make_shared<detail::queue_impl>(

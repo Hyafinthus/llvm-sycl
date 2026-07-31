@@ -3346,8 +3346,8 @@ topologicalOrderForCurrentBatch(const std::vector<DAGNode *> &nodes) {
 }
 
 // Whole-batch co-location is not a safe replacement when HEFT has already
-// placed independent components (for example, observation tiles) one-to-one
-// on different GPUs. Collapsing those components to one GPU discards physical
+// placed independent components (for example, observation tiles) across
+// multiple GPUs. Collapsing those components to one GPU discards physical
 // device parallelism based only on the approximate stream-concurrency model.
 static bool heftAlreadyParallelizesIndependentComponents(
     const std::vector<DAGNode *> &topo_order,
@@ -3411,7 +3411,18 @@ static bool heftAlreadyParallelizesIndependentComponents(
   const std::set<std::pair<int, int>> distinct_devices(
       component_devices.begin(), component_devices.end());
   device_count = distinct_devices.size();
-  return device_count == component_count;
+  return device_count > 1;
+}
+
+static bool independentComponentsShareOneGpu(
+    const std::vector<DAGNode *> &nodes, size_t &component_count) {
+  const std::vector<DAGNode *> topo_order =
+      topologicalOrderForCurrentBatch(nodes);
+  const std::unordered_set<DAGNode *> current_nodes(nodes.begin(), nodes.end());
+  size_t device_count = 0;
+  (void)heftAlreadyParallelizesIndependentComponents(
+      topo_order, current_nodes, component_count, device_count);
+  return component_count > 1 && device_count == 1;
 }
 
 static double coLocatedOccupancyDemand(const DAGNode *node,
@@ -3421,14 +3432,12 @@ static double coLocatedOccupancyDemand(const DAGNode *node,
                         static_cast<double>(node->global_size1) *
                         static_cast<double>(node->global_size2));
 
-  // global_items alone underestimates kernels whose few work-items loop over a
-  // large accessor range (row correlation and classic MGS are representative
-  // examples). node->total_elem is the scheduler's /1000-normalized logical
-  // access footprint. It is intentionally only a conservative saturation
-  // signal here, not a claim that access elements equal resident threads.
-  const double occupancy_proxy =
-      std::max(global_items, std::max(1.0, node->total_elem));
-  return std::min(1.0, occupancy_proxy / target_items);
+  // Accessor footprint is not a residency measure. Row correlation and classic
+  // MGS touch large buffers through comparatively few work-items, and
+  // independent tiles can therefore co-reside on one GPU. Keep the demand
+  // proxy tied to schedulable work-items; the independent-component guard
+  // separately protects physical parallelism already established by HEFT.
+  return std::min(1.0, global_items / target_items);
 }
 
 static void rebuildKernelSchedInfos(
@@ -3499,7 +3508,7 @@ static bool applyCoLocatedGpuScheduleIfBetter(
     DAEMON_TRACE_STREAM
         << "algorithmHEFT: whole-batch co-location skipped; ordinary HEFT "
            "already maps "
-        << independent_component_count << " independent components to "
+        << independent_component_count << " independent components across "
         << independent_component_device_count << " distinct GPUs" << std::endl;
     return false;
   }
@@ -4141,6 +4150,24 @@ bool algorithmHEFT(
   const bool co_located_batch = applyCoLocatedGpuScheduleIfBetter(
       nodes, initial_node_states, initial_available_time, heft_finish_time,
       heft_risk_finish_time, kernel_sched_order_infos);
+  bool use_static_concurrent_batch = co_located_batch;
+  if (!use_static_concurrent_batch && concurrentGpuTargetItems() > 0.0) {
+    size_t independent_component_count = 0;
+    if (independentComponentsShareOneGpu(nodes,
+                                         independent_component_count)) {
+      // There is no placement trade-off left on one GPU. Completion-driven
+      // admission would serialize the independent components before queue
+      // ordering can help, so submit the HEFT placement as one static OOO
+      // batch. The handler independently verifies one device and num_parts=1
+      // before selecting its concurrent queue.
+      use_static_concurrent_batch = true;
+      DAEMON_TRACE_STREAM
+          << "algorithmHEFT: single-GPU non-split batch uses static "
+             "out-of-order execution for "
+          << independent_component_count << " independent components"
+          << std::endl;
+    }
+  }
 
 #ifdef SNMD_OFFLINE_SPLIT_STATS
   uint64_t selected_single_kernels = 0;
@@ -4212,7 +4239,7 @@ bool algorithmHEFT(
   // TODO 最合适用几个节点去跑
   // 通信代价和贪心避免了扩张代价大于运行代价
 
-  return co_located_batch;
+  return use_static_concurrent_batch;
 }
 
 #ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
@@ -6073,13 +6100,14 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         generateDAGs(kernel_dag_nodes, nodes);
 
         // 2. 调度算法 更新node和sched_info
-        const bool co_located_batch =
+        const bool use_static_concurrent_batch =
             algorithmHEFT(nodes, kernel_sched_order_infos);
         DAEMON_TRACE_STREAM << "Rank " << daemon_rank << " TEST kernel_sched_order_infos size: " << kernel_sched_order_infos.size() << std::endl;
 
 #ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE
         if (daemon_size == 1 && onrun_size == 1 &&
-            completionDrivenQueueRuntimeEnabled() && !co_located_batch) {
+            completionDrivenQueueRuntimeEnabled() &&
+            !use_static_concurrent_batch) {
           const CompletionWindowResult result = runCompletionDrivenWindow(
               nodes, daemon_wait_count, local_pid, mq_id_daemon);
           completion_window_handled =
