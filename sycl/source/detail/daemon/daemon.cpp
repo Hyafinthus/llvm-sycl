@@ -942,6 +942,27 @@ static double coldSplitMinSingleCost() {
 }
 #endif
 
+static size_t persistentChainMinNodes() {
+  static const size_t min_nodes = [] {
+    constexpr size_t default_min_nodes =
+        SNMD_OFFLINE_PERSISTENT_CHAIN_MIN_NODES;
+    const char *env =
+        std::getenv("SYCL_SNMD_PERSISTENT_CHAIN_MIN_NODES");
+    if (env == nullptr || *env == '\0') {
+      return default_min_nodes;
+    }
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' ||
+        parsed > std::numeric_limits<size_t>::max()) {
+      return default_min_nodes;
+    }
+    return static_cast<size_t>(parsed);
+  }();
+  return min_nodes;
+}
+
 static bool decisionSummaryRuntimeEnabled() {
   static const bool enabled = [] {
     const char *env = std::getenv("SYCL_SNMD_DECISION_SUMMARY");
@@ -3170,31 +3191,115 @@ static bool supportsPersistentSplit(const DAGNode *node, int num_parts) {
   return has_write;
 }
 
+static bool partitionCompatibleEdge(const DAGNode *predecessor,
+                                    const DAGNode *successor,
+                                    int num_parts) {
+  if (predecessor == nullptr || successor == nullptr ||
+      !supportsPersistentSplit(predecessor, num_parts) ||
+      !supportsPersistentSplit(successor, num_parts) ||
+      predecessor->global_size0 != successor->global_size0) {
+    return false;
+  }
+  const auto dep_it = successor->depend_on_mem.find(
+      const_cast<DAGNode *>(predecessor));
+  return dep_it != successor->depend_on_mem.end() &&
+         !dep_it->second.empty() &&
+         std::all_of(dep_it->second.begin(), dep_it->second.end(),
+                     [](const SyclReqData &req) {
+                       return req.partition_local || req.partition_halo();
+                     });
+}
+
+static size_t persistentChainSpan(const DAGNode *node, int num_parts) {
+  if (node == nullptr || num_parts < 0 || num_parts >= 5) {
+    return 0;
+  }
+  return node->persistent_chain_nodes[static_cast<size_t>(num_parts)];
+}
+
+static bool nodeHasPartitionHaloRead(const DAGNode *node) {
+  return node != nullptr &&
+         std::any_of(node->req_data.begin(), node->req_data.end(),
+                     [](const SyclReqData &req) {
+                       return isReadAccess(req.req_accmode) &&
+                              req.partition_halo();
+                     });
+}
+
 static bool hasPartitionCompatibleSuccessor(const DAGNode *node,
                                             int num_parts) {
   if (node == nullptr) {
     return false;
   }
-  for (const DAGNode *successor : node->depend_by) {
-    if (!supportsPersistentSplit(successor, num_parts) ||
-        successor->global_size0 != node->global_size0) {
-      continue;
-    }
-    const auto dep_it = successor->depend_on_mem.find(
-        const_cast<DAGNode *>(node));
-    if (dep_it == successor->depend_on_mem.end() || dep_it->second.empty()) {
-      continue;
-    }
-    const bool all_partition_compatible =
-        std::all_of(dep_it->second.begin(), dep_it->second.end(),
-                    [](const SyclReqData &req) {
-                      return req.partition_local || req.partition_halo();
-                    });
-    if (all_partition_compatible) {
-      return true;
+  return std::any_of(
+      node->depend_by.begin(), node->depend_by.end(),
+      [node, num_parts](const DAGNode *successor) {
+        return partitionCompatibleEdge(node, successor, num_parts);
+      });
+}
+
+// Annotate maximal *linear* resident components once per wait window. The
+// linearity requirement is important: static submission is safe and useful
+// for a time-step chain, while a branching resident DAG still needs ordinary
+// completion-driven admission and device reservations.
+static void annotatePersistentSplitChains(
+    const std::vector<DAGNode *> &nodes, int max_parts) {
+  const std::unordered_set<DAGNode *> current_nodes(nodes.begin(),
+                                                    nodes.end());
+  for (DAGNode *node : nodes) {
+    node->persistent_chain_nodes.fill(0);
+  }
+
+  for (int num_parts = 2; num_parts <= std::min(max_parts, 4);
+       num_parts += 2) {
+    std::unordered_set<DAGNode *> visited;
+    for (DAGNode *seed : nodes) {
+      if (seed == nullptr || visited.count(seed) ||
+          !supportsPersistentSplit(seed, num_parts)) {
+        continue;
+      }
+
+      std::vector<DAGNode *> component;
+      std::vector<DAGNode *> pending{seed};
+      visited.insert(seed);
+      bool linear = true;
+      while (!pending.empty()) {
+        DAGNode *node = pending.back();
+        pending.pop_back();
+        component.push_back(node);
+
+        size_t compatible_predecessors = 0;
+        size_t compatible_successors = 0;
+        for (DAGNode *predecessor : node->depend_on) {
+          if (!current_nodes.count(predecessor) ||
+              !partitionCompatibleEdge(predecessor, node, num_parts)) {
+            continue;
+          }
+          ++compatible_predecessors;
+          if (visited.insert(predecessor).second) {
+            pending.push_back(predecessor);
+          }
+        }
+        for (DAGNode *successor : node->depend_by) {
+          if (!current_nodes.count(successor) ||
+              !partitionCompatibleEdge(node, successor, num_parts)) {
+            continue;
+          }
+          ++compatible_successors;
+          if (visited.insert(successor).second) {
+            pending.push_back(successor);
+          }
+        }
+        linear = linear && compatible_predecessors <= 1 &&
+                 compatible_successors <= 1;
+      }
+
+      const size_t span = linear ? component.size() : 0;
+      for (DAGNode *node : component) {
+        node->persistent_chain_nodes[static_cast<size_t>(num_parts)] = span;
+      }
     }
   }
-  return false;
 }
 
 static bool persistentEdgeCompatible(
@@ -3246,9 +3351,21 @@ static double estimateSplitInternalCopyCost(
   const double partitioned_read_bytes =
       std::max(0.0, totalReadBytesForPartitionMode(node, true) -
                         dependentReadBytesForPartitionMode(node, true));
-  const double read_bytes_per_extra_device =
+  double read_bytes_per_extra_device =
       replicated_read_bytes +
       partitioned_read_bytes / static_cast<double>(split_devices.size());
+  const size_t chain_span =
+      persistent_split
+          ? persistentChainSpan(node, static_cast<int>(split_devices.size()))
+          : 0;
+  if (nodeHasPartitionHaloRead(node) && persistentChainMinNodes() != 0 &&
+      chain_span >= persistentChainMinNodes()) {
+    // These are entry/setup bytes only: dependent resident reads were removed
+    // above. Charge them once across the compatible chain instead of once to
+    // its first kernel, otherwise greedy HEFT can never enter the resident
+    // mode whose steady-state cost it is supposed to evaluate.
+    read_bytes_per_extra_device /= static_cast<double>(chain_span);
+  }
   const double write_part_bytes =
       persistent_split
           ? 0.0
@@ -3818,10 +3935,16 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
   if (!worthConsideringSplit(node, num_parts)) {
     return candidate;
   }
+  const size_t persistent_chain_span =
+      persistentChainSpan(node, num_parts);
+  const bool long_halo_chain =
+      nodeHasPartitionHaloRead(node) &&
+      persistentChainMinNodes() != 0 &&
+      persistent_chain_span >= persistentChainMinNodes();
   const bool persistent_split =
       gpu_available_time.size() == 1 &&
-      supportsPersistentSplit(node, num_parts) &&
-      hasPartitionCompatibleSuccessor(node, num_parts);
+      (hasPartitionCompatibleSuccessor(node, num_parts) || long_halo_chain);
+  const bool amortized_persistent_chain = persistent_split && long_halo_chain;
   if (rank < 0 || rank >= static_cast<int>(gpu_available_time.size()) ||
       static_cast<int>(gpu_available_time[rank].size()) <= num_parts) {
     return candidate;
@@ -3851,7 +3974,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
   }
 #endif
 #ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
-  if (!has_split_profile &&
+  if (!has_split_profile && !amortized_persistent_chain &&
       std::all_of(single_estimates.begin(), single_estimates.end(),
                   [](const auto &Entry) {
                     return std::isfinite(Entry.second.mean) &&
@@ -3896,7 +4019,8 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
     // transfer plan or estimating Split execution: completion-driven
     // scheduling revisits every ready task, so doing the expensive work first
     // creates dispatch bubbles even though the candidate cannot be selected.
-    if (!has_split_profile && std::isfinite(best_single_estimate.mean) &&
+    if (!has_split_profile && !amortized_persistent_chain &&
+        std::isfinite(best_single_estimate.mean) &&
         best_single_estimate.mean <
             coldSplitMinSingleCost()) {
       continue;
@@ -3911,7 +4035,8 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
         estimateSplitExecCost(node, rank, split_devices, persistent_split);
 
 #ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
-    if (!has_split_profile && std::isfinite(best_single_estimate.mean)) {
+    if (!has_split_profile && !amortized_persistent_chain &&
+        std::isfinite(best_single_estimate.mean)) {
       const double max_cold_split_cost =
           best_single_estimate.mean *
           (100.0 - SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT) / 100.0;
@@ -4141,6 +4266,14 @@ bool algorithmHEFT(
     node->batch_root_count = batch_root_count;
   }
 
+  int max_available_split_parts = 0;
+  for (const auto &rank_devices : gpu_available_time) {
+    max_available_split_parts = std::max(
+        max_available_split_parts,
+        std::min<int>(4, static_cast<int>(rank_devices.size()) - 1));
+  }
+  annotatePersistentSplitChains(nodes, max_available_split_parts);
+
 #if defined(SNMD_OFFLINE_WIDE_DAG_GUARD) ||                                \
     defined(SNMD_OFFLINE_SPLIT_STATS)
   // Compute depth inside this wait batch only. Cross-window predecessors still
@@ -4305,8 +4438,26 @@ bool algorithmHEFT(
       heft_parallelizes_independent_components, independent_component_count,
       independent_component_device_count, kernel_sched_order_infos);
   bool use_static_batch = co_located_batch;
+  bool persistent_chain_static_batch = false;
   bool component_affine_static_batch = false;
   bool single_gpu_static_batch = false;
+  if (!use_static_batch && persistentChainMinNodes() != 0) {
+    for (const DAGNode *node : nodes) {
+      if (node->num_parts > 1 && node->persistent_split &&
+          nodeHasPartitionHaloRead(node) &&
+          persistentChainSpan(node, node->num_parts) >=
+              persistentChainMinNodes()) {
+        use_static_batch = true;
+        persistent_chain_static_batch = true;
+        DAEMON_TRACE_STREAM
+            << "algorithmHEFT: resident persistent chain uses static "
+               "execution; span "
+            << persistentChainSpan(node, node->num_parts) << " parts "
+            << node->num_parts << std::endl;
+        break;
+      }
+    }
+  }
   const size_t component_static_min_nodes =
       componentAffineStaticMinNodesPerComponent();
   const bool component_graph_is_deep =
@@ -4467,7 +4618,8 @@ bool algorithmHEFT(
         << " roots=" << batch_root_count
         << " components=" << independent_component_count
         << " component_devices=" << independent_component_device_count
-        << " path=" << path
+        << " path="
+        << (persistent_chain_static_batch ? "persistent_chain_static" : path)
         << " completion_queue="
         << (completionQueueRuntimeRequested() ? 1 : 0)
         << " single_kernels=" << selected_single_kernels
@@ -4494,6 +4646,7 @@ bool algorithmHEFT(
 #ifdef SNMD_OFFLINE_COLD_SPLIT_PROBE
         << " cold_split_min_single_cost=" << coldSplitMinSingleCost()
 #endif
+        << " persistent_chain_min_nodes=" << persistentChainMinNodes()
         << std::endl;
   }
 
@@ -6373,8 +6526,19 @@ void *SystemSchedulerDaemonOffline(void *arg) {
         generateDAGs(kernel_dag_nodes, nodes);
 
         // 2. 调度算法 更新node和sched_info
+        const auto planning_begin = std::chrono::steady_clock::now();
         const bool use_static_batch =
             algorithmHEFT(nodes, kernel_sched_order_infos);
+        const auto planning_end = std::chrono::steady_clock::now();
+        if (decisionSummaryRuntimeEnabled()) {
+          const auto planning_ns =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  planning_end - planning_begin)
+                  .count();
+          std::cout << "SNMD_PLANNING pid=" << local_pid
+                    << " kernels=" << nodes.size()
+                    << " duration_ns=" << planning_ns << std::endl;
+        }
         DAEMON_TRACE_STREAM << "Rank " << daemon_rank << " TEST kernel_sched_order_infos size: " << kernel_sched_order_infos.size() << std::endl;
 
 #ifdef SNMD_OFFLINE_COMPLETION_DRIVEN_QUEUE

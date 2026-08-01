@@ -17,6 +17,8 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -929,6 +931,7 @@ struct PendingOfflineSplitMerge {
   std::vector<detail::EventImplPtr> Events;
   bool EventsWaited = false;
   uint64_t PartsCompleteNs = 0;
+  bool FinalizeTimingRecorded = false;
   bool Resident = false;
   std::vector<int> SplitDeviceIndices;
   size_t PartitionDim0 = 0;
@@ -1235,11 +1238,42 @@ static bool kernelCanConsumeResidentSplit(
   return TouchesCompatibleState;
 }
 
+static bool kernelConsumesResidentHalo(
+    detail::SyclKernelCg *KernelCg,
+    const PendingOfflineSplitMerge &Pending) {
+  if (KernelCg == nullptr || !KernelCg->kernel_cg || !Pending.Resident) {
+    return false;
+  }
+  auto *ExecCG =
+      dynamic_cast<detail::CGExecKernel *>(KernelCg->kernel_cg.get());
+  const auto &PM = detail::ProgramManager::getInstance();
+  if (ExecCG == nullptr || PM.NumParts <= 1) {
+    return false;
+  }
+  for (detail::Requirement *Req : ExecCG->MRequirements) {
+    if (Req == nullptr ||
+        !offlineReqHasValidPartitionHaloShape(ExecCG, Req, PM.NumParts)) {
+      continue;
+    }
+    if (std::find(Pending.WrittenMemObjs.begin(),
+                  Pending.WrittenMemObjs.end(), Req->MSYCLMemObj) !=
+            Pending.WrittenMemObjs.end() &&
+        !pendingOfflineSplitMemSuperseded(Pending, Req->MSYCLMemObj)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void supersedeOlderResidentWrites(
     const PendingOfflineSplitMerge &NewPending) {
-  for (PendingOfflineSplitMerge &Pending : pendingOfflineSplitMerges()) {
+  std::vector<PendingOfflineSplitMerge> &PendingSplits =
+      pendingOfflineSplitMerges();
+  for (size_t I = 0; I < PendingSplits.size();) {
+    PendingOfflineSplitMerge &Pending = PendingSplits[I];
     if (!Pending.Resident ||
         Pending.SplitDeviceIndices != NewPending.SplitDeviceIndices) {
+      ++I;
       continue;
     }
     for (detail::SYCLMemObjI *MemObj : NewPending.WrittenMemObjs) {
@@ -1261,6 +1295,31 @@ static void supersedeOlderResidentWrites(
       }
 #endif
     }
+
+    const bool AllWritesSuperseded =
+        !Pending.WrittenMemObjs.empty() &&
+        std::all_of(Pending.WrittenMemObjs.begin(),
+                    Pending.WrittenMemObjs.end(),
+                    [&Pending](detail::SYCLMemObjI *MemObj) {
+                      return pendingOfflineSplitMemSuperseded(Pending,
+                                                              MemObj);
+                    });
+    // Once a completed resident version has been fully overwritten, it can no
+    // longer be a source for a future accessor. Retire Halo-only history
+    // immediately. Replicated/local read metadata stays conservative because
+    // those caches can describe immutable inputs shared by later kernels.
+    if (AllWritesSuperseded && Pending.EventsWaited &&
+        Pending.ReadMemObjs.empty() &&
+        Pending.PartitionLocalReadMemObjs.empty()) {
+      if (!Pending.FinalizeTimingRecorded) {
+        offlineSplitFinalizeTimes().push_back(
+            {Pending.KernelCount, Pending.PartsCompleteNs, 0});
+        Pending.FinalizeTimingRecorded = true;
+      }
+      PendingSplits.erase(PendingSplits.begin() + I);
+      continue;
+    }
+    ++I;
   }
 }
 
@@ -1813,8 +1872,11 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   const uint64_t MaterializationStartNs = offlineNowNs();
 
   if (Pending.SplitQueues.empty()) {
-    offlineSplitFinalizeTimes().push_back(
-        {Pending.KernelCount, Pending.PartsCompleteNs, 0});
+    if (!Pending.FinalizeTimingRecorded) {
+      offlineSplitFinalizeTimes().push_back(
+          {Pending.KernelCount, Pending.PartsCompleteNs, 0});
+      Pending.FinalizeTimingRecorded = true;
+    }
     return;
   }
 
@@ -1935,11 +1997,14 @@ static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   }
 
   const uint64_t MaterializationEndNs = offlineNowNs();
-  offlineSplitFinalizeTimes().push_back(
-      {Pending.KernelCount, Pending.PartsCompleteNs,
-       MaterializationEndNs >= MaterializationStartNs
-           ? MaterializationEndNs - MaterializationStartNs
-           : 0});
+  if (!Pending.FinalizeTimingRecorded) {
+    offlineSplitFinalizeTimes().push_back(
+        {Pending.KernelCount, Pending.PartsCompleteNs,
+         MaterializationEndNs >= MaterializationStartNs
+             ? MaterializationEndNs - MaterializationStartNs
+             : 0});
+    Pending.FinalizeTimingRecorded = true;
+  }
 }
 
 static void finalizePendingOfflineSplitsForKernel(
@@ -1975,6 +2040,15 @@ static void finalizePendingOfflineSplitsForKernel(
   for (size_t I = 0; I < PendingSplits.size();) {
     if (kernelTouchesPendingOfflineSplit(KernelCg, PendingSplits[I])) {
       if (kernelCanConsumeResidentSplit(KernelCg, PendingSplits[I])) {
+        // A Halo consumer must wait for its producer before exchanging ghost
+        // rows. Do that ownership wait here, before the caller starts the
+        // successor's profile interval. exchangeOfflineResidentHalo() keeps
+        // the same correctness fence but observes EventsWaited and therefore
+        // does not charge the predecessor's compute time to the successor.
+        // Local-only chains remain asynchronously queueable.
+        if (kernelConsumesResidentHalo(KernelCg, PendingSplits[I])) {
+          waitPendingOfflineSplit(PendingSplits[I]);
+        }
         HANDLER_TRACE_STREAM
             << "=== handler === retain compatible resident Split from "
             << "kernel_count: " << PendingSplits[I].KernelCount << std::endl;
@@ -2014,8 +2088,12 @@ static void finalizeCompletedOfflineSplit(int KernelCount) {
       // directly.  Materialization is deferred until an incompatible edge or
       // the user-visible window fence.
       waitPendingOfflineSplit(PendingSplits[I]);
-      offlineSplitFinalizeTimes().push_back(
-          {PendingSplits[I].KernelCount, PendingSplits[I].PartsCompleteNs, 0});
+      if (!PendingSplits[I].FinalizeTimingRecorded) {
+        offlineSplitFinalizeTimes().push_back(
+            {PendingSplits[I].KernelCount,
+             PendingSplits[I].PartsCompleteNs, 0});
+        PendingSplits[I].FinalizeTimingRecorded = true;
+      }
       HANDLER_TRACE_STREAM
           << "=== handler === Split completion retained resident partitions "
           << "for kernel_count: " << KernelCount << std::endl;
@@ -2033,22 +2111,28 @@ static void finalizeCompletedOfflineSplit(int KernelCount) {
 
 static void applyOfflineSplitFinalizeTimes(
     std::vector<OfflineProfileEvent> &ProfileEvents) {
+  std::unordered_map<int, size_t> ProfileIndex;
+  ProfileIndex.reserve(ProfileEvents.size());
+  for (size_t I = 0; I < ProfileEvents.size(); ++I) {
+    ProfileIndex.emplace(ProfileEvents[I].KernelCount, I);
+  }
   for (const OfflineSplitFinalizeTiming &FinalizeTime :
        offlineSplitFinalizeTimes()) {
-    for (OfflineProfileEvent &ProfileEvent : ProfileEvents) {
-      if (ProfileEvent.KernelCount == FinalizeTime.KernelCount) {
-        if (FinalizeTime.PartsCompleteNs > ProfileEvent.HostEndNs) {
-          ProfileEvent.HostEndNs = FinalizeTime.PartsCompleteNs;
-        }
-        // Resident-mode samples represent preparation plus gang execution.
-        // An incompatible successor is charged for canonicalization by the
-        // daemon transfer model; folding the same merge into the producer's
-        // profile would double-count it and make static/completion paths learn
-        // different meanings for the same profile key.
-        if (!ProfileEvent.PersistentSplit) {
-          ProfileEvent.MaterializationNs += FinalizeTime.MaterializationNs;
-        }
-      }
+    const auto It = ProfileIndex.find(FinalizeTime.KernelCount);
+    if (It == ProfileIndex.end()) {
+      continue;
+    }
+    OfflineProfileEvent &ProfileEvent = ProfileEvents[It->second];
+    if (FinalizeTime.PartsCompleteNs > ProfileEvent.HostEndNs) {
+      ProfileEvent.HostEndNs = FinalizeTime.PartsCompleteNs;
+    }
+    // Resident-mode samples represent preparation plus gang execution. An
+    // incompatible successor is charged for canonicalization by the daemon
+    // transfer model; folding the same merge into the producer's profile
+    // would double-count it and make static/completion paths learn different
+    // meanings for the same profile key.
+    if (!ProfileEvent.PersistentSplit) {
+      ProfileEvent.MaterializationNs += FinalizeTime.MaterializationNs;
     }
   }
   offlineSplitFinalizeTimes().clear();
@@ -2216,11 +2300,49 @@ static void processOfflineProfilingBatch(
     int WaitCount, const std::vector<OfflineProfileEvent> &ProfileEvents) {
   waitOfflineBatchForUserFence(ProfileEvents);
 
-  S2DProfileBatchData Batch;
+  using ProfileShapeKey =
+      std::tuple<std::string, int, int, bool>;
+  std::map<ProfileShapeKey, std::vector<S2DKernelProfileData>> GroupedProfiles;
   for (const OfflineProfileEvent &ProfileEvent : ProfileEvents) {
     S2DKernelProfileData ProfileData;
     if (collectOfflineProfilingInfo(WaitCount, ProfileEvent, ProfileData)) {
-      Batch.profiles.push_back(ProfileData);
+      GroupedProfiles[{ProfileData.kernel_key, ProfileData.device_index,
+                       ProfileData.num_parts,
+                       ProfileData.persistent_split}]
+          .push_back(std::move(ProfileData));
+    }
+  }
+
+  // A static time-step chain can contain tens of thousands of identical
+  // kernel shapes. Publishing every observation makes the message queue and
+  // persistent-store writer part of the measured user fence without adding
+  // meaningful model information. Publish one mean for each of 64 uniform
+  // time bins. Binning preserves the weight of one-time warm-up (the first
+  // setup is not accidentally given 1/64 of the model) while retaining drift
+  // across the window. Distinct kernels and short batches remain unchanged.
+  static constexpr size_t MaxSamplesPerShapePerWindow = 64;
+  S2DProfileBatchData Batch;
+  for (auto &Entry : GroupedProfiles) {
+    std::vector<S2DKernelProfileData> &Samples = Entry.second;
+    if (Samples.size() <= MaxSamplesPerShapePerWindow) {
+      for (S2DKernelProfileData &Sample : Samples) {
+        Batch.profiles.push_back(std::move(Sample));
+      }
+      continue;
+    }
+    for (size_t I = 0; I < MaxSamplesPerShapePerWindow; ++I) {
+      const size_t Begin =
+          I * Samples.size() / MaxSamplesPerShapePerWindow;
+      const size_t End =
+          (I + 1) * Samples.size() / MaxSamplesPerShapePerWindow;
+      unsigned __int128 DurationSum = 0;
+      for (size_t J = Begin; J < End; ++J) {
+        DurationSum += Samples[J].duration_ns;
+      }
+      S2DKernelProfileData Representative = std::move(Samples[Begin]);
+      Representative.duration_ns = static_cast<uint64_t>(
+          DurationSum / static_cast<unsigned __int128>(End - Begin));
+      Batch.profiles.push_back(std::move(Representative));
     }
   }
 

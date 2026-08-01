@@ -84,6 +84,13 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 #error "SNMD_OFFLINE_COLD_SPLIT_MIN_SINGLE_COST must be nonnegative"
 #endif
 
+// A linear chain whose accesses all satisfy the resident Local/Halo contract
+// is evaluated as one amortization cohort. This avoids rejecting a long
+// stencil solely because each individual time-step kernel is shorter than the
+// ordinary cold-Split threshold. Runtime override (zero disables):
+//   SYCL_SNMD_PERSISTENT_CHAIN_MIN_NODES=<nonnegative integer>
+#define SNMD_OFFLINE_PERSISTENT_CHAIN_MIN_NODES 64
+
 #if SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT < 0 ||                       \
     SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT >= 100
 #error "SNMD_OFFLINE_COLD_SPLIT_MIN_GAIN_PERCENT must be in [0, 100)"
