@@ -718,6 +718,7 @@ static void applyOfflineSplitDecision(const D2SKernelExecInfo &KernelExecInfo,
 
 static void finalizeAllPendingOfflineSplits();
 static void clearPendingOfflineSplitState();
+static void printAndResetOfflineHaloSummary();
 #ifdef SNMD_OFFLINE_SPLIT_STATS
 static void printAndResetOfflineSplitStats();
 #endif
@@ -734,6 +735,7 @@ static void clearOfflineBatch() {
 #endif
 #ifdef SNMD_OFFLINE
   finalizeAllPendingOfflineSplits();
+  printAndResetOfflineHaloSummary();
 #ifdef SNMD_OFFLINE_SPLIT_STATS
   printAndResetOfflineSplitStats();
 #endif
@@ -838,6 +840,71 @@ static uint64_t offlineRequirementBytes(const detail::Requirement *Req) {
     return std::numeric_limits<uint64_t>::max();
   }
   return Elements * ElemSize;
+}
+
+// Keep the stencil fast path observable without enabling the very verbose
+// compile-time split diagnostics.  The decision summary is already an opt-in
+// diagnostic used by the daemon, so reusing it here does not alter formal
+// timing runs.  SYCL_SNMD_HALO_SUMMARY can be used independently when only the
+// data-plane breakdown is wanted.
+static bool offlineHaloSummaryEnabled() {
+  static const bool Enabled = []() {
+    const char *HaloEnv = std::getenv("SYCL_SNMD_HALO_SUMMARY");
+    const char *DecisionEnv = std::getenv("SYCL_SNMD_DECISION_SUMMARY");
+    auto IsEnabled = [](const char *Value) {
+      return Value != nullptr && Value[0] != '\0' &&
+             std::strcmp(Value, "0") != 0 &&
+             std::strcmp(Value, "false") != 0 &&
+             std::strcmp(Value, "FALSE") != 0;
+    };
+    return IsEnabled(HaloEnv) || IsEnabled(DecisionEnv);
+  }();
+  return Enabled;
+}
+
+struct OfflineHaloSummary {
+  uint64_t Exchanges = 0;
+  uint64_t Transfers = 0;
+  uint64_t SplitSubmissions = 0;
+  uint64_t DirectTransfers = 0;
+  uint64_t StagedTransfers = 0;
+  uint64_t DirectBytes = 0;
+  uint64_t StagedD2HBytes = 0;
+  uint64_t StagedH2DBytes = 0;
+  uint64_t ProducerFenceNs = 0;
+  uint64_t DirectSubmitNs = 0;
+  uint64_t DirectWaitNs = 0;
+  uint64_t StagedWaitNs = 0;
+  uint64_t ExchangeHostNs = 0;
+  uint64_t SplitResubmitNs = 0;
+};
+
+static OfflineHaloSummary &offlineHaloSummary() {
+  static OfflineHaloSummary Summary;
+  return Summary;
+}
+
+static void printAndResetOfflineHaloSummary() {
+  OfflineHaloSummary &Summary = offlineHaloSummary();
+  if (offlineHaloSummaryEnabled() && Summary.Exchanges != 0) {
+    std::cout << "SNMD_HALO_SUMMARY pid=" << getpid()
+              << " exchanges=" << Summary.Exchanges
+              << " transfers=" << Summary.Transfers
+              << " split_submissions=" << Summary.SplitSubmissions
+              << " direct_transfers=" << Summary.DirectTransfers
+              << " staged_transfers=" << Summary.StagedTransfers
+              << " direct_bytes=" << Summary.DirectBytes
+              << " staged_d2h_bytes=" << Summary.StagedD2HBytes
+              << " staged_h2d_bytes=" << Summary.StagedH2DBytes
+              << " producer_fence_ns=" << Summary.ProducerFenceNs
+              << " direct_submit_ns=" << Summary.DirectSubmitNs
+              << " direct_wait_ns=" << Summary.DirectWaitNs
+              << " staged_wait_ns=" << Summary.StagedWaitNs
+              << " exchange_host_ns=" << Summary.ExchangeHostNs
+              << " split_resubmit_ns=" << Summary.SplitResubmitNs
+              << std::endl;
+  }
+  Summary = OfflineHaloSummary{};
 }
 
 #ifdef SNMD_OFFLINE_SPLIT_STATS
@@ -1783,17 +1850,30 @@ static void exchangeOfflineResidentHalo(
   }
 
   // The source part events are the ownership fence for the next halo
-  // exchange. This first implementation intentionally favors a simple,
-  // correct protocol; interior/boundary overlap can be added without changing
-  // the public contract.
+  // exchange.  Both directions are independent once that fence is complete:
+  // enqueue every direct peer copy first and only then wait for the batch.
+  // This preserves the synchronous correctness/fallback boundary while
+  // allowing separate destination copy engines to overlap.
   waitPendingOfflineSplit(Source);
+  const bool CollectSummary = offlineHaloSummaryEnabled();
+  const uint64_t ExchangeStartNs = CollectSummary ? offlineNowNs() : 0;
   const size_t NumParts = DestinationQueues.size();
   const size_t Dim0 = Req->MAccessRange[0];
   const size_t Chunk = Dim0 / NumParts;
 
-  auto MoveGhostRows = [&](size_t RelativeBegin0, size_t Rows,
-                           const detail::QueueImplPtr &SrcQueue,
-                           const detail::QueueImplPtr &DstQueue) {
+  struct HaloTransfer {
+    std::unique_ptr<detail::Requirement> Req;
+    detail::QueueImplPtr SrcQueue;
+    detail::QueueImplPtr DstQueue;
+    detail::EventImplPtr DirectEvent;
+    bool DirectSubmitted = false;
+  };
+  std::vector<HaloTransfer> Transfers;
+  Transfers.reserve(NumParts > 1 ? 2 * (NumParts - 1) : 0);
+
+  auto AddGhostRows = [&](size_t RelativeBegin0, size_t Rows,
+                          const detail::QueueImplPtr &SrcQueue,
+                          const detail::QueueImplPtr &DstQueue) {
     if (Rows == 0 || SrcQueue == nullptr || DstQueue == nullptr ||
         SrcQueue->getDeviceImplPtr() == DstQueue->getDeviceImplPtr()) {
       return;
@@ -1805,58 +1885,113 @@ static void exchangeOfflineResidentHalo(
           "Internal Error. Offline Halo rows are not contiguous.",
           PI_ERROR_INVALID_VALUE);
     }
-
-    bool Direct = false;
-    try {
-      detail::EventImplPtr Event =
-          detail::Scheduler::getInstance().addMemoryMove(
-              GhostReq.get(), DstQueue, SrcQueue);
-      waitOfflineSplitEvent(Event, OfflineSplitWaitKind::Prepare);
-#ifdef SNMD_OFFLINE_SPLIT_STATS
-      offlineSplitStats().HaloDirectD2DBytes +=
-          offlineRequirementBytes(GhostReq.get());
-#endif
-      Direct = true;
-    } catch (const std::exception &Error) {
-      HANDLER_TRACE_STREAM
-          << "=== handler === resident Halo direct D2D failed, using host "
-             "staging, reason: "
-          << Error.what() << std::endl;
-    } catch (...) {
-      HANDLER_TRACE_STREAM
-          << "=== handler === resident Halo direct D2D failed, using host "
-             "staging"
-          << std::endl;
-    }
-
-    if (!Direct) {
-      detail::EventImplPtr ToHost =
-          detail::Scheduler::getInstance().addMemoryMove(
-              GhostReq.get(), HostQueue, SrcQueue);
-      waitOfflineSplitEvent(ToHost, OfflineSplitWaitKind::Prepare);
-      detail::EventImplPtr ToDevice =
-          detail::Scheduler::getInstance().addMemoryMove(
-              GhostReq.get(), DstQueue, HostQueue);
-      waitOfflineSplitEvent(ToDevice, OfflineSplitWaitKind::Prepare);
-#ifdef SNMD_OFFLINE_SPLIT_STATS
-      const uint64_t Bytes = offlineRequirementBytes(GhostReq.get());
-      offlineSplitStats().HaloD2HBytes += Bytes;
-      offlineSplitStats().HaloH2DBytes += Bytes;
-#endif
-    }
+    Transfers.push_back(
+        {std::move(GhostReq), SrcQueue, DstQueue, nullptr, false});
   };
 
   for (size_t Part = 0; Part < NumParts; ++Part) {
     const size_t Begin = Part * Chunk;
     const size_t End = Begin + Chunk;
     if (Part > 0 && Halo.LeftWidth != 0) {
-      MoveGhostRows(Begin - Halo.LeftWidth, Halo.LeftWidth,
-                    Source.SplitQueues[Part - 1], DestinationQueues[Part]);
+      AddGhostRows(Begin - Halo.LeftWidth, Halo.LeftWidth,
+                   Source.SplitQueues[Part - 1], DestinationQueues[Part]);
     }
     if (Part + 1 < NumParts && Halo.RightWidth != 0) {
-      MoveGhostRows(End, Halo.RightWidth, Source.SplitQueues[Part + 1],
-                    DestinationQueues[Part]);
+      AddGhostRows(End, Halo.RightWidth, Source.SplitQueues[Part + 1],
+                   DestinationQueues[Part]);
     }
+  }
+
+  if (CollectSummary) {
+    OfflineHaloSummary &Summary = offlineHaloSummary();
+    ++Summary.Exchanges;
+    Summary.Transfers += Transfers.size();
+  }
+
+  const uint64_t DirectSubmitStartNs = CollectSummary ? offlineNowNs() : 0;
+  for (HaloTransfer &Transfer : Transfers) {
+    try {
+      Transfer.DirectEvent =
+          detail::Scheduler::getInstance().addMemoryMove(
+              Transfer.Req.get(), Transfer.DstQueue, Transfer.SrcQueue);
+      Transfer.DirectSubmitted = true;
+    } catch (const std::exception &Error) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === resident Halo direct D2D submission failed, "
+             "using host staging, reason: "
+          << Error.what() << std::endl;
+    } catch (...) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === resident Halo direct D2D submission failed, "
+             "using host staging"
+          << std::endl;
+    }
+  }
+  if (CollectSummary) {
+    offlineHaloSummary().DirectSubmitNs +=
+        offlineNowNs() - DirectSubmitStartNs;
+  }
+
+  for (HaloTransfer &Transfer : Transfers) {
+    const uint64_t Bytes = offlineRequirementBytes(Transfer.Req.get());
+    bool Direct = false;
+    if (Transfer.DirectSubmitted) {
+      const uint64_t DirectWaitStartNs = CollectSummary ? offlineNowNs() : 0;
+      try {
+        waitOfflineSplitEvent(Transfer.DirectEvent,
+                              OfflineSplitWaitKind::Prepare);
+        Direct = true;
+      } catch (const std::exception &Error) {
+        HANDLER_TRACE_STREAM
+            << "=== handler === resident Halo direct D2D execution failed, "
+               "using host staging, reason: "
+            << Error.what() << std::endl;
+      } catch (...) {
+        HANDLER_TRACE_STREAM
+            << "=== handler === resident Halo direct D2D execution failed, "
+               "using host staging"
+            << std::endl;
+      }
+      if (CollectSummary) {
+        offlineHaloSummary().DirectWaitNs +=
+            offlineNowNs() - DirectWaitStartNs;
+      }
+    }
+
+    if (Direct) {
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+      offlineSplitStats().HaloDirectD2DBytes += Bytes;
+#endif
+      if (CollectSummary) {
+        ++offlineHaloSummary().DirectTransfers;
+        offlineHaloSummary().DirectBytes += Bytes;
+      }
+      continue;
+    }
+
+    const uint64_t StagedWaitStartNs = CollectSummary ? offlineNowNs() : 0;
+    detail::EventImplPtr ToHost =
+        detail::Scheduler::getInstance().addMemoryMove(
+            Transfer.Req.get(), HostQueue, Transfer.SrcQueue);
+    waitOfflineSplitEvent(ToHost, OfflineSplitWaitKind::Prepare);
+    detail::EventImplPtr ToDevice =
+        detail::Scheduler::getInstance().addMemoryMove(
+            Transfer.Req.get(), Transfer.DstQueue, HostQueue);
+    waitOfflineSplitEvent(ToDevice, OfflineSplitWaitKind::Prepare);
+    if (CollectSummary) {
+      OfflineHaloSummary &Summary = offlineHaloSummary();
+      ++Summary.StagedTransfers;
+      Summary.StagedD2HBytes += Bytes;
+      Summary.StagedH2DBytes += Bytes;
+      Summary.StagedWaitNs += offlineNowNs() - StagedWaitStartNs;
+    }
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+    offlineSplitStats().HaloD2HBytes += Bytes;
+    offlineSplitStats().HaloH2DBytes += Bytes;
+#endif
+  }
+  if (CollectSummary) {
+    offlineHaloSummary().ExchangeHostNs += offlineNowNs() - ExchangeStartNs;
   }
   HANDLER_TRACE_STREAM << "=== handler === resident Halo exchange complete, "
                        << "left=" << Halo.LeftWidth
@@ -2047,7 +2182,14 @@ static void finalizePendingOfflineSplitsForKernel(
         // does not charge the predecessor's compute time to the successor.
         // Local-only chains remain asynchronously queueable.
         if (kernelConsumesResidentHalo(KernelCg, PendingSplits[I])) {
+          const bool CollectSummary = offlineHaloSummaryEnabled();
+          const uint64_t FenceStartNs =
+              CollectSummary ? offlineNowNs() : 0;
           waitPendingOfflineSplit(PendingSplits[I]);
+          if (CollectSummary) {
+            offlineHaloSummary().ProducerFenceNs +=
+                offlineNowNs() - FenceStartNs;
+          }
         }
         HANDLER_TRACE_STREAM
             << "=== handler === retain compatible resident Split from "
@@ -3951,6 +4093,9 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
   }
 
   if (NumParts > 1) {
+    const bool CollectHaloSummary = offlineHaloSummaryEnabled();
+    const uint64_t SplitResubmitStartNs =
+        CollectHaloSummary ? offlineNowNs() : 0;
 #ifdef SNMD_OFFLINE_SPLIT_STATS
     offlineSplitStats().SplitKernelCount++;
 #endif
@@ -4246,6 +4391,11 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
     cacheOfflineSplitReadReplicas(PendingSplit);
     supersedeOlderResidentWrites(PendingSplit);
     pendingOfflineSplitMerges().push_back(std::move(PendingSplit));
+    if (CollectHaloSummary) {
+      OfflineHaloSummary &Summary = offlineHaloSummary();
+      ++Summary.SplitSubmissions;
+      Summary.SplitResubmitNs += offlineNowNs() - SplitResubmitStartNs;
+    }
     HANDLER_TRACE_STREAM << "=== handler === Split submitted async, merge deferred for kernel_count: "
               << sycl_kernel_cg.kernel_count << std::endl;
 

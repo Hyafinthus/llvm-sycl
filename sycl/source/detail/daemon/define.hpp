@@ -98,6 +98,9 @@ static constexpr OfflineTraceNullStream OFFLINE_TRACE_NULL_STREAM{};
 
 // Opt-in, synchronization-free per-window aggregate scheduler telemetry:
 //   SYCL_SNMD_DECISION_SUMMARY=1
+// The handler also emits its aggregate resident-Halo data-plane breakdown
+// under that setting. It can be requested without scheduler telemetry via:
+//   SYCL_SNMD_HALO_SUMMARY=1
 
 // P3: When a complete DAG depth already has enough independent tasks to fill
 // the GPUs, prefer task parallelism. A measured superlinear-throughput Split

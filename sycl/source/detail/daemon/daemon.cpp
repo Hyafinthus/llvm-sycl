@@ -4622,6 +4622,8 @@ bool algorithmHEFT(
         << (persistent_chain_static_batch ? "persistent_chain_static" : path)
         << " completion_queue="
         << (completionQueueRuntimeRequested() ? 1 : 0)
+        << " completion_protocol_active="
+        << (completionQueueRuntimeRequested() && !use_static_batch ? 1 : 0)
         << " single_kernels=" << selected_single_kernels
         << " split_kernels=" << selected_split_kernels
         << " source_cold="
