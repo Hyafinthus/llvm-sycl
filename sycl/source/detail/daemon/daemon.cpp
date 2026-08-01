@@ -197,6 +197,7 @@ struct KernelFeatureSignature {
   uint32_t access_mode_mask = 0;
   bool partition_local_read = false;
   bool partition_local_write = false;
+  bool partition_halo_read = false;
 };
 
 struct PersistedProfileObservation {
@@ -1231,10 +1232,30 @@ static double totalReadBytesForPartitionMode(const DAGNode *node,
                                              bool partition_local) {
   double bytes = 0.0;
   for (const SyclReqData &req : node->req_data) {
-    if (isReadAccess(req.req_accmode) &&
-        req.partition_local == partition_local) {
+    const bool partitioned = req.partition_local || req.partition_halo();
+    if (isReadAccess(req.req_accmode) && partitioned == partition_local) {
       bytes += reqAccessBytes(req);
     }
+  }
+  return bytes;
+}
+
+static double totalHaloExchangeBytes(const DAGNode *node, int num_parts) {
+  if (node == nullptr || num_parts <= 1) {
+    return 0.0;
+  }
+  double bytes = 0.0;
+  for (const SyclReqData &req : node->req_data) {
+    if (!isReadAccess(req.req_accmode) || !req.partition_halo()) {
+      continue;
+    }
+    const double row_bytes = static_cast<double>(req.elem_size) *
+                             static_cast<double>(req.access_range1) *
+                             static_cast<double>(req.access_range2);
+    bytes += row_bytes *
+             (static_cast<double>(req.halo_left) +
+              static_cast<double>(req.halo_right)) *
+             static_cast<double>(num_parts - 1);
   }
   return bytes;
 }
@@ -1266,7 +1287,7 @@ static double dependentReadBytesForPartitionMode(const DAGNode *node,
   for (const auto &dep_pair : node->depend_on_mem) {
     for (const SyclReqData &req : dep_pair.second) {
       if (!isReadAccess(req.req_accmode) ||
-          req.partition_local != partition_local) {
+          (req.partition_local || req.partition_halo()) != partition_local) {
         continue;
       }
       if (seen_mem.insert(req.mem_pointer).second) {
@@ -1365,6 +1386,8 @@ static KernelFeatureSignature buildKernelFeature(const DAGNode *node) {
       feature.read_bytes += access_bytes;
       feature.partition_local_read =
           feature.partition_local_read || req.partition_local;
+      feature.partition_halo_read =
+          feature.partition_halo_read || req.partition_halo();
     }
     if (writes) {
       feature.write_req_count++;
@@ -1488,7 +1511,7 @@ static std::string serializePersistedProfileObservation(
     const PersistedProfileObservation &observation) {
   const KernelFeatureSignature &feature = observation.feature;
   std::ostringstream oss;
-  oss << std::setprecision(17) << "SNMD_PROFILE_OBS_V3\t"
+  oss << std::setprecision(17) << "SNMD_PROFILE_OBS_V4\t"
       << observation.profile_namespace << '\t' << observation.key.rank << '\t'
       << observation.key.device << '\t'
       << observation.key.device_identity << '\t'
@@ -1507,6 +1530,7 @@ static std::string serializePersistedProfileObservation(
       << feature.dominant_elem_size << '\t' << feature.access_mode_mask << '\t'
       << (feature.partition_local_read ? 1 : 0) << '\t'
       << (feature.partition_local_write ? 1 : 0) << '\t'
+      << (feature.partition_halo_read ? 1 : 0) << '\t'
       << observation.key.kernel_key << '\n';
   return oss.str();
 }
@@ -1519,10 +1543,13 @@ static bool deserializePersistedProfileObservation(
   int feature_valid = 0;
   int partition_local_read = 0;
   int partition_local_write = 0;
+  int partition_halo_read = 0;
   if (!(iss >> tag)) {
     return false;
   }
-  const bool has_stable_device_identity = tag == "SNMD_PROFILE_OBS_V3";
+  const bool has_halo_feature = tag == "SNMD_PROFILE_OBS_V4";
+  const bool has_stable_device_identity =
+      has_halo_feature || tag == "SNMD_PROFILE_OBS_V3";
   if (has_stable_device_identity) {
     if (!(iss >> observation.profile_namespace)) {
       return false;
@@ -1565,7 +1592,13 @@ static bool deserializePersistedProfileObservation(
         observation.feature.write_req_count >>
         observation.feature.dominant_elem_size >>
         observation.feature.access_mode_mask >> partition_local_read >>
-        partition_local_write >> observation.key.kernel_key)) {
+        partition_local_write)) {
+    return false;
+  }
+  if (has_halo_feature && !(iss >> partition_halo_read)) {
+    return false;
+  }
+  if (!(iss >> observation.key.kernel_key)) {
     return false;
   }
   observation.key.num_parts = std::max(1, observation.key.num_parts);
@@ -1573,6 +1606,7 @@ static bool deserializePersistedProfileObservation(
   observation.feature_valid = feature_valid != 0;
   observation.feature.partition_local_read = partition_local_read != 0;
   observation.feature.partition_local_write = partition_local_write != 0;
+  observation.feature.partition_halo_read = partition_halo_read != 0;
   return observation.sample_cost > 0.0 &&
          std::isfinite(observation.sample_cost) &&
          !observation.key.kernel_key.empty() &&
@@ -2450,7 +2484,8 @@ static bool kernelFeaturesShareStructuralCohort(
          lhs.dominant_elem_size == rhs.dominant_elem_size &&
          lhs.access_mode_mask == rhs.access_mode_mask &&
          lhs.partition_local_read == rhs.partition_local_read &&
-         lhs.partition_local_write == rhs.partition_local_write;
+         lhs.partition_local_write == rhs.partition_local_write &&
+         lhs.partition_halo_read == rhs.partition_halo_read;
 }
 
 static double logFeatureRatioDistance(double lhs, double rhs) {
@@ -3098,9 +3133,20 @@ static bool supportsPersistentSplit(const DAGNode *node, int num_parts) {
   }
 
   bool has_write = false;
+  const size_t chunk = node->global_size0 / static_cast<size_t>(num_parts);
   for (const SyclReqData &req : node->req_data) {
+    const bool partitioned = req.partition_local || req.partition_halo();
+    if (req.partition_local && req.partition_halo()) {
+      return false;
+    }
+    if (req.partition_halo() &&
+        (req.req_accmode != acc_mode::read || req.halo_left > chunk ||
+         req.halo_right > chunk)) {
+      // FullAllocationHalo currently exchanges with immediate neighbors only.
+      return false;
+    }
     if (!isWriteAccess(req.req_accmode)) {
-      if (!req.partition_local) {
+      if (!partitioned) {
         continue;
       }
     } else {
@@ -3111,7 +3157,7 @@ static bool supportsPersistentSplit(const DAGNode *node, int num_parts) {
         return false;
       }
     }
-    if (req.partition_local &&
+    if (partitioned &&
         (req.is_sub_buffer || req.offset0 != 0 || req.offset1 != 0 ||
          req.offset2 != 0 || req.access_range0 != node->global_size0 ||
          req.access_range0 < static_cast<size_t>(num_parts) ||
@@ -3124,7 +3170,8 @@ static bool supportsPersistentSplit(const DAGNode *node, int num_parts) {
   return has_write;
 }
 
-static bool hasPartitionLocalSuccessor(const DAGNode *node, int num_parts) {
+static bool hasPartitionCompatibleSuccessor(const DAGNode *node,
+                                            int num_parts) {
   if (node == nullptr) {
     return false;
   }
@@ -3138,12 +3185,12 @@ static bool hasPartitionLocalSuccessor(const DAGNode *node, int num_parts) {
     if (dep_it == successor->depend_on_mem.end() || dep_it->second.empty()) {
       continue;
     }
-    const bool all_partition_local =
+    const bool all_partition_compatible =
         std::all_of(dep_it->second.begin(), dep_it->second.end(),
                     [](const SyclReqData &req) {
-                      return req.partition_local;
+                      return req.partition_local || req.partition_halo();
                     });
-    if (all_partition_local) {
+    if (all_partition_compatible) {
       return true;
     }
   }
@@ -3169,7 +3216,7 @@ static bool persistentEdgeCompatible(
     return false;
   }
   for (const SyclReqData &req : dep_it->second) {
-    if (!req.partition_local) {
+    if (!req.partition_local && !req.partition_halo()) {
       return false;
     }
   }
@@ -3196,12 +3243,12 @@ static double estimateSplitInternalCopyCost(
   const double replicated_read_bytes =
       std::max(0.0, totalReadBytesForPartitionMode(node, false) -
                         dependentReadBytesForPartitionMode(node, false));
-  const double partition_local_read_bytes =
+  const double partitioned_read_bytes =
       std::max(0.0, totalReadBytesForPartitionMode(node, true) -
                         dependentReadBytesForPartitionMode(node, true));
   const double read_bytes_per_extra_device =
       replicated_read_bytes +
-      partition_local_read_bytes / static_cast<double>(split_devices.size());
+      partitioned_read_bytes / static_cast<double>(split_devices.size());
   const double write_part_bytes =
       persistent_split
           ? 0.0
@@ -3214,6 +3261,29 @@ static double estimateSplitInternalCopyCost(
     seconds += sameRankCopySeconds(rank, main_proc, proc,
                                    read_bytes_per_extra_device);
     seconds += sameRankCopySeconds(rank, proc, main_proc, write_part_bytes);
+  }
+
+  // A resident halo edge avoids full materialization but still exchanges the
+  // ghost rows at each adjacent partition boundary. Account for both
+  // directions independently because P2P capability/bandwidth can differ.
+  for (const SyclReqData &req : node->req_data) {
+    if (!isReadAccess(req.req_accmode) || !req.partition_halo()) {
+      continue;
+    }
+    const double row_bytes = static_cast<double>(req.elem_size) *
+                             static_cast<double>(req.access_range1) *
+                             static_cast<double>(req.access_range2);
+    for (size_t boundary = 0; boundary + 1 < split_devices.size();
+         ++boundary) {
+      const int left_proc = split_devices[boundary];
+      const int right_proc = split_devices[boundary + 1];
+      seconds += sameRankCopySeconds(
+          rank, left_proc, right_proc,
+          row_bytes * static_cast<double>(req.halo_left));
+      seconds += sameRankCopySeconds(
+          rank, right_proc, left_proc,
+          row_bytes * static_cast<double>(req.halo_right));
+    }
   }
 
   return heftCostFromSeconds(seconds);
@@ -3751,7 +3821,7 @@ static TaskCandidate makeSplitCandidate(DAGNode *node, int rank,
   const bool persistent_split =
       gpu_available_time.size() == 1 &&
       supportsPersistentSplit(node, num_parts) &&
-      hasPartitionLocalSuccessor(node, num_parts);
+      hasPartitionCompatibleSuccessor(node, num_parts);
   if (rank < 0 || rank >= static_cast<int>(gpu_available_time.size()) ||
       static_cast<int>(gpu_available_time[rank].size()) <= num_parts) {
     return candidate;
@@ -4289,6 +4359,7 @@ bool algorithmHEFT(
   uint64_t selected_split_kernels = 0;
   long double estimated_split_extra_input_bytes = 0.0;
   long double estimated_split_merge_bytes = 0.0;
+  long double estimated_halo_exchange_bytes = 0.0;
   for (DAGNode *node : nodes) {
     const CostEstimate single_exec_estimate =
         estimateSingleExecCost(node, node->exec_rank, node->exec_proc);
@@ -4306,14 +4377,16 @@ bool algorithmHEFT(
           node->persistent_split);
       const long double replicated_read_bytes =
           totalReadBytesForPartitionMode(node, false);
-      const long double partition_local_read_bytes =
+      const long double partitioned_read_bytes =
           totalReadBytesForPartitionMode(node, true);
       estimated_split_extra_input_bytes +=
           replicated_read_bytes *
               static_cast<long double>(node->num_parts - 1) +
-          partition_local_read_bytes *
+          partitioned_read_bytes *
               static_cast<long double>(node->num_parts - 1) /
               static_cast<long double>(node->num_parts);
+      estimated_halo_exchange_bytes +=
+          totalHaloExchangeBytes(node, node->num_parts);
       if (!node->persistent_split) {
         estimated_split_merge_bytes +=
             static_cast<long double>(totalWriteBytes(node)) *
@@ -4346,7 +4419,10 @@ bool algorithmHEFT(
             << " estimated_split_extra_input_bytes="
             << static_cast<double>(estimated_split_extra_input_bytes)
             << " estimated_split_merge_bytes="
-            << static_cast<double>(estimated_split_merge_bytes) << std::endl;
+            << static_cast<double>(estimated_split_merge_bytes)
+            << " estimated_halo_exchange_bytes="
+            << static_cast<double>(estimated_halo_exchange_bytes)
+            << std::endl;
 #endif
 
   if (decisionSummaryRuntimeEnabled()) {

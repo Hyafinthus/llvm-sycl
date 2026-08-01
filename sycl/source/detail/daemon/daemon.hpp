@@ -80,6 +80,10 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
   size_t offset2 = 0;
   bool is_sub_buffer = false;
   bool partition_local = false;
+  size_t halo_left = 0;
+  size_t halo_right = 0;
+
+  bool partition_halo() const { return halo_left != 0 || halo_right != 0; }
 
   // 用于map/set/sort/priority_queue
   bool operator<(const SyclReqData &other) const {
@@ -118,7 +122,9 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
         << offset1 << "\n"
         << offset2 << "\n"
         << is_sub_buffer << "\n"
-        << partition_local << "\n";
+        << partition_local << "\n"
+        << halo_left << "\n"
+        << halo_right << "\n";
     return oss.str();
   }
 
@@ -146,11 +152,13 @@ struct SyclReqData { // daemon需要的一个Req(AccessorImplHost)中Mem的信�
     iss >> req.offset2;
     iss >> req.is_sub_buffer;
     iss >> req.partition_local;
+    iss >> req.halo_left;
+    iss >> req.halo_right;
     return req;
   }
 };
 
-static constexpr int SYCL_REQ_DATA_SERIALIZED_LINES = 17;
+static constexpr int SYCL_REQ_DATA_SERIALIZED_LINES = 19;
 
 inline bool profileKeyReadAccess(acc_mode mode) {
   return mode == acc_mode::read || mode == acc_mode::read_write ||
@@ -203,7 +211,8 @@ inline std::string buildKernelProfileKey(uint64_t kernel_identity,
         << req.access_range1 << "x" << req.access_range2 << ":o"
         << req.offset0 << "x" << req.offset1 << "x" << req.offset2
         << ":sub" << (req.is_sub_buffer ? 1 : 0) << ":pl"
-        << (req.partition_local ? 1 : 0) << ";";
+        << (req.partition_local ? 1 : 0) << ":halo" << req.halo_left << "x"
+        << req.halo_right << ";";
   }
   oss << "|rb=" << read_bytes << "|wb=" << write_bytes;
   return oss.str();

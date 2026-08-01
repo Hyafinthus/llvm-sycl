@@ -538,6 +538,21 @@ static bool offlineReqHasPartitionLocalContract(
              ExecCG->MSNMDPartitionLocalReqs.end();
 }
 
+static const detail::CGExecKernel::SNMDPartitionHaloDesc *
+offlineReqPartitionHaloContract(const detail::CGExecKernel *ExecCG,
+                                const detail::Requirement *Req) {
+  if (ExecCG == nullptr || Req == nullptr || Req->MSYCLMemObj == nullptr) {
+    return nullptr;
+  }
+  auto It = std::find_if(
+      ExecCG->MSNMDPartitionHaloReqs.begin(),
+      ExecCG->MSNMDPartitionHaloReqs.end(),
+      [Req](const detail::CGExecKernel::SNMDPartitionHaloDesc &Desc) {
+        return Desc.Requirement == Req;
+      });
+  return It == ExecCG->MSNMDPartitionHaloReqs.end() ? nullptr : &*It;
+}
+
 static bool offlineReqHasValidPartitionLocalShape(
     const detail::NDRDescT &NDR, const detail::Requirement *Req,
     size_t NumParts = 1) {
@@ -552,6 +567,24 @@ static bool offlineReqHasValidPartitionLocalShape(
          AccessRange[0] >= NumParts && AccessRange[0] % NumParts == 0 &&
          AccessRange[1] == MemoryRange[1] &&
          AccessRange[2] == MemoryRange[2];
+}
+
+static bool offlineReqHasValidPartitionHaloShape(
+    const detail::CGExecKernel *ExecCG, const detail::Requirement *Req,
+    size_t NumParts) {
+  const auto *Halo = offlineReqPartitionHaloContract(ExecCG, Req);
+  if (Halo == nullptr || Req == nullptr || NumParts <= 1 ||
+      Req->MAccessMode != access::mode::read ||
+      (Halo->LeftWidth == 0 && Halo->RightWidth == 0) ||
+      offlineReqHasPartitionLocalContract(ExecCG, Req) ||
+      !offlineReqHasValidPartitionLocalShape(ExecCG->MNDRDesc, Req,
+                                             NumParts)) {
+    return false;
+  }
+  const size_t Chunk = Req->MAccessRange[0] / NumParts;
+  // Full-allocation Halo exchanges only adjacent partitions in this first
+  // implementation. Wider ghosts require a multi-hop protocol.
+  return Halo->LeftWidth <= Chunk && Halo->RightWidth <= Chunk;
 }
 
 static bool offlineSplitHasValidPersistentContract(
@@ -569,11 +602,22 @@ static bool offlineSplitHasValidPersistentContract(
     }
     const bool PartitionLocal =
         offlineReqHasPartitionLocalContract(ExecCG, Req);
+    const bool PartitionHalo =
+        offlineReqPartitionHaloContract(ExecCG, Req) != nullptr;
+    if (PartitionLocal && PartitionHalo) {
+      return false;
+    }
     if (offlineSplitWriteAccess(Req->MAccessMode)) {
       HasWrite = true;
       if (!PartitionLocal || Req->MAccessMode == access::mode::atomic) {
         return false;
       }
+    }
+    if (PartitionHalo) {
+      if (!offlineReqHasValidPartitionHaloShape(ExecCG, Req, NumParts)) {
+        return false;
+      }
+      continue;
     }
     if (!PartitionLocal) {
       continue;
@@ -718,7 +762,9 @@ static void fillOfflineKernelReqData(
     S2DKernelReqData &KernelReqData, pid_t Pid, int KernelCount,
     const std::string &KernelName, const detail::NDRDescT &NDRDesc,
     const std::vector<detail::Requirement *> &Requirements,
-    const std::vector<detail::AccessorImplHost *> &PartitionLocalReqs) {
+    const std::vector<detail::AccessorImplHost *> &PartitionLocalReqs,
+    const std::vector<detail::CGExecKernel::SNMDPartitionHaloDesc>
+        &PartitionHaloReqs) {
   KernelReqData.pid = Pid;
   KernelReqData.kernel_count = KernelCount;
   KernelReqData.kernel_identity = stableKernelIdentity(KernelName);
@@ -756,6 +802,17 @@ static void fillOfflineKernelReqData(
     ReqData.partition_local =
         DeclaredPartitionLocal &&
         offlineReqHasValidPartitionLocalShape(NDRDesc, Req);
+    auto HaloIt = std::find_if(
+        PartitionHaloReqs.begin(), PartitionHaloReqs.end(),
+        [Req](const detail::CGExecKernel::SNMDPartitionHaloDesc &Desc) {
+          return Desc.Requirement == Req;
+        });
+    if (HaloIt != PartitionHaloReqs.end() &&
+        Req->MAccessMode == access::mode::read &&
+        offlineReqHasValidPartitionLocalShape(NDRDesc, Req)) {
+      ReqData.halo_left = HaloIt->LeftWidth;
+      ReqData.halo_right = HaloIt->RightWidth;
+    }
 
     KernelReqData.reqs.push_back(ReqData);
   }
@@ -794,6 +851,9 @@ struct OfflineSplitStats {
   uint64_t MergeH2DBytes = 0;
   uint64_t ResidentReusedBytes = 0;
   uint64_t ResidentSupersededBytes = 0;
+  uint64_t HaloDirectD2DBytes = 0;
+  uint64_t HaloD2HBytes = 0;
+  uint64_t HaloH2DBytes = 0;
   uint64_t PrepareWaitNs = 0;
   uint64_t PartWaitNs = 0;
   uint64_t MergeWaitNs = 0;
@@ -823,6 +883,9 @@ static void printAndResetOfflineSplitStats() {
             << " resident_reused_bytes=" << Stats.ResidentReusedBytes
             << " resident_superseded_bytes="
             << Stats.ResidentSupersededBytes
+            << " halo_direct_d2d_bytes=" << Stats.HaloDirectD2DBytes
+            << " halo_d2h_bytes=" << Stats.HaloD2HBytes
+            << " halo_h2d_bytes=" << Stats.HaloH2DBytes
             << " prepare_wait_ns=" << Stats.PrepareWaitNs
             << " part_wait_ns=" << Stats.PartWaitNs
             << " merge_wait_ns=" << Stats.MergeWaitNs << std::endl;
@@ -876,6 +939,7 @@ struct PendingOfflineSplitMerge {
   std::vector<std::unique_ptr<detail::Requirement>> SplitReqOwners;
   std::vector<detail::SYCLMemObjI *> ReadMemObjs;
   std::vector<detail::SYCLMemObjI *> PartitionLocalReadMemObjs;
+  std::vector<detail::SYCLMemObjI *> PartitionHaloReadMemObjs;
   std::vector<detail::SYCLMemObjI *> WrittenMemObjs;
   std::vector<detail::SYCLMemObjI *> SupersededWrittenMemObjs;
 };
@@ -1084,11 +1148,13 @@ static bool pendingOfflineSplitMatchesDevices(
 static PendingOfflineSplitMerge *findCompatibleResidentVersion(
     const detail::Requirement *Req, const detail::CGExecKernel *ExecCG,
     const std::vector<int> &SplitDeviceIndices) {
-  if (!offlineReqHasPartitionLocalContract(ExecCG, Req)) {
-    return nullptr;
-  }
-  if (!offlineReqHasValidPartitionLocalShape(
-          ExecCG->MNDRDesc, Req, SplitDeviceIndices.size())) {
+  const bool PartitionLocal =
+      offlineReqHasPartitionLocalContract(ExecCG, Req) &&
+      offlineReqHasValidPartitionLocalShape(
+          ExecCG->MNDRDesc, Req, SplitDeviceIndices.size());
+  const bool PartitionHalo = offlineReqHasValidPartitionHaloShape(
+      ExecCG, Req, SplitDeviceIndices.size());
+  if (!PartitionLocal && !PartitionHalo) {
     return nullptr;
   }
   detail::SYCLMemObjI *MemObj = Req->MSYCLMemObj;
@@ -1136,7 +1202,8 @@ static bool kernelCanConsumeResidentSplit(
         !pendingOfflineSplitMemSuperseded(Pending, Req->MSYCLMemObj);
     if (TouchesWrite) {
       TouchesCompatibleState = true;
-      if (!offlineReqHasPartitionLocalContract(ExecCG, Req)) {
+      if (!offlineReqHasPartitionLocalContract(ExecCG, Req) &&
+          !offlineReqHasValidPartitionHaloShape(ExecCG, Req, PM.NumParts)) {
         return false;
       }
     }
@@ -1149,10 +1216,14 @@ static bool kernelCanConsumeResidentSplit(
     }
     const bool OrdersAfterPartitionRead =
         offlineSplitWriteAccess(Req->MAccessMode) &&
-        std::find(Pending.PartitionLocalReadMemObjs.begin(),
-                  Pending.PartitionLocalReadMemObjs.end(),
-                  Req->MSYCLMemObj) !=
-            Pending.PartitionLocalReadMemObjs.end();
+        (std::find(Pending.PartitionLocalReadMemObjs.begin(),
+                   Pending.PartitionLocalReadMemObjs.end(),
+                   Req->MSYCLMemObj) !=
+             Pending.PartitionLocalReadMemObjs.end() ||
+         std::find(Pending.PartitionHaloReadMemObjs.begin(),
+                   Pending.PartitionHaloReadMemObjs.end(),
+                   Req->MSYCLMemObj) !=
+             Pending.PartitionHaloReadMemObjs.end());
     if (OrdersAfterPartitionRead) {
       // offlineSplitHasValidPersistentContract() and the device-scheme check
       // above prove that this write owns the same per-device row block. Stable
@@ -1579,7 +1650,11 @@ static bool kernelTouchesPendingOfflineSplit(
          std::find(Pending.PartitionLocalReadMemObjs.begin(),
                    Pending.PartitionLocalReadMemObjs.end(),
                    Req->MSYCLMemObj) !=
-             Pending.PartitionLocalReadMemObjs.end());
+             Pending.PartitionLocalReadMemObjs.end() ||
+         std::find(Pending.PartitionHaloReadMemObjs.begin(),
+                   Pending.PartitionHaloReadMemObjs.end(),
+                   Req->MSYCLMemObj) !=
+             Pending.PartitionHaloReadMemObjs.end());
     if (TouchesPendingWrite || WritesPendingRead) {
       return true;
     }
@@ -1633,6 +1708,101 @@ static void waitPendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
   if (Pending.PartsCompleteNs == 0) {
     Pending.PartsCompleteNs = offlineNowNs();
   }
+}
+
+static void exchangeOfflineResidentHalo(
+    detail::Requirement *Req,
+    const detail::CGExecKernel::SNMDPartitionHaloDesc &Halo,
+    PendingOfflineSplitMerge &Source,
+    const std::vector<detail::QueueImplPtr> &DestinationQueues,
+    const detail::QueueImplPtr &HostQueue) {
+  if (Req == nullptr || DestinationQueues.size() <= 1 ||
+      Source.SplitQueues.size() != DestinationQueues.size()) {
+    throw sycl::runtime_error(
+        "Internal Error. Incompatible resident Halo device scheme.",
+        PI_ERROR_INVALID_VALUE);
+  }
+
+  // The source part events are the ownership fence for the next halo
+  // exchange. This first implementation intentionally favors a simple,
+  // correct protocol; interior/boundary overlap can be added without changing
+  // the public contract.
+  waitPendingOfflineSplit(Source);
+  const size_t NumParts = DestinationQueues.size();
+  const size_t Dim0 = Req->MAccessRange[0];
+  const size_t Chunk = Dim0 / NumParts;
+
+  auto MoveGhostRows = [&](size_t RelativeBegin0, size_t Rows,
+                           const detail::QueueImplPtr &SrcQueue,
+                           const detail::QueueImplPtr &DstQueue) {
+    if (Rows == 0 || SrcQueue == nullptr || DstQueue == nullptr ||
+        SrcQueue->getDeviceImplPtr() == DstQueue->getDeviceImplPtr()) {
+      return;
+    }
+    std::unique_ptr<detail::Requirement> GhostReq =
+        makeOfflineLinearRowBlockReq(Req, RelativeBegin0, Rows);
+    if (!GhostReq) {
+      throw sycl::runtime_error(
+          "Internal Error. Offline Halo rows are not contiguous.",
+          PI_ERROR_INVALID_VALUE);
+    }
+
+    bool Direct = false;
+    try {
+      detail::EventImplPtr Event =
+          detail::Scheduler::getInstance().addMemoryMove(
+              GhostReq.get(), DstQueue, SrcQueue);
+      waitOfflineSplitEvent(Event, OfflineSplitWaitKind::Prepare);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+      offlineSplitStats().HaloDirectD2DBytes +=
+          offlineRequirementBytes(GhostReq.get());
+#endif
+      Direct = true;
+    } catch (const std::exception &Error) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === resident Halo direct D2D failed, using host "
+             "staging, reason: "
+          << Error.what() << std::endl;
+    } catch (...) {
+      HANDLER_TRACE_STREAM
+          << "=== handler === resident Halo direct D2D failed, using host "
+             "staging"
+          << std::endl;
+    }
+
+    if (!Direct) {
+      detail::EventImplPtr ToHost =
+          detail::Scheduler::getInstance().addMemoryMove(
+              GhostReq.get(), HostQueue, SrcQueue);
+      waitOfflineSplitEvent(ToHost, OfflineSplitWaitKind::Prepare);
+      detail::EventImplPtr ToDevice =
+          detail::Scheduler::getInstance().addMemoryMove(
+              GhostReq.get(), DstQueue, HostQueue);
+      waitOfflineSplitEvent(ToDevice, OfflineSplitWaitKind::Prepare);
+#ifdef SNMD_OFFLINE_SPLIT_STATS
+      const uint64_t Bytes = offlineRequirementBytes(GhostReq.get());
+      offlineSplitStats().HaloD2HBytes += Bytes;
+      offlineSplitStats().HaloH2DBytes += Bytes;
+#endif
+    }
+  };
+
+  for (size_t Part = 0; Part < NumParts; ++Part) {
+    const size_t Begin = Part * Chunk;
+    const size_t End = Begin + Chunk;
+    if (Part > 0 && Halo.LeftWidth != 0) {
+      MoveGhostRows(Begin - Halo.LeftWidth, Halo.LeftWidth,
+                    Source.SplitQueues[Part - 1], DestinationQueues[Part]);
+    }
+    if (Part + 1 < NumParts && Halo.RightWidth != 0) {
+      MoveGhostRows(End, Halo.RightWidth, Source.SplitQueues[Part + 1],
+                    DestinationQueues[Part]);
+    }
+  }
+  HANDLER_TRACE_STREAM << "=== handler === resident Halo exchange complete, "
+                       << "left=" << Halo.LeftWidth
+                       << " right=" << Halo.RightWidth
+                       << " parts=" << NumParts << std::endl;
 }
 
 static void mergePendingOfflineSplit(PendingOfflineSplitMerge &Pending) {
@@ -2171,7 +2341,8 @@ event handler::finalize() {
           fillOfflineKernelReqData(kernel_req_data, getpid(),
                                    daemon_kernel_count, MKernelName, MNDRDesc,
                                    MRequirements,
-                                   MSNMDPartitionLocalReqs);
+                                   MSNMDPartitionLocalReqs,
+                                   MSNMDPartitionHaloReqs);
 
           std::string serialized_data = kernel_req_data.serialize();
           size_t message_size = serialized_data.size();
@@ -2234,7 +2405,8 @@ event handler::finalize() {
         fillOfflineKernelReqData(kernel_req_data, getpid(),
                                  daemon_kernel_count, MKernelName, MNDRDesc,
                                  MRequirements,
-                                 MSNMDPartitionLocalReqs);
+                                 MSNMDPartitionLocalReqs,
+                                 MSNMDPartitionHaloReqs);
 
         std::string serialized_data = kernel_req_data.serialize();
         size_t message_size = serialized_data.size();
@@ -2412,7 +2584,8 @@ event handler::finalize() {
       fillOfflineKernelReqData(kernel_req_data, getpid(),
                                daemon_kernel_count, MKernelName, MNDRDesc,
                                MRequirements,
-                               MSNMDPartitionLocalReqs);
+                               MSNMDPartitionLocalReqs,
+                               MSNMDPartitionHaloReqs);
     }
     kernel_reqs.push_back(kernel_req_data);
 
@@ -3043,7 +3216,8 @@ event handler::finalize() {
           MKernelName, MOSModuleHandle, std::move(MStreamStorage),
           std::move(MImpl->MAuxiliaryResources), MCGType,
           MImpl->MKernelCacheConfig, MCodeLoc,
-          std::move(MSNMDPartitionLocalReqs)));
+          std::move(MSNMDPartitionLocalReqs),
+          std::move(MSNMDPartitionHaloReqs)));
 
       detail::EventImplPtr Event = detail::Scheduler::getInstance().addCG(
           std::move(CommandGroup), MQueue);
@@ -3406,7 +3580,8 @@ event handler::finalize() {
         MKernelName, MOSModuleHandle, std::move(MStreamStorage),
         std::move(MImpl->MAuxiliaryResources), MCGType,
         MImpl->MKernelCacheConfig, MCodeLoc,
-        std::move(MSNMDPartitionLocalReqs)));
+        std::move(MSNMDPartitionLocalReqs),
+        std::move(MSNMDPartitionHaloReqs)));
     break;
   }
   case detail::CG::CodeplayInteropTask:
@@ -3723,6 +3898,10 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
             offlineReqHasPartitionLocalContract(ExecCG, Req) &&
             offlineReqHasValidPartitionLocalShape(ExecCG->MNDRDesc, Req,
                                                   NumParts);
+        const auto *HaloContract =
+            offlineReqPartitionHaloContract(ExecCG, Req);
+        const bool PartitionHalo =
+            offlineReqHasValidPartitionHaloShape(ExecCG, Req, NumParts);
         PendingOfflineSplitMerge *ResidentSource =
             findCompatibleResidentVersion(Req, ExecCG, SplitDevices);
         const bool ReusePartitionRead =
@@ -3760,25 +3939,40 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
           HANDLER_TRACE_STREAM << "=== handler === Split step3 SrcQueue: " << SrcQueue << std::endl;
         }
 
+        if (ResidentSource != nullptr && PartitionHalo) {
+          exchangeOfflineResidentHalo(Req, *HaloContract, *ResidentSource,
+                                      SplitQueues_Write, hostQ);
+        }
+
         if (ResidentSource == nullptr && !ReusePartitionRead) {
           for (size_t Part = 0; Part < SplitQueues_Write.size(); ++Part) {
             const QueueImplPtr &SplitQueue = SplitQueues_Write[Part];
             std::unique_ptr<Requirement> PartReadReqOwner;
             Requirement *PartTransferReq = TransferReq;
-            if (PartitionLocal) {
+            if (PartitionLocal || PartitionHalo) {
               const size_t Chunk = Req->MAccessRange[0] / NumParts;
+              const size_t OwnedBegin = Part * Chunk;
+              const size_t OwnedEnd = OwnedBegin + Chunk;
+              size_t TransferBegin = OwnedBegin;
+              size_t TransferEnd = OwnedEnd;
+              if (PartitionHalo) {
+                TransferBegin -=
+                    std::min(HaloContract->LeftWidth, TransferBegin);
+                TransferEnd += std::min(HaloContract->RightWidth,
+                                        Req->MAccessRange[0] - TransferEnd);
+              }
               PartReadReqOwner = makeOfflineLinearRowBlockReq(
-                  Req, Part * Chunk, Chunk);
+                  Req, TransferBegin, TransferEnd - TransferBegin);
               if (!PartReadReqOwner) {
                 throw sycl::runtime_error(
-                    "Internal Error. Offline partition-local read block is "
+                    "Internal Error. Offline partitioned read block is "
                     "not contiguous.",
                     PI_ERROR_INVALID_VALUE);
               }
               PartTransferReq = PartReadReqOwner.get();
             }
 
-            if (onlyRead && !PartitionLocal &&
+            if (onlyRead && !PartitionLocal && !PartitionHalo &&
                 offlineHasReadReplica(Req->MSYCLMemObj, SplitQueue)) {
 #ifdef SNMD_OFFLINE_SPLIT_STATS
               offlineSplitStats().ReusedReadReplicaBytes +=
@@ -3862,12 +4056,26 @@ event handler::resubmit(detail::SyclKernelCg &sycl_kernel_cg) {
       // 3.2
       if (onlyRead) {
         SplitReqs_onlyRead.push_back(Req);
-        // A partition-local read does not create a complete replica and must
-        // never enter the ordinary read-only replica cache.
-        if (!offlineReqHasPartitionLocalContract(ExecCG, Req) ||
-            !offlineReqHasValidPartitionLocalShape(ExecCG->MNDRDesc, Req,
-                                                   NumParts)) {
+        const bool PartitionLocal =
+            offlineReqHasPartitionLocalContract(ExecCG, Req) &&
+            offlineReqHasValidPartitionLocalShape(ExecCG->MNDRDesc, Req,
+                                                  NumParts);
+        const bool PartitionHalo =
+            offlineReqHasValidPartitionHaloShape(ExecCG, Req, NumParts);
+        // Partitioned reads do not create complete replicas and must never
+        // enter the ordinary full-buffer read-only replica cache. Halo ghosts
+        // are version-specific, so unlike immutable local blocks they are not
+        // added to the cross-kernel partition cache either.
+        if (!PartitionLocal && !PartitionHalo) {
           rememberOfflineSplitRead(PendingSplit, Req->MSYCLMemObj);
+        } else if (PartitionHalo) {
+          if (std::find(PendingSplit.PartitionHaloReadMemObjs.begin(),
+                        PendingSplit.PartitionHaloReadMemObjs.end(),
+                        Req->MSYCLMemObj) ==
+              PendingSplit.PartitionHaloReadMemObjs.end()) {
+            PendingSplit.PartitionHaloReadMemObjs.push_back(
+                Req->MSYCLMemObj);
+          }
         } else if (std::find(PendingSplit.PartitionLocalReadMemObjs.begin(),
                             PendingSplit.PartitionLocalReadMemObjs.end(),
                             Req->MSYCLMemObj) ==

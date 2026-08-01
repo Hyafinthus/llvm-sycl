@@ -116,6 +116,14 @@ CGExecKernel::cloneForSplit(const NDRDescT &NewNDR) const {
     if (AccessorImplHost *MappedReq = FindMappedReq(Req))
       PartitionLocalReqsCopy.push_back(MappedReq);
   }
+  std::vector<CGExecKernel::SNMDPartitionHaloDesc> PartitionHaloReqsCopy;
+  PartitionHaloReqsCopy.reserve(MSNMDPartitionHaloReqs.size());
+  for (const SNMDPartitionHaloDesc &Desc : MSNMDPartitionHaloReqs) {
+    if (AccessorImplHost *MappedReq = FindMappedReq(Desc.Requirement)) {
+      PartitionHaloReqsCopy.push_back(
+          {MappedReq, Desc.LeftWidth, Desc.RightWidth});
+    }
+  }
 
   auto ArgsCopy = MArgs; // vector<ArgDesc>
   auto RemapReqArgPtr = [&ReqMap](void *Ptr) -> void * {
@@ -178,7 +186,8 @@ CGExecKernel::cloneForSplit(const NDRDescT &NewNDR) const {
       MType,
       MKernelCacheConfig,
       code_location{},
-      std::move(PartitionLocalReqsCopy));
+      std::move(PartitionLocalReqsCopy),
+      std::move(PartitionHaloReqsCopy));
 }
 
 } // namespace detail

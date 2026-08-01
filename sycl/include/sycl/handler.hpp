@@ -1525,6 +1525,46 @@ public:
 #endif
   }
 
+  /// Declares a read-only dim-0 halo contract for an accessor used by an
+  /// SNMD Split kernel. Each part reads its owned dim-0 block plus at most
+  /// LeftWidth rows from the preceding part and RightWidth rows from the
+  /// following part. Global edges are clipped; boundary handling remains the
+  /// kernel's responsibility. The current implementation keeps full virtual
+  /// allocations and exchanges only these ghost rows between resident parts.
+  template <typename DataT, int Dims, access::mode AccMode,
+            access::target AccTarget, access::placeholder IsPlaceholder>
+  void ext_snmd_partition_halo(
+      accessor<DataT, Dims, AccMode, AccTarget, IsPlaceholder> Acc,
+      size_t LeftWidth, size_t RightWidth) {
+#ifndef __SYCL_DEVICE_ONLY__
+    static_assert(AccTarget != access::target::local,
+                  "local accessors cannot be SNMD halo partitions");
+    static_assert(AccMode == access::mode::read,
+                  "SNMD halo accessors must currently be read-only");
+    if (LeftWidth == 0 && RightWidth == 0) {
+      throw sycl::exception(make_error_code(errc::invalid),
+                            "SNMD halo width cannot be zero on both sides");
+    }
+    detail::AccessorBaseHost *AccBase =
+        reinterpret_cast<detail::AccessorBaseHost *>(&Acc);
+    detail::AccessorImplPtr AccImpl = detail::getSyclObjImpl(*AccBase);
+    if (!AccImpl)
+      return;
+    auto It = std::find_if(
+        MSNMDPartitionHaloReqs.begin(), MSNMDPartitionHaloReqs.end(),
+        [&AccImpl](const detail::CGExecKernel::SNMDPartitionHaloDesc &Desc) {
+          return Desc.Requirement == AccImpl.get();
+        });
+    if (It == MSNMDPartitionHaloReqs.end()) {
+      MSNMDPartitionHaloReqs.push_back(
+          {AccImpl.get(), LeftWidth, RightWidth});
+    } else {
+      It->LeftWidth = LeftWidth;
+      It->RightWidth = RightWidth;
+    }
+#endif
+  }
+
   template <auto &SpecName>
   void set_specialization_constant(
       typename std::remove_reference_t<decltype(SpecName)>::value_type Value) {
@@ -2857,6 +2897,9 @@ private:
   std::vector<detail::AccessorImplHost *> MRequirements;
   /// Accessor requirements covered by the explicit dim-0 partition contract.
   std::vector<detail::AccessorImplHost *> MSNMDPartitionLocalReqs;
+  /// Read requirements covered by a clipped dim-0 ghost-region contract.
+  std::vector<detail::CGExecKernel::SNMDPartitionHaloDesc>
+      MSNMDPartitionHaloReqs;
   /// Struct that encodes global size, local size, ...
   detail::NDRDescT MNDRDesc;
   std::string MKernelName;

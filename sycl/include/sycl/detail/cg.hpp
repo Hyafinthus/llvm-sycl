@@ -136,6 +136,12 @@ public:
 /// "Execute kernel" command group class.
 class CGExecKernel : public CG {
 public:
+  struct SNMDPartitionHaloDesc {
+    AccessorImplHost *Requirement = nullptr;
+    size_t LeftWidth = 0;
+    size_t RightWidth = 0;
+  };
+
   /// Stores ND-range description.
   NDRDescT MNDRDesc;
   std::unique_ptr<HostKernelBase> MHostKernel;
@@ -148,6 +154,7 @@ public:
   std::vector<std::shared_ptr<const void>> MAuxiliaryResources;
   RT::PiKernelCacheConfig MKernelCacheConfig;
   std::vector<AccessorImplHost *> MSNMDPartitionLocalReqs;
+  std::vector<SNMDPartitionHaloDesc> MSNMDPartitionHaloReqs;
 
   CGExecKernel(NDRDescT NDRDesc, std::unique_ptr<HostKernelBase> HKernel,
                std::shared_ptr<detail::kernel_impl> SyclKernel,
@@ -163,7 +170,8 @@ public:
                std::vector<std::shared_ptr<const void>> AuxiliaryResources,
                CGTYPE Type, RT::PiKernelCacheConfig KernelCacheConfig,
                detail::code_location loc = {},
-               std::vector<AccessorImplHost *> SNMDPartitionLocalReqs = {})
+               std::vector<AccessorImplHost *> SNMDPartitionLocalReqs = {},
+               std::vector<SNMDPartitionHaloDesc> SNMDPartitionHaloReqs = {})
       : CG(Type, std::move(ArgsStorage), std::move(AccStorage),
            std::move(SharedPtrStorage), std::move(Requirements),
            std::move(Events), std::move(loc)),
@@ -174,7 +182,8 @@ public:
         MStreams(std::move(Streams)),
         MAuxiliaryResources(std::move(AuxiliaryResources)),
         MKernelCacheConfig(std::move(KernelCacheConfig)),
-        MSNMDPartitionLocalReqs(std::move(SNMDPartitionLocalReqs)) {
+        MSNMDPartitionLocalReqs(std::move(SNMDPartitionLocalReqs)),
+        MSNMDPartitionHaloReqs(std::move(SNMDPartitionHaloReqs)) {
     assert((getType() == RunOnHostIntel || getType() == Kernel) &&
            "Wrong type of exec kernel CG.");
   }
